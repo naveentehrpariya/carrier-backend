@@ -508,14 +508,16 @@ const upgradePlan = catchAsync(async (req, res, next) => {
  * Get tenant users
  */
 const getTenantUsers = catchAsync(async (req, res, next) => {
-  const { page = 1, limit = 10, search, role } = req.query;
+  const { page = 1, limit = 10, search, q, role } = req.query;
+  const searchText = (search || q || '').toString().trim();
   
   // Start with active users filter
   const filter = User.activeFilter(req.tenantId);
-  if (search) {
+  if (searchText) {
     filter.$or = [
-      { name: { $regex: search, $options: 'i' } },
-      { email: { $regex: search, $options: 'i' } }
+      { name: { $regex: searchText, $options: 'i' } },
+      { email: { $regex: searchText, $options: 'i' } },
+      { corporateID: { $regex: searchText, $options: 'i' } }
     ];
   }
   if (role && role !== 'all') {
@@ -544,6 +546,76 @@ const getTenantUsers = catchAsync(async (req, res, next) => {
   });
 });
 
+const updateUserModules = catchAsync(async (req, res, next) => {
+  if (!req.user.isTenantAdmin && req.user.role !== 3 && req.user.is_admin !== 1) {
+    return next(new AppError('Only tenant administrators can update user permissions', 403));
+  }
+
+  const tenantId = req.tenantId;
+  if (!tenantId) return next(new AppError('Tenant context required', 400));
+
+  const raw = req.body?.allowedModules;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return next(new AppError('Please select at least one module', 400));
+  }
+
+  const valid = ['outsourcing', 'regular'];
+  const requested = raw
+    .map((m) => String(m).toLowerCase())
+    .filter((m) => valid.includes(m));
+
+  if (requested.length === 0) {
+    return next(new AppError('Invalid modules provided', 400));
+  }
+
+  const tenant = await Tenant.findOne({ tenantId })
+    .select('subscription.plan subscription.planSlug subscription.legacyPlan subscription.allowedModules')
+    .lean();
+
+  let planModules = Array.isArray(tenant?.subscription?.allowedModules) ? tenant.subscription.allowedModules : [];
+  if (!planModules.length) {
+    let planRecord = null;
+    const planSlug = tenant?.subscription?.planSlug;
+    const planRef = tenant?.subscription?.plan;
+    if (planSlug) {
+      planRecord = await SubscriptionPlan.findOne({ slug: planSlug }).select('allowedModules').lean();
+    } else if (typeof planRef === 'string') {
+      planRecord = await SubscriptionPlan.findOne({ slug: planRef }).select('allowedModules').lean();
+    } else if (planRef) {
+      planRecord = await SubscriptionPlan.findById(planRef).select('allowedModules').lean();
+    }
+    planModules = Array.isArray(planRecord?.allowedModules) ? planRecord.allowedModules : valid;
+  }
+
+  const effective = requested.filter((m) => planModules.includes(m));
+  if (!effective.length) {
+    return next(new AppError('Selected modules are not enabled for this company', 400));
+  }
+
+  const criteria = { _id: req.params.id, tenantId };
+
+  let isCustomized = true;
+  if (effective.length === planModules.length) {
+    isCustomized = false;
+  }
+
+  const user = await User.findOneAndUpdate(
+    criteria,
+    { allowedModules: effective, modulesCustomized: isCustomized },
+    { new: true, runValidators: true }
+  ).select('-password');
+
+  if (!user) {
+    return next(new AppError('User not found', 404));
+  }
+
+  res.json({
+    status: true,
+    data: { user },
+    message: 'User permissions updated successfully'
+  });
+});
+
 /**
  * Invite user to tenant
  */
@@ -552,7 +624,7 @@ const inviteUser = catchAsync(async (req, res, next) => {
     return next(new AppError('Only tenant administrators can invite users', 403));
   }
 
-  const { name, email, role, position } = req.body;
+  const { name, email, role, position, allowedModules: requestedModulesRaw } = req.body;
   
   // Check if user already exists
   const existingUser = await User.findOne({ email, tenantId: req.tenantId });
@@ -572,7 +644,39 @@ const inviteUser = catchAsync(async (req, res, next) => {
   const tempPassword = Math.random().toString(36).substring(2, 15);
   const hashedPassword = await bcrypt.hash(tempPassword, 12);
 
-  const company = await Company.findOne({ tenantId: req.tenantId });
+  const companyId = req.user?.company?._id || req.user?.company || null;
+  const company = companyId ? await Company.findById(companyId) : await Company.findOne({ tenantId: req.tenantId });
+  if (!company) {
+    return next(new AppError('Company details are not set up yet. Please add company details first.', 400));
+  }
+
+  const valid = ['outsourcing', 'regular'];
+  const sanitize = (arr) => (Array.isArray(arr) ? arr.map((m) => String(m).toLowerCase().trim()).filter((m) => valid.includes(m)) : []);
+
+  const tenantForModules = await Tenant.findOne({ tenantId: req.tenantId })
+    .select('subscription.plan subscription.planSlug subscription.legacyPlan subscription.allowedModules')
+    .lean();
+
+  let planModules = sanitize(tenantForModules?.subscription?.allowedModules);
+  if (!planModules.length) {
+    const planSlug = tenantForModules?.subscription?.planSlug || tenantForModules?.subscription?.legacyPlan || null;
+    const planRef = tenantForModules?.subscription?.plan;
+    let planRecord = null;
+    if (planSlug) planRecord = await SubscriptionPlan.findOne({ slug: planSlug }).select('allowedModules').lean();
+    else if (typeof planRef === 'string') planRecord = await SubscriptionPlan.findOne({ slug: planRef }).select('allowedModules').lean();
+    else if (planRef) planRecord = await SubscriptionPlan.findById(planRef).select('allowedModules').lean();
+    planModules = sanitize(planRecord?.allowedModules);
+  }
+  if (!planModules.length) planModules = ['outsourcing'];
+
+  const requestedModules = sanitize(requestedModulesRaw);
+  const effectiveModules = requestedModules.length
+    ? requestedModules.filter((m) => planModules.includes(m))
+    : planModules;
+
+  if (!effectiveModules.length) {
+    return next(new AppError('Selected modules are not enabled for this company', 400));
+  }
 
   const user = await User.create({
     tenantId: req.tenantId,
@@ -586,7 +690,9 @@ const inviteUser = catchAsync(async (req, res, next) => {
     role: parseInt(role),
     position,
     corporateID: `USER_${Date.now()}`,
-    created_by: req.user._id
+    created_by: req.user._id,
+    allowedModules: effectiveModules,
+    modulesCustomized: requestedModules.length > 0 && effectiveModules.length !== planModules.length
   });
 
   // Remove password from response
@@ -597,7 +703,7 @@ const inviteUser = catchAsync(async (req, res, next) => {
 
   res.status(201).json({
     status: true,
-    data: { user },
+    data: { user, tempPassword },
     message: 'User invited successfully. Invitation email sent.'
   });
 });
@@ -802,6 +908,7 @@ module.exports = {
   upgradePlan,
   getTenantUsers,
   inviteUser,
+  updateUserModules,
   updateUserRole,
   removeUser,
   getIntegrations,

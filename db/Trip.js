@@ -15,6 +15,7 @@ const tripSchema = new mongoose.Schema({
     
     // Assets for this specific segment/trip
     driver: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
+    drivers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'users' }],
     truck: { type: mongoose.Schema.Types.ObjectId, ref: 'trucks' },
     trailer: { type: mongoose.Schema.Types.ObjectId, ref: 'trailers' },
     carrier: { type: mongoose.Schema.Types.ObjectId, ref: 'carriers' },

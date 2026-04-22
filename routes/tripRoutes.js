@@ -8,8 +8,10 @@ router.route('/order/split').post(validateToken, resolveTenant, tripController.s
 router.route('/order/trips/:orderId').get(validateToken, resolveTenant, tripController.getOrderTrips);
 router.route('/trip/update/:tripId').put(validateToken, resolveTenant, tripController.updateTrip);
 router.route('/driver/:driverId/trips').get(validateToken, resolveTenant, tripController.getDriverTrips);
+router.route('/driver/:driverId/trips/logs').get(validateToken, resolveTenant, tripController.getDriverTripLogs);
 router.route('/driver/:driverId/trips/summary').get(validateToken, resolveTenant, tripController.getDriverTripSummary);
 router.route('/truck/:truckId/trips/summary').get(validateToken, resolveTenant, tripController.getTruckTripSummary);
+router.route('/truck/:truckId/trips/logs').get(validateToken, resolveTenant, tripController.getTruckTripLogs);
 router.route('/trip/:tripId').delete(validateToken, resolveTenant, tripController.deleteTrip);
 
 module.exports = router;

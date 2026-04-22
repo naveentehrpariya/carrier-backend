@@ -3,10 +3,12 @@ const router = express.Router();
 const { validateToken } = require('../controllers/multiTenantAuthController');
 const { resolveTenant, optionalTenant } = require('../middleware/tenant');
 const orderController = require('../controllers/orderController');
+const tripController = require('../controllers/tripController');
 const restrictOrderMiddleware = require('../middlewares/restrictOrderMiddleware');
 const { checkOrderLimit } = require('../middlewares/planLimitsMiddleware');
+const { checkOrderModuleAccess } = require('../middlewares/planModulesMiddleware');
 
-router.route('/order/add').post(validateToken, resolveTenant, checkOrderLimit(), orderController.create_order);
+router.route('/order/add').post(validateToken, resolveTenant, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
 router.route('/order/update/:id').put(validateToken, restrictOrderMiddleware, orderController.update_order);
 router.route('/order/listings').get(validateToken, orderController.order_listing);
 router.route('/order/detail/:id').get(validateToken, orderController.order_detail);
@@ -18,6 +20,11 @@ router.route('/account/order/update/payment/:id/:type').post(validateToken, rest
 
 router.route('/account/order-status/:id').post(validateToken, restrictOrderMiddleware, orderController.updateOrderStatus);
 router.route('/account/order/addnote/:id').post(validateToken, restrictOrderMiddleware, orderController.addnote);
+
+router.route('/account/trucks/gross').get(validateToken, resolveTenant, tripController.getTrucksGrossEarnings);
+router
+  .route('/account/trucks/gross/:truckId')
+  .get(validateToken, resolveTenant, tripController.getTruckGrossEarningsDetail);
 
 router.route('/overview').get(validateToken, optionalTenant, orderController.overview);
 router.route('/cummodityLists').get(validateToken, optionalTenant, orderController.cummodityLists);

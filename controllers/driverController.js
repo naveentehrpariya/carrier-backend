@@ -26,7 +26,11 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     }
     const {
       name, email, password, country, phone, address,
-      ratePerMile, licenseNumber, licenseState, licenseExpiry,
+      ratePerMile,
+      ratePerMileSolo,
+      ratePerMileTeam,
+      cityHoursRate,
+      licenseNumber, licenseState, licenseIssueDate, licenseExpiry,
       emails = [], phones = []
     } = req.body;
 
@@ -51,11 +55,11 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       country,
       phone,
       address,
-      role: 0,
+      permissions: ['driver'],
       company: req.user?.company ? req.user.company._id : null,
       position: 'Driver',
       tenantId,
-      allowedModules: ['regular']
+      modulesCustomized: false
     });
 
     const normalizedEmails = [];
@@ -75,9 +79,13 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       user: user._id,
       emails: normalizedEmails,
       phones: normalizedPhones,
-      ratePerMile: Number(ratePerMile) || 0,
+      ratePerMile: Number(ratePerMileSolo ?? ratePerMile) || 0,
+      ratePerMileSolo: Number(ratePerMileSolo ?? ratePerMile) || 0,
+      ratePerMileTeam: Number(ratePerMileTeam ?? ratePerMile) || 0,
+      cityHoursRate: Number(cityHoursRate) || 0,
       licenseNumber,
       licenseState,
+      licenseIssueDate: licenseIssueDate ? new Date(licenseIssueDate) : undefined,
       licenseExpiry,
       createdBy: req.user?._id
     });
@@ -101,7 +109,11 @@ exports.editDriver = catchAsync(async (req, res, next) => {
     const { id } = req.params;
     const {
       name, email, country, phone, address,
-      ratePerMile, notes, licenseNumber, licenseState, licenseExpiry,
+      ratePerMile,
+      ratePerMileSolo,
+      ratePerMileTeam,
+      cityHoursRate,
+      notes, licenseNumber, licenseState, licenseIssueDate, licenseExpiry,
       emails = [], phones = []
     } = req.body;
 
@@ -132,10 +144,14 @@ exports.editDriver = catchAsync(async (req, res, next) => {
       {
         emails: normalizedEmails,
         phones: normalizedPhones,
-        ratePerMile: Number(ratePerMile) || 0,
+        ratePerMile: Number(ratePerMileSolo ?? ratePerMile) || 0,
+        ratePerMileSolo: Number(ratePerMileSolo ?? ratePerMile) || 0,
+        ratePerMileTeam: Number(ratePerMileTeam ?? ratePerMile) || 0,
+        cityHoursRate: Number(cityHoursRate) || 0,
         notes,
         licenseNumber,
         licenseState,
+        licenseIssueDate: licenseIssueDate ? new Date(licenseIssueDate) : undefined,
         licenseExpiry,
         updatedAt: Date.now()
       },
@@ -161,12 +177,12 @@ exports.driversLists = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'Tenant context is required', lists: [] });
     }
     const companyId = req.user?.company ? req.user.company._id : null;
-    const filter = { tenantId, role: 0 };
+    const filter = { tenantId, permissions: 'driver' };
     if (companyId) {
       filter.company = companyId;
     }
     const users = await User.find(filter)
-      .select('name email status role tenantId createdAt position phone country address corporateID created_by')
+      .select('name email status tenantId createdAt position phone country address corporateID created_by permissions')
       .sort({ createdAt: -1 })
       .lean();
 
@@ -198,7 +214,7 @@ exports.removeDriver = catchAsync(async (req, res, next) => {
     }
     const companyId = req.user?.company ? req.user.company._id : null;
     const id = req.params.id;
-    const filter = { _id: id, tenantId, role: 0 };
+    const filter = { _id: id, tenantId, permissions: 'driver' };
     if (companyId) {
       filter.company = companyId;
     }

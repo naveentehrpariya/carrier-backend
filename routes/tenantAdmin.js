@@ -10,6 +10,7 @@ const {
   upgradePlan,
   getTenantUsers,
   inviteUser,
+  updateUserModules,
   updateUserRole,
   removeUser,
   getIntegrations,
@@ -43,6 +44,7 @@ router.post('/billing/upgrade', upgradePlan);
 // User Management Routes
 router.get('/users', getTenantUsers);
 router.post('/users/invite', inviteUser);
+router.patch('/users/:id/modules', updateUserModules);
 router.put('/users/:id/role', updateUserRole);
 router.delete('/users/:id', removeUser);
 

@@ -7,20 +7,23 @@ const fileupload = require('../utils/fileupload');
 const FleetDoc = require('../db/FleetDoc');
 const truckController = require('../controllers/truckController');
 const trailerController = require('../controllers/trailerController');
+const { requireModuleAccess } = require('../middlewares/planModulesMiddleware');
 
 const upload = multer({ dest: require('os').tmpdir() + '/uploads' });
 
 // Trucks
-router.route('/fleet/trucks/listings').get(validateToken, resolveTenant, truckController.trucks_listing);
-router.route('/fleet/trucks/add').post(validateToken, resolveTenant, truckController.addTruck);
-router.route('/fleet/trucks/update/:id').post(validateToken, resolveTenant, truckController.updateTruck);
-router.route('/fleet/trucks/remove/:id').get(validateToken, resolveTenant, truckController.removeTruck);
+router.route('/fleet/trucks/listings').get(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.trucks_listing);
+router.route('/fleet/trucks/detail/:id').get(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.truck_detail);
+router.route('/fleet/trucks/add').post(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.addTruck);
+router.route('/fleet/trucks/update/:id').post(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.updateTruck);
+router.route('/fleet/trucks/remove/:id').get(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.removeTruck);
 
 // Trailers
-router.route('/fleet/trailers/listings').get(validateToken, resolveTenant, trailerController.trailers_listing);
-router.route('/fleet/trailers/add').post(validateToken, resolveTenant, trailerController.addTrailer);
-router.route('/fleet/trailers/update/:id').post(validateToken, resolveTenant, trailerController.updateTrailer);
-router.route('/fleet/trailers/remove/:id').get(validateToken, resolveTenant, trailerController.removeTrailer);
+router.route('/fleet/trailers/listings').get(validateToken, resolveTenant, requireModuleAccess('regular'), trailerController.trailers_listing);
+router.route('/fleet/trailers/detail/:id').get(validateToken, resolveTenant, requireModuleAccess('regular'), trailerController.trailer_detail);
+router.route('/fleet/trailers/add').post(validateToken, resolveTenant, requireModuleAccess('regular'), trailerController.addTrailer);
+router.route('/fleet/trailers/update/:id').post(validateToken, resolveTenant, requireModuleAccess('regular'), trailerController.updateTrailer);
+router.route('/fleet/trailers/remove/:id').get(validateToken, resolveTenant, requireModuleAccess('regular'), trailerController.removeTrailer);
 
 // Upload docs for trucks
 router.post('/upload/truck/doc/:id', validateToken, resolveTenant, upload.fields([{ name: 'attachment' }]), async (req, res) => {
@@ -80,4 +83,3 @@ router.get('/fleet/docs/:type/:id', validateToken, resolveTenant, async (req, re
 });
 
 module.exports = router;
-

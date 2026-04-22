@@ -5,10 +5,10 @@ const truckSchema = new mongoose.Schema({
     type: String, 
     required: true, 
     index: true,
-    default: 'legacy_tenant_001'
   },
   company: { type: mongoose.Schema.Types.ObjectId, ref: 'companies' },
   plateNumber: { type: String, required: true },
+  unitNumber: { type: String },
   make: { type: String },
   model: { type: String },
   year: { type: Number },
@@ -29,4 +29,3 @@ truckSchema.index({ tenantId: 1, createdAt: -1 });
 
 const Truck = mongoose.model('trucks', truckSchema);
 module.exports = Truck;
-

@@ -19,7 +19,7 @@ const checkPlanLimits = (resourceType, additionalCount = 1) => {
     }
 
     // Super admins bypass all limits
-    if (req.isSuperAdminUser || req.user?.role === 'super_admin') {
+    if (req.isSuperAdminUser || req.user?.permissions?.includes('super_admin')) {
       return next();
     }
 

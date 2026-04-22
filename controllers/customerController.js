@@ -6,14 +6,27 @@ const logger = require("../utils/logger");
 const { checkCustomerLimit } = require("../middlewares/planLimitsMiddleware");
 
 exports.addCustomer = catchAsync(async (req, res, next) => {
+  const hasCustomersPermission = req.user?.permissions?.includes('customers') || req.user?.permissions?.includes('subadmin');
+  const isAdmin = req.user?.is_admin === 1 && req.user?.role === 3;
+  if (req.user && !isAdmin && !hasCustomersPermission) {
+    return res.status(403).json({ status: false, message: "You are not authorized to add customers." });
+  }
+
   const { name, phone, 
     assigned_to,
     secondary_email,
     secondary_phone,
     email, emails, address, country, state, city, zipcode } = req.body;
+  const tenantId = req.tenantId || req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(400).json({ status: false, message: "Tenant context is required." });
+  }
+  const companyId = req.user?.company?._id || req.user?.company || null;
 
-  const existingCustomer = await Customer.findOne({ 
-    $or: [{ phone }, { email }] 
+  const existingCustomer = await Customer.findOne({
+    tenantId,
+    ...(companyId ? { company: companyId } : {}),
+    $or: [{ phone }, { email }]
   });
 
   if (existingCustomer) {
@@ -35,7 +48,7 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
   //   }
   // }
 
-  const lastCustomer = await Customer.findOne().sort({ customerCode: -1 });
+  const lastCustomer = await Customer.findOne({ tenantId, ...(companyId ? { company: companyId } : {}) }).sort({ customerCode: -1 });
   const newCustomerNo = lastCustomer ? parseInt(lastCustomer.customerCode) + 1 : 1000;
 
   // Process emails array - maintain backward compatibility
@@ -59,6 +72,7 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
   }
 
  await Customer.syncIndexes();
+ const normalizedAssignedTo = assigned_to ? assigned_to : null;
  Customer.create({
    name: name,
    email: email,
@@ -71,10 +85,10 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
    country: country,
    state: state,
    city: city,
-   tenantId: req.tenantId,
-   company:req.user && req.user.company ? req.user.company._id : null,
+   tenantId,
+   company: companyId,
    zipcode: zipcode,
-   assigned_to:assigned_to,
+   assigned_to: normalizedAssignedTo,
    created_by:req.user._id,
  }).then(result => {
    res.send({
@@ -91,16 +105,24 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
 exports.customers_listing = catchAsync(async (req, res) => {
 
   const { search } = req.query;
-  const queryObj = {
-    $or: [{ deletedAt: null }]
-  };
-  if (req.tenantId) {
-    queryObj.tenantId = req.tenantId;
+  const queryObj = { deletedAt: null };
+  const tenantId = req.tenantId || req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(400).json({ status: false, message: "Tenant context is required.", customers: [], totalDocuments: 0 });
+  }
+  queryObj.tenantId = tenantId;
+  if (req.user && req.user.company) {
+    queryObj.company = req.user.company._id;
   }
 
-  if (req.user && req.user.is_admin === 1 && req.user.role === 3) {
+  const hasCustomersPermission = req.user?.permissions?.includes('customers') || req.user?.permissions?.includes('subadmin');
+  if ((req.user && req.user.is_admin === 1 && req.user.role === 3) || hasCustomersPermission) {
   } else {
-     queryObj.assigned_to = req.user._id;
+     queryObj.$or = [
+      { assigned_to: req.user._id },
+      { assigned_to: null },
+      { assigned_to: { $exists: false } },
+    ];
   }
 
   if (search && search.length >1) {
@@ -134,10 +156,17 @@ exports.customers_listing = catchAsync(async (req, res) => {
 exports.customerDetails = catchAsync(async (req, res, next) => {
   const criteria = { _id: req.params.id };
   if (req.tenantId) criteria.tenantId = req.tenantId;
+  if (req.user && req.user.company) criteria.company = req.user.company._id;
   
   // Add access control - non-admin staff can only view customers assigned to them
-  if (req.user && !(req.user.is_admin === 1 && req.user.role === 3)) {
-    criteria.assigned_to = req.user._id;
+  const hasCustomersPermission = req.user?.permissions?.includes('customers') || req.user?.permissions?.includes('subadmin');
+  const isAdmin = req.user && req.user.is_admin === 1 && req.user.role === 3;
+  if (req.user && !isAdmin && !hasCustomersPermission) {
+    criteria.$or = [
+      { assigned_to: req.user._id },
+      { assigned_to: null },
+      { assigned_to: { $exists: false } },
+    ];
   }
   
   const customer = await Customer.findOne(criteria).populate('assigned_to');
@@ -191,6 +220,17 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
   await Customer.syncIndexes();
   const updateQuery = { _id: req.params.id };
   if (req.tenantId) updateQuery.tenantId = req.tenantId;
+  if (req.user && req.user.company) updateQuery.company = req.user.company._id;
+  const hasCustomersPermission = req.user?.permissions?.includes('customers') || req.user?.permissions?.includes('subadmin');
+  const isAdmin = req.user && req.user.is_admin === 1 && req.user.role === 3;
+  if (req.user && !isAdmin && !hasCustomersPermission) {
+    updateQuery.$or = [
+      { assigned_to: req.user._id },
+      { assigned_to: null },
+      { assigned_to: { $exists: false } },
+    ];
+  }
+  const normalizedAssignedTo = assigned_to ? assigned_to : null;
   const updatedUser = await Customer.findOneAndUpdate(updateQuery, {
     name: name,
     email: email,
@@ -203,7 +243,7 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
     country: country,
     state: state,
     city: city,
-    assigned_to: assigned_to,
+    assigned_to: normalizedAssignedTo,
     zipcode: zipcode,
     created_by:req.user._id,
   }, {
@@ -229,6 +269,16 @@ exports.deleteCustomer = catchAsync(async (req, res) => {
     try {
       const criteria = { _id: req.params.id };
       if (req.tenantId) criteria.tenantId = req.tenantId;
+      if (req.user && req.user.company) criteria.company = req.user.company._id;
+      const hasCustomersPermission = req.user?.permissions?.includes('customers') || req.user?.permissions?.includes('subadmin');
+      const isAdmin = req.user && req.user.is_admin === 1 && req.user.role === 3;
+      if (req.user && !isAdmin && !hasCustomersPermission) {
+        criteria.$or = [
+          { assigned_to: req.user._id },
+          { assigned_to: null },
+          { assigned_to: { $exists: false } },
+        ];
+      }
       const customer = await Customer.findOne(criteria);
       if (!customer) {
         return res.status(404).json({

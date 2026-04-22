@@ -313,7 +313,8 @@ Cross-border shipments require custom stamps or deductions may apply.`
       phone: contactInfo.phone || '',
       country: 'USA',
       address: contactInfo.address || 'N/A',
-      role: 3,
+      is_admin: 1,
+      permissions: ['admin', 'regular', 'outsourcing', 'accounting', 'customers', 'employees', 'payments', 'orders'],
       position: 'Administrator',
       corporateID: `ADMIN_${Date.now()}`
     });
@@ -637,8 +638,16 @@ const updateSubscriptionPlan = catchAsync(async (req, res, next) => {
         if (req.body.limits.maxCarriers) updateObj['subscription.planLimits.maxCarriers'] = req.body.limits.maxCarriers;
       }
 
+      const planIdStr = String(plan._id);
       await Tenant.updateMany(
-        { 'subscription.plan': plan._id },
+        {
+          $or: [
+            { 'subscription.plan': plan._id },
+            { 'subscription.plan': planIdStr },
+            { 'subscription.plan': plan.slug },
+            { 'subscription.planSlug': plan.slug }
+          ]
+        },
         { $set: updateObj }
       );
       console.log(`✅ Synced plan ${plan.name} updates to tenants`);

@@ -5,7 +5,6 @@ const fleetDocSchema = new mongoose.Schema({
     type: String, 
     required: true, 
     index: true,
-    default: 'legacy_tenant_001'
   },
   type: { type: String, enum: ['truck', 'trailer'], required: true, index: true },
   entityId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },

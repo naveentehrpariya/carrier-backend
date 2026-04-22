@@ -9,7 +9,6 @@ const schema = new mongoose.Schema({
         type: String, 
         required: true, 
         index: true,
-        default: 'legacy_tenant_001' // Default for existing data migration
     },
     company: { type: mongoose.Schema.Types.ObjectId, ref: 'companies' },
     name: {
@@ -38,10 +37,6 @@ const schema = new mongoose.Schema({
         required: [true, 'Corporate ID can not be empty.'],
         unique: true,
         index: true 
-    },
-    role: {
-        type: Number,
-        default:1,
     },
     position : { 
         type: String,
@@ -86,11 +81,13 @@ const schema = new mongoose.Schema({
         required:[true, 'Please enter your address.'],
     },
 
-    // module access control
-    allowedModules: {
+    permissions: {
         type: [String],
-        enum: ['outsourcing', 'regular'],
-        default: ['outsourcing']
+        default: []
+    },
+    modulesCustomized: {
+        type: Boolean,
+        default: false
     },
 
     createdAt: {

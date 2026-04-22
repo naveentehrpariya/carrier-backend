@@ -4,7 +4,6 @@ const schema = new mongoose.Schema({
         type: String, 
         required: true, 
         index: true,
-        default: 'legacy_tenant_001' // Default for existing data migration
     },
     company: { type: mongoose.Schema.Types.ObjectId, ref: 'companies' },
     name: {

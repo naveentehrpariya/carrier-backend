@@ -5,10 +5,12 @@ const trailerSchema = new mongoose.Schema({
     type: String, 
     required: true, 
     index: true,
-    default: 'legacy_tenant_001'
   },
   company: { type: mongoose.Schema.Types.ObjectId, ref: 'companies' },
   plateNumber: { type: String, required: true },
+  unitNumber: { type: String },
+  vin: { type: String },
+  licenseNumber: { type: String },
   type: { type: String },
   length: { type: Number },
   make: { type: String },

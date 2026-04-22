@@ -10,6 +10,16 @@ const Customer = require('../db/Customer');
 const Carrier = require('../db/Carrier');
 const Files = require('../db/Files');
 const bcrypt = require('bcrypt');
+const mongoose = require('mongoose');
+
+const VALID_MODULES = ['outsourcing', 'regular'];
+const sanitizeAllowedModules = (value) => {
+  if (!Array.isArray(value)) return undefined;
+  const cleaned = value
+    .map((m) => String(m).toLowerCase().trim())
+    .filter((m) => VALID_MODULES.includes(m));
+  return cleaned;
+};
 
 /**
  * Get system overview
@@ -73,18 +83,29 @@ const getAllTenants = catchAsync(async (req, res, next) => {
   const { page = 1, limit = 10, search, status, plan } = req.query;
   
   const filter = {};
+  const and = [];
   if (search) {
-    filter.$or = [
-      { name: { $regex: search, $options: 'i' } },
-      { subdomain: { $regex: search, $options: 'i' } }
-    ];
+    and.push({
+      $or: [
+        { name: { $regex: search, $options: 'i' } },
+        { subdomain: { $regex: search, $options: 'i' } },
+        { tenantId: { $regex: search, $options: 'i' } }
+      ]
+    });
   }
   if (status && status !== 'all') {
     filter.status = status;
   }
   if (plan && plan !== 'all') {
-    filter['subscription.plan'] = plan;
+    and.push({
+      $or: [
+        { 'subscription.planSlug': plan },
+        { 'subscription.legacyPlan': plan },
+        { 'subscription.plan': plan }
+      ]
+    });
   }
+  if (and.length) filter.$and = and;
 
   const tenants = await Tenant.find(filter)
     .sort({ createdAt: -1 })
@@ -103,7 +124,14 @@ const getAllTenants = catchAsync(async (req, res, next) => {
           Customer.countDocuments({ tenantId: tenant.tenantId }),
           Carrier.countDocuments({ tenantId: tenant.tenantId })
         ]),
-        SubscriptionPlan.findOne({ slug: tenant.subscription.plan }),
+        (async () => {
+          const planSlug = tenant.subscription?.planSlug;
+          const planRef = tenant.subscription?.plan;
+          if (planSlug) return SubscriptionPlan.findOne({ slug: planSlug });
+          if (planRef && mongoose.Types.ObjectId.isValid(planRef)) return SubscriptionPlan.findById(planRef);
+          if (typeof planRef === 'string') return SubscriptionPlan.findOne({ slug: planRef });
+          return null;
+        })(),
         Order.aggregate([
           { $match: { tenantId: tenant.tenantId } },
           {
@@ -163,7 +191,14 @@ const getTenantDetails = catchAsync(async (req, res, next) => {
       Customer.countDocuments({ tenantId }),
       Carrier.countDocuments({ tenantId })
     ]),
-    SubscriptionPlan.findOne({ slug: tenant.subscription.plan }),
+    (async () => {
+      const planSlug = tenant.subscription?.planSlug;
+      const planRef = tenant.subscription?.plan;
+      if (planSlug) return SubscriptionPlan.findOne({ slug: planSlug });
+      if (planRef && mongoose.Types.ObjectId.isValid(planRef)) return SubscriptionPlan.findById(planRef);
+      if (typeof planRef === 'string') return SubscriptionPlan.findOne({ slug: planRef });
+      return null;
+    })(),
     Order.aggregate([
       { $match: { tenantId } },
       {
@@ -245,7 +280,12 @@ const updateTenantPlan = catchAsync(async (req, res, next) => {
   const tenant = await Tenant.findOneAndUpdate(
     { tenantId },
     {
-      'subscription.plan': planSlug,
+      'subscription.plan': newPlan._id,
+      'subscription.planSlug': planSlug,
+      'subscription.allowedModules': Array.isArray(newPlan.allowedModules) ? newPlan.allowedModules : ['outsourcing', 'regular'],
+      'subscription.planLimits': newPlan.limits,
+      'subscription.planFeatures': newPlan.features,
+      'subscription.legacyPlan': (newPlan.slug && typeof newPlan.slug === 'string' && newPlan.slug.split('-')[0]) || 'basic',
       'settings.maxUsers': newPlan.limits.maxUsers,
       'settings.maxOrders': newPlan.limits.maxOrders,
       'settings.features': newPlan.features,
@@ -274,10 +314,15 @@ const updateTenantPlan = catchAsync(async (req, res, next) => {
 const getSubscriptionPlans = catchAsync(async (req, res, next) => {
   // For superadmin, include both active and inactive plans
   const plans = await SubscriptionPlan.find({}).sort({ name: 1 });
-  
+  const sanitizedPlans = plans.map((p) => {
+    const obj = p.toObject();
+    obj.allowedModules = sanitizeAllowedModules(obj.allowedModules) || [];
+    return obj;
+  });
+
   res.json({
     status: true,
-    data: { plans }
+    data: { plans: sanitizedPlans }
   });
 });
 
@@ -285,8 +330,14 @@ const getSubscriptionPlans = catchAsync(async (req, res, next) => {
  * Create new subscription plan
  */
 const createSubscriptionPlan = catchAsync(async (req, res, next) => {
+  const allowedModules = sanitizeAllowedModules(req.body.allowedModules);
+  if (!allowedModules || allowedModules.length === 0) {
+    return next(new AppError('Please select at least one valid module (outsourcing, regular).', 400));
+  }
+
   const plan = await SubscriptionPlan.create({
     ...req.body,
+    allowedModules,
     createdBy: req.user._id
   });
 
@@ -305,11 +356,20 @@ const updateSubscriptionPlan = catchAsync(async (req, res, next) => {
   
   console.log('Update request for plan ID:', id);
   console.log('Update payload:', JSON.stringify(req.body, null, 2));
+
+  const update = { ...req.body, updatedAt: new Date() };
+  if (Object.prototype.hasOwnProperty.call(req.body, 'allowedModules')) {
+    const allowedModules = sanitizeAllowedModules(req.body.allowedModules);
+    if (!allowedModules || allowedModules.length === 0) {
+      return next(new AppError('Please select at least one valid module (outsourcing, regular).', 400));
+    }
+    update.allowedModules = allowedModules;
+  }
   
   // Use findOneAndUpdate with _id to bypass the pre-find middleware
   const plan = await SubscriptionPlan.findOneAndUpdate(
     { _id: id },
-    { ...req.body, updatedAt: new Date() },
+    update,
     { new: true, runValidators: true }
   );
 
@@ -319,6 +379,29 @@ const updateSubscriptionPlan = catchAsync(async (req, res, next) => {
   }
   
   console.log('Plan after update:', JSON.stringify(plan, null, 2));
+
+  try {
+    const updateObj = {};
+    if (Array.isArray(plan.allowedModules)) updateObj['subscription.allowedModules'] = plan.allowedModules;
+    if (plan.limits) updateObj['subscription.planLimits'] = plan.limits;
+    if (Array.isArray(plan.features)) updateObj['subscription.planFeatures'] = plan.features;
+    if (plan.slug) updateObj['subscription.planSlug'] = plan.slug;
+
+    const planIdStr = String(plan._id);
+    await Tenant.updateMany(
+      {
+        $or: [
+          { 'subscription.plan': plan._id },
+          { 'subscription.plan': planIdStr },
+          { 'subscription.plan': plan.slug },
+          { 'subscription.planSlug': plan.slug }
+        ]
+      },
+      { $set: updateObj }
+    );
+  } catch (err) {
+    console.error('Failed to sync tenants after plan update:', err);
+  }
 
   res.json({
     status: true,
@@ -342,7 +425,15 @@ const deleteSubscriptionPlan = catchAsync(async (req, res, next) => {
   }
   
   // Check if any tenant is using this plan (check by slug, not id)
-  const tenantsUsingPlan = await Tenant.countDocuments({ 'subscription.plan': plan.slug });
+  const planIdStr = String(plan._id);
+  const tenantsUsingPlan = await Tenant.countDocuments({
+    $or: [
+      { 'subscription.plan': plan._id },
+      { 'subscription.plan': planIdStr },
+      { 'subscription.plan': plan.slug },
+      { 'subscription.planSlug': plan.slug }
+    ]
+  });
   if (tenantsUsingPlan > 0) {
     return next(new AppError('Cannot delete plan that is in use by tenants', 400));
   }
@@ -431,11 +522,16 @@ const createTenant = catchAsync(async (req, res, next) => {
       phone: adminPhone || ''
     },
     subscription: {
-      plan: tenantPlanKey,
+      plan: plan._id,
+      legacyPlan: tenantPlanKey,
+      planSlug: plan.slug,
       status: 'active',
       startDate: new Date(),
       endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
-      billingCycle: 'monthly'
+      billingCycle: 'monthly',
+      planLimits: plan?.limits || undefined,
+      planFeatures: Array.isArray(plan?.features) ? plan.features : undefined,
+      allowedModules: Array.isArray(plan?.allowedModules) ? plan.allowedModules : undefined
     },
     settings: {
       maxUsers: plan?.limits?.maxUsers ?? 10,

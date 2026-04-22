@@ -7,8 +7,19 @@ const axios = require("axios");
 const { checkCarrierLimit } = require("../middlewares/planLimitsMiddleware");
 
 exports.addCarrier = catchAsync(async (req, res, next) => {
+  const hasCarriersPermission = req.user?.permissions?.includes('carriers') || req.user?.permissions?.includes('subadmin');
+  const isAdmin = req.user?.is_admin === 1;
+  if (req.user && !isAdmin && !hasCarriersPermission) {
+    return res.status(403).json({ status: false, message: "You are not authorized to add carriers." });
+  }
+
   const { name, phone, email, emails, location, country, state, city, zipcode, secondary_email, secondary_phone, mc_code } = req.body;
-  const existingCarrier = await Carrier.findOne({mc_code});
+  const tenantId = req.tenantId || req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(400).json({ status: false, message: "Tenant context is required." });
+  }
+  const companyId = req.user?.company?._id || req.user?.company || null;
+  const existingCarrier = await Carrier.findOne({ tenantId, ...(companyId ? { company: companyId } : {}), mc_code });
     if (existingCarrier) {
     return res.status(200).json({
       status: false,
@@ -20,7 +31,7 @@ exports.addCarrier = catchAsync(async (req, res, next) => {
   let isUnique = false;
   while (!isUnique) {
     carrierID = `CR_ID${Math.floor(100000 + Math.random() * 900000)}`;
-    const existingUser = await Carrier.findOne({ carrierID });
+    const existingUser = await Carrier.findOne({ tenantId, ...(companyId ? { company: companyId } : {}), carrierID });
     if (!existingUser) {
       isUnique = true;
     }
@@ -62,8 +73,8 @@ exports.addCarrier = catchAsync(async (req, res, next) => {
     zipcode: zipcode,
     created_by:req.user._id,
     mc_code: mc_code,
-    company:req.user && req.user.company ? req.user.company._id : null,
-    tenantId: req.tenantId,
+    company: companyId,
+    tenantId,
   }).then(result => {
     res.send({
       status: true,
@@ -82,9 +93,12 @@ exports.carriers_listing = catchAsync(async (req, res) => {
     const queryObj = {
       $or: [{ deletedAt: null }]
     };
-    if (req.tenantId) {
-      queryObj.tenantId = req.tenantId;
+    const tenantId = req.tenantId || req.user?.tenantId;
+    if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required.", carriers: [], totalDocuments: 0 });
     }
+    queryObj.tenantId = tenantId;
+    if (req.user?.company) queryObj.company = req.user.company._id;
 
     if (search && search.length >1) {
       const safeSearch = search.trim().replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
@@ -111,6 +125,12 @@ exports.carriers_listing = catchAsync(async (req, res) => {
 });
 
 exports.deleteCarrier = catchAsync(async (req, res) => {
+    const hasCarriersPermission = req.user?.permissions?.includes('carriers') || req.user?.permissions?.includes('subadmin');
+    const isAdmin = req.user?.is_admin === 1;
+    if (req.user && !isAdmin && !hasCarriersPermission) {
+      return res.status(403).json({ status: false, message: "You are not authorized to delete carriers." });
+    }
+
     try {
       const criteria = { _id: req.params.id };
       if (req.tenantId) criteria.tenantId = req.tenantId;
@@ -147,6 +167,12 @@ exports.deleteCarrier = catchAsync(async (req, res) => {
 });
 
 exports.updateCarrier = catchAsync(async (req, res, next) => {
+  const hasCarriersPermission = req.user?.permissions?.includes('carriers') || req.user?.permissions?.includes('subadmin');
+  const isAdmin = req.user?.is_admin === 1;
+  if (req.user && !isAdmin && !hasCarriersPermission) {
+    return res.status(403).json({ status: false, message: "You are not authorized to update carriers." });
+  }
+
   try { 
     const { mc_code, name, phone, email, emails, location, country, state, city, zipcode, secondary_email, secondary_phone } = req.body;
     if (mc_code) {
@@ -308,6 +334,9 @@ exports.getDistance = async (req, res) => {
     });
   } catch (error) {
     console.log("Directions API Error:", error.response?.data || error.message);
-    // res.status(200).json({ error: "Failed to fetch route info" });
+    res.status(200).json({
+      status: false,
+      msg: error.response?.data?.error_message || error.message || "Failed to fetch route info"
+    });
   }
 };

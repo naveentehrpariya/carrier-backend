@@ -38,6 +38,8 @@ const userController = require('../controllers/userController');
 const orderController = require('../controllers/orderController');
 const customerController = require('../controllers/customerController');
 const carrierController = require('../controllers/carrierController');
+const { checkOrderLimit } = require('../middlewares/planLimitsMiddleware');
+const { checkOrderModuleAccess } = require('../middlewares/planModulesMiddleware');
 
 // Import new tenant admin controller
 const tenantAdminController = require('../controllers/tenantAdminController');
@@ -175,7 +177,7 @@ router.delete('/user/delete', validateToken, userController.deleteCurrentUser);
 router.get('/user/staff-listing', validateToken, userController.staffListing);
 
 // Order routes with tenant filtering
-router.post('/order/add', validateToken, orderController.create_order);
+router.post('/order/add', validateToken, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
 router.put('/order/update/:id', validateToken, orderController.update_order);
 router.get('/order/listings', validateToken, orderController.order_listing);
 router.get('/order/detail/:id', validateToken, orderController.order_detail);

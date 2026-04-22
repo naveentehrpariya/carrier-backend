@@ -19,6 +19,10 @@ const sendEmail = async (options) => {
          subject: options.subject,
          html: options.message,
       };
+
+      
+
+
       const result = await transporter.sendMail(mailOptions);
       console.log('Email sent:', result);
       return result; 

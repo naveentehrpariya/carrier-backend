@@ -8,14 +8,14 @@ exports.addTrailer = catchAsync(async (req, res, next) => {
   try {
     const tenantId = req.tenantId || req.user?.tenantId;
     if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
-    const { plateNumber, type, length, make, model, notes, ratePerMile } = req.body;
+    const { plateNumber, unitNumber, vin, licenseNumber, type, length, make, model, notes, ratePerMile } = req.body;
     if (!plateNumber) return res.status(400).json({ status: false, message: 'Plate number is required' });
     const exists = await Trailer.findOne({ tenantId, plateNumber });
     if (exists) return res.status(400).json({ status: false, message: 'Trailer with this plate already exists' });
     const trailer = await Trailer.create({
       tenantId,
       company: req.user?.company ? req.user.company._id : null,
-      plateNumber, type, length, make, model, notes,
+      plateNumber, unitNumber, vin, licenseNumber, type, length, make, model, notes,
       ratePerMile: Number(ratePerMile) || 0,
       createdBy: req.user?._id
     });
@@ -73,6 +73,25 @@ exports.updateTrailer = catchAsync(async (req, res, next) => {
     }
     const trailer = await Trailer.findOneAndUpdate({ _id: id, tenantId }, payload, { new: true });
     res.json({ status: true, message: 'Trailer updated', trailer });
+  } catch (err) {
+    JSONerror(res, err, next);
+    logger(err);
+  }
+});
+
+exports.trailer_detail = catchAsync(async (req, res, next) => {
+  try {
+    const tenantId = req.tenantId || req.user?.tenantId;
+    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
+    const companyId = req.user?.company ? req.user.company._id : null;
+    const id = req.params.id;
+
+    const filter = { _id: id, tenantId, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
+    if (companyId) filter.company = companyId;
+
+    const trailer = await Trailer.findOne(filter).lean();
+    if (!trailer) return res.status(404).json({ status: false, message: 'Trailer not found' });
+    res.json({ status: true, trailer });
   } catch (err) {
     JSONerror(res, err, next);
     logger(err);

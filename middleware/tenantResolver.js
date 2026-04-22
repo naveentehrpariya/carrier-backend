@@ -106,27 +106,6 @@ const tenantResolver = catchAsync(async (req, res, next) => {
         });
       }
       
-      if (!tenant) {
-        console.log(`❌ Tenant not found for subdomain: ${subdomain}`);
-        return res.status(404).json({
-          status: false,
-          error: 'tenant_not_found',
-          message: 'Company not found or inactive',
-          subdomain: subdomain
-        });
-      }
-      
-      // Check if tenant subscription is active
-      if (!tenant.subscription || tenant.subscription.status !== 'active') {
-        console.log(`⚠️ Tenant subscription inactive: ${tenant.name}`);
-        return res.status(403).json({
-          status: false,
-          error: 'subscription_inactive',
-          message: 'Company subscription is inactive',
-          tenant: tenant.name
-        });
-      }
-      
       req.tenant = tenant;
       req.tenantId = tenant.tenantId;
       

@@ -10,8 +10,22 @@ const PaymentLogs = require("../db/PaymentLogs");
 const Trip = require("../db/Trip");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
 
-async function CreatePaymentLog(user, order, status, method, type, approval) {
-   const payment = PaymentLogs.create({
+function getTenantId(req) {
+   return req.tenantId || req.user?.tenantId || null;
+}
+
+function normalizeCompanyId(req) {
+   const raw = req.user?.company?._id || req.user?.company;
+   return raw ? String(raw) : null;
+}
+
+async function CreatePaymentLog(user, order, status, method, type, approval, tenantId, company) {
+   if (!tenantId) {
+      throw new Error('CreatePaymentLog: tenantId is required to create a payment log.');
+   }
+   const payment = await PaymentLogs.create({
+      tenantId,
+      company: company || null,
       order: order,
       method: method,
       status: status,
@@ -19,7 +33,6 @@ async function CreatePaymentLog(user, order, status, method, type, approval) {
       approval: "approved",
       updated_by: user,
    });
-   console.log(payment);
    return payment;
 }
 
@@ -84,6 +97,10 @@ async function generateUniqueSerialNumber(tenantId) {
 
 exports.create_order = catchAsync(async (req, res, next) => {
    try {
+      const tenantId = getTenantId(req);
+      if (!tenantId) {
+         return res.status(400).json({ status: false, message: "Tenant context is required." });
+      }
 
       const { company_name,
          customer_order_no,
@@ -102,6 +119,7 @@ exports.create_order = catchAsync(async (req, res, next) => {
          carrier_payment_method,
 
          order_type,
+         drivers,
          driver,
          truck,
          trailer,
@@ -116,10 +134,11 @@ exports.create_order = catchAsync(async (req, res, next) => {
          order_status,
        } = req.body;
  
-      const newOrderId = await generateUniqueSerialNumber(req.tenantId || req.user?.tenantId || 'legacy_tenant_001');
+      const newOrderId = await generateUniqueSerialNumber(tenantId);
       const order = await Order.create({
          company_name,
          serial_no : parseInt(newOrderId),
+         customer_order_no: customer_order_no ? String(customer_order_no).trim() : null,
          shipping_details,
 
          customer : customer,
@@ -133,6 +152,7 @@ exports.create_order = catchAsync(async (req, res, next) => {
          carrier_payment_method,
 
          order_type,
+         drivers: drivers || [],
          driver,
          truck,
          trailer,
@@ -170,6 +190,7 @@ exports.create_order = catchAsync(async (req, res, next) => {
                start_stop_index: 0,
                end_stop_index: locations.length - 1,
                driver: order.order_type === 'regular' ? order.driver : null,
+               drivers: order.order_type === 'regular' ? (order.drivers || []) : [],
                truck: order.order_type === 'regular' ? order.truck : null,
                trailer: order.order_type === 'regular' ? order.trailer : null,
                carrier: order.order_type === 'outsourcing' ? order.carrier : null,
@@ -198,8 +219,15 @@ exports.create_order = catchAsync(async (req, res, next) => {
 
 exports.update_order = catchAsync(async (req, res, next) => {
    try {
+      const tenantId = getTenantId(req);
+      if (!tenantId) {
+         return res.status(400).json({ status: false, message: "Tenant context is required." });
+      }
+      const companyId = normalizeCompanyId(req);
       const updateData = req.body;
-      const order = await Order.findByIdAndUpdate(req.params.id, updateData, {
+      const criteria = { _id: req.params.id, tenantId };
+      if (companyId) criteria.company = companyId;
+      const order = await Order.findOneAndUpdate(criteria, updateData, {
          new: true, 
          runValidators: true,
       });
@@ -215,7 +243,6 @@ exports.update_order = catchAsync(async (req, res, next) => {
          message: "Order updated successfully."
       });
    } catch (error) {
-      console.log(error);
       res.status(400).json({
          status: false,
          message: "Failed to update order.",
@@ -225,7 +252,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
 });
 
 exports.order_listing = catchAsync(async (req, res, next) => {
-   const { search, customer_id, carrier_id, sortby, status, paymentStatus } = req.query;
+   const { search, customer_id, carrier_id, driver_id, truck_id, trailer_id, created_by_id, sortby, status, paymentStatus } = req.query;
    
    const queryObj = {
       $or: [
@@ -235,9 +262,21 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       ]
    };
 
-   // Scope by tenant when available (including emulation)
-   if (req.tenantId) {
-      queryObj.tenantId = req.tenantId;
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required.", orders: [], page: 1, totalPages: 0 });
+   }
+   queryObj.tenantId = tenantId;
+   const companyId = normalizeCompanyId(req);
+   if (companyId) {
+      queryObj.$and = queryObj.$and || [];
+      queryObj.$and.push({
+         $or: [
+            { company: companyId },
+            { company: null },
+            { company: { $exists: false } }
+         ]
+      });
    }
 
    if(paymentStatus){
@@ -284,6 +323,35 @@ exports.order_listing = catchAsync(async (req, res, next) => {
          }
       }
    }
+
+   const mongoose = require('mongoose');
+   const setObjectIdFilter = (key, value) => {
+      const v = String(value || '').trim();
+      if (!v) return;
+      if (!mongoose.Types.ObjectId.isValid(v)) {
+         throw new Error('invalid_object_id');
+      }
+      queryObj[key] = v;
+   };
+
+   // Assigned fleet filters (Regular orders)
+   try {
+      if (driver_id) setObjectIdFilter('driver', driver_id);
+      if (truck_id) setObjectIdFilter('truck', truck_id);
+      if (trailer_id) setObjectIdFilter('trailer', trailer_id);
+      if (driver_id || truck_id || trailer_id) queryObj.order_type = 'regular';
+   } catch (e) {
+      return res.json({ status: true, orders: [], page: 1, totalPages: 0, message: "No orders found" });
+   }
+
+   // Admin filter: orders created by a specific employee (used in employee detail)
+   if (created_by_id && (req.user?.is_admin === 1 || req.user?.permissions?.includes('accounting'))) {
+      try {
+         setObjectIdFilter('created_by', created_by_id);
+      } catch (e) {
+         return res.json({ status: true, orders: [], page: 1, totalPages: 0, message: "No orders found" });
+      }
+   }
    
    if(status == 'added' || status == 'intransit' || status == 'completed'){
       queryObj.order_status = status;
@@ -294,19 +362,21 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       queryObj.created_by = req.user._id;
       // Debug logging in non-production
       if (process.env.NODE_ENV !== 'production') {
-         console.log('Staff user filter applied:', { userId: req.user._id, role: req.user.role, query: queryObj });
+         console.log('Staff user filter applied:', { userId: req.user._id, permissions: req.user.permissions, query: queryObj });
       }
    }
 
-   if (search && search.length >1) {
+   if (search && search.length > 1) {
       const searchValue = search.trim();
-      // Check if search is a number for serial_no search
       if (!isNaN(searchValue)) {
+         // Numeric: match by serial number
          queryObj.serial_no = parseInt(searchValue);
       } else {
-         // For non-numeric searches, you might want to search in other fields
-         // Currently keeping empty to only search serial numbers
-         queryObj.serial_no = -1; // This will not match any valid serial_no
+         // Non-numeric: search customer order number or company name
+         queryObj.$or = [
+            { customer_order_no: { $regex: searchValue, $options: 'i' } },
+            { company_name: { $regex: searchValue, $options: 'i' } },
+         ];
       }
    }
 
@@ -317,7 +387,7 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       
       let Query = new APIFeatures(
          Order.find(queryObj)
-            .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by'])
+            .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'truck', 'trailer'])
             .populate('documents_count'),
          req.query
       ).sort();
@@ -356,11 +426,21 @@ exports.order_listing = catchAsync(async (req, res, next) => {
 exports.order_listing_account = catchAsync(async (req, res) => {
    try {
       const { search } = req.query;
+      const tenantId = getTenantId(req);
+      const companyId = normalizeCompanyId(req);
       const queryObj = {
          $or: [{ deletedAt: null }]
       };
-      if (req.tenantId) {
-         queryObj.tenantId = req.tenantId;
+      if (tenantId) queryObj.tenantId = tenantId;
+      if (companyId) {
+         queryObj.$and = queryObj.$and || [];
+         queryObj.$and.push({
+            $or: [
+               { company: companyId },
+               { company: null },
+               { company: { $exists: false } }
+            ]
+         });
       }
       if (search && search.length >1) {
          const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // escape regex
@@ -374,7 +454,7 @@ exports.order_listing_account = catchAsync(async (req, res) => {
    
    let Query = new APIFeatures(
       Order.find(queryObj)
-         .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by'])
+         .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'truck', 'trailer'])
          .populate('documents_count'),
       req.query
    ).sort();
@@ -420,7 +500,14 @@ exports.order_listing_account = catchAsync(async (req, res) => {
 exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
    try { 
       const { status, method, notes, approve } = req.body;
+      const tenantId = getTenantId(req);
+      if (!tenantId) {
+         return res.status(400).json({ status: false, message: "Tenant context is required." });
+      }
+      const companyId = normalizeCompanyId(req);
       let order;
+      const criteria = { _id: req.params.id, tenantId };
+      if (companyId) criteria.company = companyId;
       if(req.params.type === 'customer'){ 
             const update = {
                customer_payment_status : status,
@@ -432,11 +519,11 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
             if (approve && req?.user?.is_admin == 1) {
                update.customer_payment_approved_by_admin = 1;
             }
-            order = await Order.findByIdAndUpdate(req.params.id, update, {
+            order = await Order.findOneAndUpdate(criteria, update, {
               new: true, 
               runValidators: true,
             });
-         await CreatePaymentLog(req.user?._id, req.params.id, status, method, 'customer', req?.user?.is_admin == 1 ? 'admin' : null);
+         await CreatePaymentLog(req.user?._id, req.params.id, status, method, 'customer', req?.user?.is_admin == 1 ? 'admin' : null, tenantId, companyId);
       } else { 
          const update = {
             carrier_payment_status :status,
@@ -448,30 +535,26 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
          if (approve && req?.user?.is_admin == 1) {
             update.carrier_payment_approved_by_admin = 1;
          }
-         order = await Order.findByIdAndUpdate(req.params.id, update, {
+         order = await Order.findOneAndUpdate(criteria, update, {
            new: true, 
            runValidators: true,
          });
-         await CreatePaymentLog(req.user?._id, req.params.id, status, method, "carrier", req?.user?.is_admin == 1 ? 'admin' : null);
+         await CreatePaymentLog(req.user?._id, req.params.id, status, method, "carrier", req?.user?.is_admin == 1 ? 'admin' : null, tenantId, companyId);
       }
-      if(!order){ 
-        res.send({
+      if(!order){
+        return res.send({
           status: false,
-          carrier : order,
           message: "failed to update order information.",
         });
-      } 
-      console.log(order);
+      }
       res.send({
          status: true,
-         error : order,
+         order: order,
          message: "Payment status has been updated.",
       });
    } catch (error) {
-      console.log(error);
       res.send({
         status: false,
-        error :error,
         message: "Failed to update order information.",
       });
     }
@@ -480,29 +563,34 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
 exports.updateOrderStatus = catchAsync(async (req, res) => {
    try { 
       const { status } = req.body;
-      const order  = await Order.findByIdAndUpdate(req.params.id, {
+      const tenantId = getTenantId(req);
+      if (!tenantId) {
+         return res.status(400).json({ status: false, message: "Tenant context is required." });
+      }
+      const companyId = normalizeCompanyId(req);
+      const criteria = { _id: req.params.id, tenantId };
+      if (companyId) criteria.company = companyId;
+      const order  = await Order.findOneAndUpdate(criteria, {
          order_status : status,
          updatedAt : Date.now(),
       }, {
          new: true, 
          runValidators: true,
       });
-      if(!order){ 
-        res.send({
+      if(!order){
+        return res.send({
           status: false,
-          carrier : order,
           message: "failed to update order information.",
         });
-      } 
+      }
       res.send({
         status: true,
-        error :order,
+        order: order,
         message: "Order status has been updated.",
       });
     } catch (error) {
       res.send({
         status: false,
-        error :error,
         message: "Failed to update order information.",
       });
     }
@@ -511,25 +599,29 @@ exports.updateOrderStatus = catchAsync(async (req, res) => {
 exports.addnote = catchAsync(async (req, res) => {
    try { 
       const { notes } = req.body;
-      console.log("req.params.id",req.params.id)
-      const order  = await Order.findByIdAndUpdate(req.params.id, {
+      const tenantId = getTenantId(req);
+      if (!tenantId) {
+         return res.status(400).json({ status: false, message: "Tenant context is required." });
+      }
+      const companyId = normalizeCompanyId(req);
+      const criteria = { _id: req.params.id, tenantId };
+      if (companyId) criteria.company = companyId;
+      const order  = await Order.findOneAndUpdate(criteria, {
          notes : notes,
          updatedAt : Date.now(),
       }, {
-         new: true, 
+         new: true,
          runValidators: true,
       });
-      if(!order){ 
-        res.send({
+      if(!order){
+        return res.send({
           status: false,
-          carrier : order,
           message: "failed to add note on this order.",
         });
-      } 
-      console.log("order",order)
+      }
       res.send({
         status: true,
-        error :order,
+        order: order,
         message: "Note has been added.",
       });
     } catch (error) {
@@ -557,14 +649,24 @@ exports.overview = catchAsync(async (req, res) => {
    
    // Check if this is a super admin emulating a tenant
    const isEmulating = req.isEmulating || req.isSuperAdminUser;
-   const isRegularUser = req.user.role === 1 && !isEmulating;
+   
+   // A user is regular (staff) if they are NOT an admin (role 3) and NOT is_admin=1
+   const isRegularUser = req.user.role !== 3 && req.user.is_admin !== 1 && !isEmulating;
    
    if(isRegularUser){
       // For regular users (non-admin, non-emulating), include created_by filter
-      queryFilter = {
-         created_by: req.user._id,
-         ...baseDeletedFilter
-      };
+      // Or if they are a driver (role 0), filter by driver assignment
+      if (req.user.role === 0) {
+         queryFilter = {
+            driver: req.user._id,
+            ...baseDeletedFilter
+         };
+      } else {
+         queryFilter = {
+            created_by: req.user._id,
+            ...baseDeletedFilter
+         };
+      }
    } else {
       // For admin users or super admins emulating, only apply deleted filter
       queryFilter = baseDeletedFilter;
@@ -573,19 +675,22 @@ exports.overview = catchAsync(async (req, res) => {
    // Scope dashboard counts by tenant when available
    if (req.tenantId) {
       queryFilter.tenantId = req.tenantId;
-      console.log('📊 Overview: Using tenantId filter:', req.tenantId);
-   } else {
-      console.log('⚠️ Overview: No tenantId provided - this might show all data!');
+   } else if (process.env.NODE_ENV !== 'production') {
+      console.warn('⚠️ Overview: No tenantId provided - this might show all data!');
+   }
+
+   const companyId = normalizeCompanyId(req);
+   if (companyId) {
+      queryFilter.$and = queryFilter.$and || [];
+      queryFilter.$and.push({
+         $or: [
+            { company: companyId },
+            { company: null },
+            { company: { $exists: false } }
+         ]
+      });
    }
    
-   // Debug logging for emulation
-   if (isEmulating) {
-      console.log('🎭 Super admin emulating tenant dashboard');
-      console.log('   req.user.role:', req.user.role);
-      console.log('   req.tenantId:', req.tenantId);
-      console.log('   req.isEmulating:', req.isEmulating);
-      console.log('   req.isSuperAdminUser:', req.isSuperAdminUser);
-   }
    
    // Count documents with proper filter
    totalLoads = await Order.countDocuments(queryFilter);
@@ -600,9 +705,39 @@ exports.overview = catchAsync(async (req, res) => {
    // customer payments
    customercompletedPayments = await Order.countDocuments({ customer_payment_status: 'paid', ...queryFilter });
    customerpendingPayments = await Order.countDocuments({ customer_payment_status: { $ne: 'paid' }, ...queryFilter });
+
+   // Generate chart data for the last 6 months (Revenue & Loads)
+   const chartData = [];
+   const today = new Date();
+   for (let i = 5; i >= 0; i--) {
+      const startOfMonth = new Date(today.getFullYear(), today.getMonth() - i, 1);
+      const endOfMonth = new Date(today.getFullYear(), today.getMonth() - i + 1, 0, 23, 59, 59);
+      const monthFilter = { ...queryFilter, createdAt: { $gte: startOfMonth, $lte: endOfMonth } };
+      
+      const monthlyOrders = await Order.find(monthFilter)
+         .select('total_amount carrier_amount order_type created_by')
+         .populate({ path: 'created_by', select: 'staff_commision' });
+      
+      let monthlyRevenue = 0;
+      let monthlyProfit = 0;
+      monthlyOrders.forEach(o => {
+         monthlyRevenue += Number(o.total_amount) || 0;
+         monthlyProfit += Number(o.profit) || 0;
+      });
+
+      const monthName = startOfMonth.toLocaleString('default', { month: 'short' });
+      chartData.push({
+         name: monthName,
+         loads: monthlyOrders.length,
+         revenue: monthlyRevenue,
+         profit: monthlyProfit
+      });
+   }
+
    res.json({
       status: true,
       message: 'Dashboard data retrieved successfully.',
+      chartData: chartData,
       lists: [
          { icon:"van",bg:'bg-green-700', title : 'Total Loads', data: totalLoads, link: '/orders' },
          { icon:"van",bg:'bg-green-700', title : 'Intransit Loads', data: intransitLoads, link:"/orders?status=intransit" },
@@ -650,11 +785,24 @@ exports.order_detail = catchAsync(async (req, res) => {
 
 exports.order_docs = catchAsync(async (req, res) => {
    const id = req.params.id;
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required.", files: [], paymentLogs: [] });
+   }
+   const companyId = normalizeCompanyId(req);
+   const orderCriteria = { _id: id, tenantId };
+   if (companyId) orderCriteria.company = companyId;
+   const order = await Order.findOne(orderCriteria).select('_id').lean();
+   if (!order) {
+      return res.status(404).json({ status: false, message: "Order not found.", files: [], paymentLogs: [] });
+   }
+   const notDeleted = { $or: [{ deletedAt: null }, { deletedAt: '' }, { deletedAt: { $exists: false } }] };
    const files = await Files.find({
-      order : id,
-      deletedAt : null || ''
-    }).populate('added_by');
-    let paymentLogs = await PaymentLogs.find({order: id}).populate('updated_by');
+      tenantId,
+      order: id,
+      ...notDeleted
+   }).populate('added_by');
+    let paymentLogs = await PaymentLogs.find({ tenantId, order: id }).populate('updated_by');
     paymentLogs = paymentLogs ? paymentLogs.reverse() : [];
     if(!files){ 
       res.json({
@@ -664,7 +812,6 @@ exports.order_docs = catchAsync(async (req, res) => {
          message: "files not found."
        });
     }
-    console.log("files",files)
    res.json({
       status: true,
       paymentLogs: paymentLogs ?? [],
@@ -681,9 +828,16 @@ exports.lockOrder = catchAsync(async (req, res) => {
       });
    }
    const id = req.params.id;
-   const order = await Order.findById(id);
-   if(!order){ 
-      res.json({
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required." });
+   }
+   const companyId = normalizeCompanyId(req);
+   const criteria = { _id: id, tenantId };
+   if (companyId) criteria.company = companyId;
+   const order = await Order.findOne(criteria);
+   if(!order){
+      return res.json({
          status: false,
          message: "Order not found."
        });
@@ -710,7 +864,14 @@ exports.deleteOrder = catchAsync(async (req, res) => {
    }
 
    const id = req.params.id;
-   const order = await Order.findById(id);
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required." });
+   }
+   const companyId = normalizeCompanyId(req);
+   const criteria = { _id: id, tenantId };
+   if (companyId) criteria.company = companyId;
+   const order = await Order.findOne(criteria);
    if(!order){ 
       res.json({
          status: false,
@@ -877,7 +1038,6 @@ exports.removeEquipment = catchAsync(async (req, res, next) => {
       });
    }
    
-   console.log("id",id)
    Equipment.deleteOne({ _id: id, tenantId })
      .then((result) => {
        if (result.deletedCount === 0) {
@@ -1072,7 +1232,7 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
       queryObj.created_by = req.user._id;
       // Debug logging in non-production
       if (process.env.NODE_ENV !== 'production') {
-         console.log('Staff user payments filter applied:', { userId: req.user._id, role: req.user.role, query: queryObj });
+         console.log('Staff user payments filter applied:', { userId: req.user._id, permissions: req.user.permissions, query: queryObj });
       }
    }
 

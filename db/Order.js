@@ -1,16 +1,16 @@
 const { default: mongoose } = require('mongoose');
 const mongo = require('mongoose'); 
 const schema = new mongo.Schema({
-    // customer_order_no:  {
-    //     type:String,
-    //     minlength: 1,
-    //     required:[true, 'Please enter customer order number.'],
-    // }, 
+    customer_order_no:  {
+        type: String,
+        trim: true,
+        default: null,
+        index: true
+    },
     tenantId: { 
         type: String, 
         required: true, 
         index: true,
-        default: 'legacy_tenant_001' // Default for existing data migration
     },
     company: { type: mongoose.Schema.Types.ObjectId, ref: 'companies' },
     company_name:{ 
@@ -35,6 +35,7 @@ const schema = new mongo.Schema({
         index: true
     },
     driver: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
+    drivers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'users' }],
     truck: { type: mongoose.Schema.Types.ObjectId, ref: 'trucks' },
     trailer: { type: mongoose.Schema.Types.ObjectId, ref: 'trailers' },
     total_amount: {
@@ -161,6 +162,7 @@ schema.query.notDeleted = function () {
 
 schema.virtual('commission').get(function () {
     const totalAmount = this.total_amount || 0;
+    if (this.order_type !== 'outsourcing') return 0;
     const staffCommissionRate = this.created_by?.staff_commision || 0;
     return totalAmount * (staffCommissionRate / 100);
 });
@@ -175,8 +177,9 @@ schema.virtual('carrier_final_payment_status').get(function () {
 
 schema.virtual('profit').get(function () {
     const totalAmount = this.total_amount || 0;
-    const carrierAmount = this.carrier_amount || 0;
-    const staffCommissionRate = this.created_by?.staff_commision || 0;
+    const isOutsourcing = this.order_type === 'outsourcing';
+    const carrierAmount = isOutsourcing ? (this.carrier_amount || 0) : 0;
+    const staffCommissionRate = isOutsourcing ? (this.created_by?.staff_commision || 0) : 0;
     const commission = totalAmount * (staffCommissionRate / 100);
     const profit = totalAmount - commission - carrierAmount;
     return profit;

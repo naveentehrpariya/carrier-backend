@@ -21,6 +21,7 @@ const connectDB = require('./db/config'); // Adjust path as needed
 connectDB();
 const multer = require('multer');
 const Files = require('./db/Files');
+const Order = require('./db/Order');
 const os = require('os');
 // const corsOptions = {
 //   origin: '*',
@@ -51,6 +52,7 @@ app.use("", require('./routes/customerRoutes'));
 app.use("", require('./routes/driverRoutes'));
 app.use("", require('./routes/fleetRoutes'));
 app.use("", require('./routes/tripRoutes'));
+app.use("", require('./routes/searchRoutes'));
 app.use("/api/migration", require('./routes/migrationRoutes'));
 app.use("/api/tenant-admin", require('./routes/tenantAdmin'));
 app.use("/api/super-admin", require('./routes/superAdmin'));
@@ -92,6 +94,17 @@ app.post("/cloud/upload/:id", validateToken, multerParse.fields([{name: "attachm
       return res.status(400).json({ message: "No file uploaded" });
     }
     try {
+      const tenantId = req.tenantId || req.user?.tenantId;
+      if (!tenantId) {
+        return res.status(400).json({ status: false, message: "Tenant context is required" });
+      }
+      const companyId = req.user?.company?._id || req.user?.company || null;
+      const orderCriteria = { _id: orderid, tenantId };
+      if (companyId) orderCriteria.company = companyId;
+      const order = await Order.findOne(orderCriteria).select('_id').lean();
+      if (!order) {
+        return res.status(404).json({ status: false, message: "Order not found" });
+      }
       const uploadResponse = await fileupload(attachment);
       console.log("req.user._id",req.user._id)
       if (uploadResponse) {
@@ -102,6 +115,8 @@ app.post("/cloud/upload/:id", validateToken, multerParse.fields([{name: "attachm
           url: uploadResponse.url,
           order: orderid,
           size : uploadResponse.size,
+          tenantId,
+          company: companyId,
           added_by: req.user._id
         });
         const fileupoaded = await file.save();
@@ -145,6 +160,17 @@ app.post("/upload/employee/doc/:id", validateToken, multerParse.fields([{name: "
       return res.status(400).json({ message: "No file uploaded" });
     }
     try {
+      const tenantId = req.tenantId || req.user?.tenantId;
+      if (!tenantId) {
+        return res.status(400).json({ status: false, message: "Tenant context is required" });
+      }
+      const companyId = req.user?.company?._id || req.user?.company || null;
+      const userCriteria = { _id: userid, tenantId };
+      if (companyId) userCriteria.company = companyId;
+      const employee = await User.findOne(userCriteria).select('_id').lean();
+      if (!employee) {
+        return res.status(404).json({ status: false, message: "Employee not found" });
+      }
       const uploadResponse = await fileupload(attachment);
       if (uploadResponse) {
         const file = new EmployeeDoc({
@@ -154,6 +180,8 @@ app.post("/upload/employee/doc/:id", validateToken, multerParse.fields([{name: "
           url: uploadResponse.url,
           user: userid,
           size : uploadResponse.size,
+          tenantId,
+          company: companyId,
           added_by: req.user._id
         });
         const fileupoaded = await file.save();

@@ -72,7 +72,9 @@ const validateToken = catchAsync ( async (req, res, next) => {
 });
   
 const editUser = catchAsync(async (req, res, next) => {
-  if(req.user && req.user.is_admin !== 1){
+  // Authorization check: allow if is_admin === 1 OR role === 3 (Tenant Admin)
+  const hasEmployeesPermission = req.user?.permissions?.includes('employees') || req.user?.permissions?.includes('subadmin');
+  if (req.user && req.user.is_admin !== 1 && req.user.role !== 3 && !hasEmployeesPermission) {
     return res.json({
       status : false,
       message : "You are not authorized to access this route."
@@ -122,29 +124,14 @@ const editUser = catchAsync(async (req, res, next) => {
     const payload = {
       name: req.body.name,
       email: req.body.email, 
-      staff_commision : req.body.role === 1 ? req.body.staff_commision : null,
+      staff_commision : (req.body.permissions?.includes('regular') || req.body.permissions?.includes('outsourcing') || req.body.permissions?.includes('subadmin')) ? req.body.staff_commision : null,
       country: req.body.country,
       phone: req.body.phone,
       position: req.body.position,
       address: req.body.address,
-      role: req.body.role,
+      permissions: req.body.permissions || [],
+      modulesCustomized: false
     };
-    if (Array.isArray(req.body.allowedModules)) {
-      let cleaned = req.body.allowedModules.filter(m => m === 'outsourcing' || m === 'regular');
-      
-      // Filter by plan modules
-      try {
-        const tenant = await Tenant.findOne({ tenantId: tenantIdFromContext });
-        if (tenant && tenant.subscription && Array.isArray(tenant.subscription.allowedModules)) {
-          const planModules = tenant.subscription.allowedModules;
-          cleaned = cleaned.filter(m => planModules.includes(m));
-        }
-      } catch (err) {
-        console.error('Edit user plan modules check error:', err);
-      }
-      
-      payload.allowedModules = cleaned.length ? cleaned : ['outsourcing', 'regular'];
-    }
     const result = await User.findByIdAndUpdate(req.params.id, payload, { new: true, includeInactive: true });
     
     result.password = undefined;
@@ -160,7 +147,8 @@ const editUser = catchAsync(async (req, res, next) => {
 });
 
 const suspandUser = catchAsync(async (req, res, next) => {
-  if(req.user && req.user.is_admin !== 1){
+  const hasEmployeesPermission = req.user?.permissions?.includes('employees') || req.user?.permissions?.includes('subadmin');
+  if(req.user && req.user.is_admin !== 1 && req.user.role !== 3 && !hasEmployeesPermission){
     return res.json({
       status : false,
       message : "You are not authorized to access this route."
@@ -213,15 +201,16 @@ const suspandUser = catchAsync(async (req, res, next) => {
 
 const signup = catchAsync(async (req, res, next) => {
   // Extract fields and explicitly exclude tenantId from body
-  const { role, name, email, avatar, password, generateAutoPassword, staff_commision, position, country, phone, address, allowedModules } = req.body;
+  const { permissions, name, email, avatar, password, generateAutoPassword, staff_commision, position, country, phone, address } = req.body;
   
   // Prevent client from setting tenantId
   if ('tenantId' in req.body) {
     delete req.body.tenantId;
   }
   
-  // Authorization check
-  if(req.user && req.user.is_admin !== 1){
+  // Authorization check: allow if is_admin === 1 or role === 3 or has permission
+  const hasEmployeesPermission = req.user?.permissions?.includes('employees') || req.user?.permissions?.includes('subadmin');
+  if (req.user && req.user.is_admin !== 1 && req.user.role !== 3 && !hasEmployeesPermission) {
     return res.json({
       status : false,
       message : "You are not authorized to create user."
@@ -269,7 +258,7 @@ const signup = catchAsync(async (req, res, next) => {
   let corporateID;
   let isUnique = false;
   while (!isUnique) {
-    corporateID = `CCID${Math.floor(100000 + Math.random() * 900000)}`;
+    corporateID = `CCID${crypto.randomInt(100000, 1000000)}`;
     const existingUser = await User.findOne({ corporateID }, null, { includeInactive: true });
     if (!existingUser) {
       isUnique = true;
@@ -278,27 +267,11 @@ const signup = catchAsync(async (req, res, next) => {
 
   await User.syncIndexes();
   
-  // Validate allowedModules against plan
-  let finalModules = Array.isArray(allowedModules) && allowedModules.length 
-    ? allowedModules.filter(m => m === 'outsourcing' || m === 'regular') 
-    : ['outsourcing', 'regular'];
-  
-  try {
-    const tenant = await Tenant.findOne({ tenantId: tenantIdFromContext });
-    if (tenant && tenant.subscription && Array.isArray(tenant.subscription.allowedModules)) {
-      const planModules = tenant.subscription.allowedModules;
-      finalModules = finalModules.filter(m => planModules.includes(m));
-      if (finalModules.length === 0) finalModules = ['outsourcing', 'regular'];
-    }
-  } catch (err) {
-    console.error('Signup plan modules check error:', err);
-  }
-
   try {
     const result = await User.create({
       name: name,
       email: email, 
-      staff_commision : role === 1 ? staff_commision : null,
+      staff_commision : (permissions?.includes('regular') || permissions?.includes('outsourcing') || permissions?.includes('subadmin')) ? staff_commision : null,
       avatar: avatar || '',
       corporateID: corporateID,
       created_by: creator && creator._id,
@@ -306,12 +279,12 @@ const signup = catchAsync(async (req, res, next) => {
       country: country,
       phone: phone,
       address: address,
-      role: role,
       company: creator && creator.company ? creator.company._id : null,
       position: position,
       confirmPassword: generatedPassword,
       tenantId: tenantIdFromContext,
-      allowedModules: finalModules
+      permissions: permissions || [],
+      modulesCustomized: false
     });
     
     // Debug logging for development
@@ -331,7 +304,6 @@ const signup = catchAsync(async (req, res, next) => {
         name: name,
         generatedPassword: generatedPassword,
         email: email,
-        role : role,
         corporateID: corporateID
       },
       user: result,
@@ -387,25 +359,9 @@ const login = catchAsync ( async (req, res, next) => {
   user.password = undefined;
   user.confirmPassword = undefined;
 
-  // Calculate effective modules for login response
-  let effectiveModules = ['outsourcing', 'regular'];
-  const isTenantAdmin = user.role === 3 || user.is_admin === 1;
-  try {
-    const tenant = await Tenant.findOne({ tenantId: normalizedTenantId });
-    if (tenant && tenant.subscription && Array.isArray(tenant.subscription.allowedModules)) {
-      const planModules = tenant.subscription.allowedModules;
-      if (isTenantAdmin) {
-        effectiveModules = planModules;
-      } else {
-        const userModules = Array.isArray(user.allowedModules) ? user.allowedModules : ['outsourcing', 'regular'];
-        effectiveModules = userModules.filter(m => planModules.includes(m));
-      }
-    }
-  } catch (err) {
-    console.error('Login plan modules check error:', err);
-  }
-  user.allowedModules = effectiveModules.length ? effectiveModules : ['outsourcing', 'regular'];
-  user.isTenantAdmin = isTenantAdmin;
+  // Ensure permissions array exists
+  user.permissions = user.permissions || [];
+  user.isTenantAdmin = user.is_admin === 1;
 
    res.status(200).json({
     status :true,
@@ -426,24 +382,28 @@ const profile = catchAsync ( async (req, res) => {
   const isSuperAdmin = req.isSuperAdminUser || req.superAdmin;
   const isEmulating = req.isEmulating && req.tenantId;
   
+  const validModules = ['outsourcing', 'regular'];
+  const sanitizeModules = (value) => Array.isArray(value)
+    ? value.map((m) => String(m).toLowerCase().trim()).filter((m) => validModules.includes(m))
+    : [];
+
   let userProfile = {
     _id: req.user._id,
     id: req.user._id,
     name: req.user.name,
     email: req.user.email,
     status: req.user.status || 'active',
-    role: req.user.role,
+    permissions: req.user.permissions || [],
     corporateID: req.user.corporateID,
     is_admin: req.user.is_admin,
-    isTenantAdmin: req.user.role === 3 || req.user.is_admin === 1,
+    isTenantAdmin: req.user.is_admin === 1,
     tenantId: req.user.tenantId,
     position: req.user.position,
     phone: req.user.phone,
     country: req.user.country,
     address: req.user.address,
     avatar: req.user.avatar,
-    createdAt: req.user.createdAt,
-    allowedModules: req.user.allowedModules || ['outsourcing', 'regular']
+    createdAt: req.user.createdAt
   };
 
   // If emulating or regular user, we should intersect with plan modules
@@ -452,30 +412,44 @@ const profile = catchAsync ( async (req, res) => {
     try {
       const tenant = await Tenant.findOne({ tenantId: tenantIdForPlan });
       if (tenant && tenant.subscription) {
-        let planModules = Array.isArray(tenant.subscription.allowedModules) ? tenant.subscription.allowedModules : ['outsourcing', 'regular'];
+        let planModules = sanitizeModules(tenant.subscription.allowedModules);
         
         // Fallback to plan record if cached is default and plan exists
         if (tenant.subscription.plan) {
           try {
             const SubscriptionPlan = require('../db/SubscriptionPlan');
-            const planRecord = await SubscriptionPlan.findById(tenant.subscription.plan);
+            const rawPlanRef = tenant.subscription.plan;
+            let planRecord = null;
+            const planRefStr = String(rawPlanRef || '');
+            if (require('mongoose').Types.ObjectId.isValid(planRefStr)) {
+              planRecord = await SubscriptionPlan.findById(planRefStr);
+            } else if (typeof rawPlanRef === 'string' && rawPlanRef.trim()) {
+              planRecord = await SubscriptionPlan.findOne({ slug: rawPlanRef.trim(), isActive: true });
+            } else if (tenant.subscription.planSlug) {
+              planRecord = await SubscriptionPlan.findOne({ slug: tenant.subscription.planSlug, isActive: true });
+            }
             if (planRecord && Array.isArray(planRecord.allowedModules) && planRecord.allowedModules.length > 0) {
-              planModules = planRecord.allowedModules;
+              planModules = sanitizeModules(planRecord.allowedModules);
             }
           } catch (planErr) {
             console.error('Plan fetch error in profile:', planErr);
           }
         }
+        if (!planModules.length) planModules = ['outsourcing'];
 
-        const userModules = Array.isArray(req.user.allowedModules) ? req.user.allowedModules : ['outsourcing', 'regular'];
-        
-        // Super admin emulating or Tenant Admin gets all plan modules
-        if ((isSuperAdmin && isEmulating) || req.user.role === 3 || req.user.is_admin === 1) {
-           userProfile.allowedModules = planModules;
-        } else {
-           userProfile.allowedModules = userModules.filter(m => planModules.includes(m));
+        // Remove regular/outsourcing permissions from userProfile if they aren't in the plan
+        userProfile.permissions = userProfile.permissions.filter(p => {
+          if (p === 'regular' || p === 'outsourcing') {
+            return planModules.includes(p);
+          }
+          return true;
+        });
+
+        // Super admin emulating gets all plan modules
+        if (isSuperAdmin && isEmulating) {
+           if (planModules.includes('regular') && !userProfile.permissions.includes('regular')) userProfile.permissions.push('regular');
+           if (planModules.includes('outsourcing') && !userProfile.permissions.includes('outsourcing')) userProfile.permissions.push('outsourcing');
         }
-        if (userProfile.allowedModules.length === 0) userProfile.allowedModules = ['outsourcing', 'regular'];
       }
     } catch (err) {
       console.error('Plan modules fetch error:', err);
@@ -525,6 +499,10 @@ const profile = catchAsync ( async (req, res) => {
 const employeesLisiting = catchAsync ( async (req, res) => {
   // Get tenant ID from request context (prefer req.tenantId from tenant resolver)
   const tenantId = req.tenantId || req.user?.tenantId;
+  const validModules = ['outsourcing', 'regular'];
+  const sanitizeModules = (value) => Array.isArray(value)
+    ? value.map((m) => String(m).toLowerCase().trim()).filter((m) => validModules.includes(m))
+    : [];
   
   if (!tenantId) {
     return res.status(400).json({
@@ -535,15 +513,35 @@ const employeesLisiting = catchAsync ( async (req, res) => {
     });
   }
   
-  // Build filter using tenant context and exclude admins
+  // Build filter using tenant context and exclude admins and drivers
   const baseFilter = { 
     tenantId: tenantId,
-    is_admin: { $ne: 1 } // Exclude admin users from employee listing
+    is_admin: { $ne: 1 }, // Exclude admin users from employee listing
+    permissions: { $ne: 'driver' } // Exclude drivers
   };
   
   // If dbFilter from tenantDataFilter middleware exists, merge it
   if (req.dbFilter) {
     Object.assign(baseFilter, req.dbFilter);
+  }
+
+  let planModules = ['outsourcing', 'regular'];
+  try {
+    const tenant = await Tenant.findOne({ tenantId }).select('subscription.allowedModules').lean();
+    const fromTenant = sanitizeModules(tenant?.subscription?.allowedModules);
+    if (fromTenant.length) planModules = fromTenant;
+  } catch (e) {}
+
+  let companyEffectiveModules = planModules;
+  const isTenantAdmin = req.user?.is_admin === 1 || req.user?.is_admin === 1 || req.user?.isTenantAdmin === true;
+  if (isTenantAdmin) {
+    const adminModules = sanitizeModules(req.user?.allowedModules);
+    const legacyRestricted = adminModules.length > 0 && planModules.length > 0 && adminModules.length < planModules.length;
+    const useAdminModules = (req.user?.modulesCustomized === true || legacyRestricted) && adminModules.length > 0;
+    if (useAdminModules) {
+      const clipped = adminModules.filter((m) => planModules.includes(m));
+      if (clipped.length) companyEffectiveModules = clipped;
+    }
   }
   
   // Debug logging for development
@@ -561,17 +559,32 @@ const employeesLisiting = catchAsync ( async (req, res) => {
   try {
     // Use Mongoose query with proper filtering - exclude inactive users
     const employees = await User.find(baseFilter)
-      .select('name email status role tenantId createdAt position phone country address corporateID created_by')
+      .select('name email status tenantId createdAt position phone country address corporateID created_by permissions staff_commision modulesCustomized')
       .sort({ createdAt: -1 })
       .lean();
     
-    const totalDocuments = employees.length;
+    const employeesWithEffective = employees.map((emp) => {
+      // Ensure permissions array exists
+      emp.permissions = Array.isArray(emp.permissions) ? emp.permissions : [];
+      
+      // Filter regular/outsourcing permissions based on company's plan modules
+      emp.permissions = emp.permissions.filter(p => {
+        if (p === 'regular' || p === 'outsourcing') {
+          return companyEffectiveModules.includes(p);
+        }
+        return true;
+      });
+      
+      return emp;
+    });
+    
+    const totalDocuments = employeesWithEffective.length;
     
     // Debug logging for development
     if (process.env.NODE_ENV !== 'production') {
       console.log(`✅ Found ${totalDocuments} employees for tenant "${tenantId}"`);
-      if (employees.length > 0) {
-        console.log('First few employees:', employees.slice(0, 3).map(emp => ({ 
+      if (employeesWithEffective.length > 0) {
+        console.log('First few employees:', employeesWithEffective.slice(0, 3).map(emp => ({ 
           name: emp.name, 
           email: emp.email, 
           tenantId: emp.tenantId 
@@ -581,7 +594,7 @@ const employeesLisiting = catchAsync ( async (req, res) => {
     
     res.status(200).json({
       status: true,
-      lists: employees,
+      lists: employeesWithEffective,
       totalDocuments: totalDocuments
     });
   } catch (error) {
@@ -597,6 +610,11 @@ const employeesLisiting = catchAsync ( async (req, res) => {
 
 const employeeDetail = catchAsync ( async (req, res) => {
   const employeeId = req.params.id;
+  const tenantId = req.tenantId || req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(400).json({ status: false, message: "Tenant context is required.", employee: null });
+  }
+  const companyId = req.user?.company?._id || req.user?.company || null;
   
   // Validate employee ID
   if (!employeeId || employeeId === 'undefined' || employeeId === 'null') {
@@ -614,7 +632,9 @@ const employeeDetail = catchAsync ( async (req, res) => {
       employee: null
     });
   }
-  const employee = await User.findById(employeeId, null, { includeInactive: true }).populate('company');
+  const criteria = { _id: employeeId, tenantId };
+  if (companyId) criteria.company = companyId;
+  const employee = await User.findOne(criteria, null, { includeInactive: true }).populate('company').lean();
   
   if (!employee) {
     return res.status(404).json({
@@ -623,6 +643,23 @@ const employeeDetail = catchAsync ( async (req, res) => {
       employee: null
     });
   }
+  
+  // Calculate effective permissions for employee detail view based on tenant plan
+  let planModules = ['outsourcing', 'regular'];
+  try {
+    const tenant = await Tenant.findOne({ tenantId }).select('subscription.allowedModules').lean();
+    if (tenant?.subscription?.allowedModules) {
+      planModules = tenant.subscription.allowedModules.map(m => String(m).toLowerCase().trim()).filter(m => ['outsourcing', 'regular'].includes(m));
+    }
+  } catch (e) {}
+
+  employee.permissions = Array.isArray(employee.permissions) ? employee.permissions : [];
+  employee.permissions = employee.permissions.filter(p => {
+    if (p === 'regular' || p === 'outsourcing') {
+      return planModules.includes(p);
+    }
+    return true;
+  });
   
   // Remove sensitive information
   employee.password = undefined;
@@ -636,6 +673,11 @@ const employeeDetail = catchAsync ( async (req, res) => {
 
 const employeesDocs = catchAsync ( async (req, res) => {
   const employeeId = req.params.id;
+  const tenantId = req.tenantId || req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(400).json({ status: false, message: "Tenant context is required.", documents: [] });
+  }
+  const companyId = req.user?.company?._id || req.user?.company || null;
   
   // Validate employee ID
   if (!employeeId || employeeId === 'undefined' || employeeId === 'null') {
@@ -655,7 +697,13 @@ const employeesDocs = catchAsync ( async (req, res) => {
     });
   }
   
-  const documents = await EmployeeDoc.find({ user: employeeId }).populate('added_by').sort({ createdAt: -1 });
+  const employeeCriteria = { _id: employeeId, tenantId };
+  if (companyId) employeeCriteria.company = companyId;
+  const employee = await User.findOne(employeeCriteria).select('_id').lean();
+  if (!employee) {
+    return res.status(404).json({ status: false, message: "Employee not found.", documents: [] });
+  }
+  const documents = await EmployeeDoc.find({ tenantId, user: employeeId }).populate('added_by').sort({ createdAt: -1 });
   console.log("documents", documents);
   
   res.status(200).json({
@@ -891,21 +939,68 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
 
 const changePassword = async (req, res) => {
     try {
-        const { id, password } = req.body;
+        const { id, password, currentPassword } = req.body;
+
+        const tenantId = req.tenantId || req.user?.tenantId || null;
+        if (!tenantId) {
+          return res.status(400).json({
+            status: false,
+            message: 'Tenant context required.'
+          });
+        }
+
+        const targetId = id || req.user?._id || req.user?.id;
+        if (!targetId) {
+          return res.status(400).json({
+            status: false,
+            message: 'User id is required.'
+          });
+        }
+
+        const requesterId = req.user?._id || req.user?.id;
+        const isSelf = requesterId && String(targetId) === String(requesterId);
+        const isTenantAdmin = req.user?.is_admin === 1 || req.user?.is_admin === 1 || req.user?.isTenantAdmin;
+
+        if (!isSelf && !isTenantAdmin) {
+          return res.status(403).json({
+            status: false,
+            message: 'Not allowed to change password for this user.'
+          });
+        }
+
+        if (!password || typeof password !== 'string' || password.length < 8) {
+          return res.status(400).json({
+            status: false,
+            message: 'Password must be at least 8 characters long.'
+          });
+        }
 
         // 1. Find the user with password field included
-        const user = await User.findById(id).select('+password');
+        const criteria = { _id: targetId, tenantId };
+        const companyId = req.user?.company?._id || req.user?.company || null;
+        if (companyId) criteria.company = companyId;
+
+        const user = await User.findOne(criteria).select('+password');
         if (!user) return res.status(200).json({ 
           status: false,
           message: 'User not found.' 
         });
 
-        // // 2. Check if current password matches
-        // const isMatch = await user.checkPassword(password, user.password);
-        // if (!isMatch) return res.status(401).json({ 
-        //   status: false,
-        //   message: 'Current password is incorrect.'
-        // });
+        if (isSelf) {
+          if (!currentPassword || typeof currentPassword !== 'string') {
+            return res.status(400).json({
+              status: false,
+              message: 'Current password is required.'
+            });
+          }
+          const isMatch = await user.checkPassword(currentPassword, user.password);
+          if (!isMatch) {
+            return res.status(401).json({
+              status: false,
+              message: 'Current password is incorrect.'
+            });
+          }
+        }
 
         user.password = password;
         user.changedPasswordAt = Date.now();
@@ -1242,6 +1337,42 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
       domain: process.env.NODE_ENV === 'production' ? '.logistikore.com' : 'none'
     });
     
+    try {
+      const valid = ['outsourcing', 'regular'];
+      const sanitize = (arr) => Array.isArray(arr)
+        ? arr.map((m) => String(m).toLowerCase().trim()).filter((m) => valid.includes(m))
+        : [];
+
+      let planModules = sanitize(tenant?.subscription?.allowedModules);
+      if (!planModules.length) planModules = ['outsourcing', 'regular'];
+      if (tenant?.subscription?.plan) {
+        const SubscriptionPlan = require('../db/SubscriptionPlan');
+        const rawPlanRef = tenant.subscription.plan;
+        const planRefStr = String(rawPlanRef || '');
+        let planRecord = null;
+        if (require('mongoose').Types.ObjectId.isValid(planRefStr)) {
+          planRecord = await SubscriptionPlan.findById(planRefStr);
+        } else if (typeof rawPlanRef === 'string' && rawPlanRef.trim()) {
+          planRecord = await SubscriptionPlan.findOne({ slug: rawPlanRef.trim(), isActive: true });
+        } else if (tenant.subscription.planSlug) {
+          planRecord = await SubscriptionPlan.findOne({ slug: tenant.subscription.planSlug, isActive: true });
+        }
+        if (planRecord && Array.isArray(planRecord.allowedModules) && planRecord.allowedModules.length > 0) {
+          planModules = sanitize(planRecord.allowedModules);
+        }
+      }
+      const userModules = sanitize(user.allowedModules);
+      if (user.role === 3 || user.is_admin === 1) {
+        const legacyRestricted = userModules.length > 0 && planModules.length > 0 && userModules.length < planModules.length;
+        const useAdminModules = (user.modulesCustomized === true || legacyRestricted) && userModules.length > 0;
+        user.allowedModules = useAdminModules ? userModules.filter((m) => planModules.includes(m)) : planModules;
+      } else {
+        const legacyRestricted = userModules.length > 0 && planModules.length > 0 && userModules.length < planModules.length;
+        const useUserModules = (user.modulesCustomized === true || legacyRestricted) && userModules.length > 0;
+        user.allowedModules = useUserModules ? userModules.filter((m) => planModules.includes(m)) : planModules;
+      }
+    } catch (e) {}
+
     user.password = undefined;
     
     console.log('✅ MULTITENANT LOGIN SUCCESS - Returning success response');

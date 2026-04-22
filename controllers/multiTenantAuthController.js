@@ -7,9 +7,44 @@ const SECRET_ACCESS = process.env.SECRET_ACCESS || 'MYSECRET';
 const User = require('../db/Users');
 const SuperAdmin = require('../db/SuperAdmin');
 const Tenant = require('../db/Tenant');
+const Company = require('../db/Company');
 
 // Import utilities
 const { generateTenantUrl, generateSuperAdminUrl } = require('../middleware/tenantResolver');
+
+const VALID_MODULES = ['outsourcing', 'regular'];
+const sanitizeModules = (value) => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((m) => String(m).toLowerCase().trim())
+    .filter((m) => VALID_MODULES.includes(m));
+};
+
+const resolveTenantPlanModules = async (tenant) => {
+  const cached = sanitizeModules(tenant?.subscription?.allowedModules);
+  if (cached.length > 0) return cached;
+
+  const planSlug = (tenant?.subscription?.planSlug || tenant?.subscription?.legacyPlan || '').toString().trim();
+  const planRef = tenant?.subscription?.plan;
+
+  try {
+    const SubscriptionPlan = mongoose.model('subscription_plans');
+    let planRecord = null;
+
+    if (planSlug) {
+      planRecord = await SubscriptionPlan.findOne({ slug: planSlug });
+    } else if (planRef && mongoose.Types.ObjectId.isValid(planRef)) {
+      planRecord = await SubscriptionPlan.findById(planRef);
+    } else if (typeof planRef === 'string' && planRef.trim()) {
+      planRecord = await SubscriptionPlan.findOne({ slug: planRef.trim() });
+    }
+
+    const mods = sanitizeModules(planRecord?.allowedModules);
+    if (mods.length > 0) return mods;
+  } catch (err) {}
+
+  return ['outsourcing'];
+};
 
 /**
  * Generate JWT token
@@ -180,18 +215,19 @@ const landingLogin = catchAsync(async (req, res, next) => {
       tenantId: user.tenantId
     });
 
-    const userModules = Array.isArray(user.allowedModules) ? user.allowedModules : ['outsourcing', 'regular'];
-    const planModules = (tenant && tenant.subscription && Array.isArray(tenant.subscription.allowedModules)) 
-      ? tenant.subscription.allowedModules 
-      : ['outsourcing', 'regular'];
+    const planModules = await resolveTenantPlanModules(tenant);
+    const userModules = sanitizeModules(user.allowedModules);
     
     const isTenantAdmin = user.role === 3 || user.is_admin === 1;
     let effectiveModules;
     if (isTenantAdmin) {
       effectiveModules = planModules;
     } else {
-      effectiveModules = userModules.filter(m => planModules.includes(m));
+      const useUserModules = user.modulesCustomized === true && userModules.length > 0;
+      effectiveModules = useUserModules ? userModules.filter((m) => planModules.includes(m)) : planModules;
     }
+    if (effectiveModules.length === 0 && planModules.length > 0) effectiveModules = planModules;
+    if (effectiveModules.length === 0) effectiveModules = ['outsourcing'];
 
     return res.json({
       status: true,
@@ -208,7 +244,7 @@ const landingLogin = catchAsync(async (req, res, next) => {
         is_admin: user.is_admin,
         isTenantAdmin: isTenantAdmin,
         company: user.company,
-        allowedModules: effectiveModules.length ? effectiveModules : ['outsourcing', 'regular']
+        allowedModules: effectiveModules
       },
       tenant: {
         name: tenant.name,
@@ -256,18 +292,19 @@ const tenantLogin = catchAsync(async (req, res, next) => {
     return next(new AppError('Invalid email or password', 401));
   }
 
-  const userModules = Array.isArray(user.allowedModules) ? user.allowedModules : ['outsourcing', 'regular'];
-  const planModules = (req.tenant && req.tenant.subscription && Array.isArray(req.tenant.subscription.allowedModules)) 
-    ? req.tenant.subscription.allowedModules 
-    : ['outsourcing', 'regular'];
+  const planModules = await resolveTenantPlanModules(req.tenant);
+  const userModules = sanitizeModules(user.allowedModules);
   
   const isTenantAdmin = user.role === 3 || user.is_admin === 1;
   let effectiveModules;
   if (isTenantAdmin) {
     effectiveModules = planModules;
   } else {
-    effectiveModules = userModules.filter(m => planModules.includes(m));
+    const useUserModules = user.modulesCustomized === true && userModules.length > 0;
+    effectiveModules = useUserModules ? userModules.filter((m) => planModules.includes(m)) : planModules;
   }
+  if (effectiveModules.length === 0 && planModules.length > 0) effectiveModules = planModules;
+  if (effectiveModules.length === 0) effectiveModules = ['outsourcing'];
 
   // Create token with tenant context
   createSendToken(user, 200, res, {
@@ -277,7 +314,7 @@ const tenantLogin = catchAsync(async (req, res, next) => {
     isTenantAdmin: isTenantAdmin,
     company: user.company,
     tenant: req.tenant,
-    allowedModules: effectiveModules.length ? effectiveModules : ['outsourcing', 'regular']
+    allowedModules: effectiveModules
   });
 });
 
@@ -432,6 +469,28 @@ const validateToken = catchAsync(async (req, res, next) => {
     // For tenant users, verify tenant context matches
     if (req.tenantId && currentUser.tenantId !== req.tenantId) {
       return next(new AppError('Invalid tenant access', 403));
+    }
+
+    // Ensure tenant context is available for module/limits enforcement even on landing-host requests
+    if (!req.tenantId) {
+      req.tenantId = decoded.tenantId || currentUser.tenantId || null;
+    }
+    if (req.tenantId && !req.tenant) {
+      try {
+        const tenant = await Tenant.findOne({ tenantId: req.tenantId });
+        if (tenant) req.tenant = tenant;
+      } catch (err) {}
+    }
+
+    // Ensure company association for tenant users (older staff accounts may miss it)
+    if (req.tenantId && !currentUser.company) {
+      try {
+        const c = await Company.findOne({ tenantId: req.tenantId });
+        if (c) {
+          await User.updateOne({ _id: currentUser._id }, { company: c._id });
+          currentUser.company = c;
+        }
+      } catch (err) {}
     }
 
     // Check if password was changed after token was issued
@@ -660,10 +719,8 @@ const getProfile = catchAsync(async (req, res, next) => {
     profile.isEmulating = true;
     profile.emulatedTenantId = req.tenantId;
     
-    // Super admins see all modules allowed by the plan while emulating
-    profile.allowedModules = (req.tenant && req.tenant.subscription && Array.isArray(req.tenant.subscription.allowedModules))
-      ? req.tenant.subscription.allowedModules
-      : ['outsourcing', 'regular']; // Default to everything if plan info missing
+    // Super admins see modules allowed by the plan while emulating
+    profile.allowedModules = await resolveTenantPlanModules(req.tenant);
     
     // Get tenant information if available
     if (req.tenant) {
@@ -698,42 +755,28 @@ const getProfile = catchAsync(async (req, res, next) => {
     profile.userType = 'tenant_user';
     
     // Effective modules intersection
-    const userModules = Array.isArray(req.user.allowedModules) ? req.user.allowedModules : ['outsourcing', 'regular'];
+    const userModules = sanitizeModules(req.user.allowedModules);
     
     // Get plan modules - prefer cached but fallback to plan record if cached is default
     const tenant = req.tenant;
-    let planModules = (tenant && tenant.subscription && Array.isArray(tenant.subscription.allowedModules)) 
-      ? tenant.subscription.allowedModules 
-      : ['outsourcing', 'regular'];
+    let planModules = await resolveTenantPlanModules(tenant);
 
     console.log(`🔍 DEBUG [getProfile] - Tenant: ${req.tenant?.name}, Cached Modules: ${planModules}`);
 
-    // If tenant has a plan reference and cached modules are just default, try fetching plan modules
     if (req.tenant && req.tenant.subscription && req.tenant.subscription.plan) {
-      try {
-        const SubscriptionPlan = mongoose.model('subscription_plans');
-        const planRecord = await SubscriptionPlan.findById(req.tenant.subscription.plan);
-        if (planRecord) {
-           console.log(`🔍 DEBUG [getProfile] - Found Plan Record: ${planRecord.name}, Modules: ${planRecord.allowedModules}`);
-           if (Array.isArray(planRecord.allowedModules) && planRecord.allowedModules.length > 0) {
-              planModules = planRecord.allowedModules;
-           }
-        } else {
-           console.log(`⚠️ DEBUG [getProfile] - Plan Record NOT FOUND for ID: ${req.tenant.subscription.plan}`);
-        }
-      } catch (err) {
-        console.error('Failed to fetch plan modules in profile:', err);
-      }
+      console.log(`🔍 DEBUG [getProfile] - Tenant Plan Ref: ${req.tenant.subscription.plan}`);
     }
     
     // Admins (role 3) get everything the plan allows
     if (req.user.role === 3 || req.user.is_admin === 1) {
       profile.allowedModules = planModules;
     } else {
-      profile.allowedModules = userModules.filter(m => planModules.includes(m));
+      const useUserModules = req.user.modulesCustomized === true && userModules.length > 0;
+      profile.allowedModules = useUserModules ? userModules.filter((m) => planModules.includes(m)) : planModules;
     }
     
-    if (profile.allowedModules.length === 0) profile.allowedModules = ['outsourcing', 'regular']; // fallback
+    if (profile.allowedModules.length === 0 && planModules.length > 0) profile.allowedModules = planModules;
+    if (profile.allowedModules.length === 0) profile.allowedModules = ['outsourcing'];
     
     if (req.tenant) {
       profile.tenant = {

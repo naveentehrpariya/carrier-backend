@@ -2,6 +2,60 @@ const Trip = require('../db/Trip');
 const Order = require('../db/Order');
 const User = require('../db/Users');
 const DriverProfile = require('../db/DriverProfile');
+const Truck = require('../db/Truck');
+const mongoose = require('mongoose');
+const axios = require('axios');
+
+const emptyDistanceCache = new Map();
+
+function getGoogleApiKey() {
+    return (
+        process.env.GOOGLE_MAP_API_KEY ||
+        process.env.GOOGLE_MAPS_API_KEY ||
+        process.env.GOOGLE_API_KEY ||
+        process.env.GOOGLE_KEY ||
+        ''
+    );
+}
+
+async function getMilesBetweenLocations(from, to) {
+    const a = String(from || '').trim();
+    const b = String(to || '').trim();
+    if (!a || !b) return null;
+    const key = `${a}||${b}`;
+    if (emptyDistanceCache.has(key)) return emptyDistanceCache.get(key);
+    const apiKey = getGoogleApiKey();
+    if (!apiKey) return null;
+    const url =
+        `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(a)}` +
+        `&destination=${encodeURIComponent(b)}&key=${encodeURIComponent(apiKey)}`;
+    const resp = await axios.get(url);
+    const route = resp.data?.routes?.[0];
+    const legs = route?.legs;
+    const meters = Array.isArray(legs) ? legs.reduce((acc, l) => acc + (Number(l?.distance?.value) || 0), 0) : 0;
+    const miles = meters ? meters / 1609.344 : 0;
+    const rounded = Number.isFinite(miles) ? Number(miles.toFixed(2)) : null;
+    emptyDistanceCache.set(key, rounded);
+    return rounded;
+}
+
+async function enrichEmptyMiles(logs, maxCalls = 25) {
+    let calls = 0;
+    for (const item of logs) {
+        if (item.type !== 'empty') continue;
+        if (calls >= maxCalls) break;
+        if (typeof item.miles === 'number') continue;
+        try {
+            const miles = await getMilesBetweenLocations(item.from_location, item.to_location);
+            if (typeof miles === 'number') {
+                item.miles = miles;
+            }
+        } catch {
+        }
+        calls += 1;
+    }
+    return logs;
+}
 
 function isRelayLoc(loc) {
     if (!loc) return false;
@@ -38,6 +92,32 @@ function buildSegmentsFromOrder(orderDoc) {
     return segs;
 }
 
+function parseDateStart(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    d.setHours(0, 0, 0, 0);
+    return d;
+}
+
+function parseDateEnd(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    d.setHours(23, 59, 59, 999);
+    return d;
+}
+
+function resolveRange(from, to) {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    const start = parseDateStart(from) || startOfMonth;
+    const end = parseDateEnd(to) || endOfMonth;
+    end.setHours(23, 59, 59, 999);
+    return { start, end };
+}
+
 exports.splitOrder = async (req, res) => {
     try {
         const { orderId, segments } = req.body;
@@ -68,7 +148,8 @@ exports.splitOrder = async (req, res) => {
                 trip_no: i + 1,
                 start_stop_index: seg.start_stop_index,
                 end_stop_index: seg.end_stop_index,
-                driver: seg.driver,
+                driver: seg.driver || (seg.drivers && seg.drivers.length > 0 ? seg.drivers[0] : null),
+                drivers: seg.drivers || [],
                 truck: seg.truck,
                 trailer: seg.trailer,
                 carrier: seg.carrier,
@@ -144,7 +225,7 @@ exports.getDriverTrips = async (req, res) => {
         const { driverId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
-        const filter = { tenantId, driver: driverId, deletedAt: null };
+        const filter = { tenantId, drivers: driverId, deletedAt: null };
         if (from || to) {
             filter.createdAt = {};
             if (from) filter.createdAt.$gte = new Date(from);
@@ -161,39 +242,264 @@ exports.getDriverTrips = async (req, res) => {
     }
 };
 
+function getOrderLocations(orderDoc) {
+    const block = orderDoc?.shipping_details?.[0];
+    const locs = block?.locations;
+    return Array.isArray(locs) ? locs : [];
+}
+
+function extractLocMeta(orderDoc, idx) {
+    const locs = getOrderLocations(orderDoc);
+    const loc = typeof idx === 'number' ? locs[idx] : null;
+    const rawType = loc?.type || loc?.location_type || '';
+    return {
+        type: rawType ? String(rawType).toLowerCase() : '',
+        date: loc?.date || null,
+        referenceNo: loc?.referenceNo || null
+    };
+}
+
+function normalizeCompanyId(req) {
+    const raw = req.user?.company?._id || req.user?.company;
+    if (!raw) return null;
+    const s = String(raw);
+    if (!mongoose.Types.ObjectId.isValid(s)) return null;
+    return new mongoose.Types.ObjectId(s);
+}
+
+function buildTripLogItem(trip) {
+    const order = trip.order;
+    const startMeta = extractLocMeta(order, trip.start_stop_index);
+    const endMeta = extractLocMeta(order, trip.end_stop_index);
+    const miles = Number(trip.miles || 0);
+    const orderTotalDistance = Number(order?.totalDistance || 0);
+    const orderTotalAmount = Number(order?.total_amount || 0);
+    const gross = orderTotalDistance > 0 ? (orderTotalAmount * miles) / orderTotalDistance : 0;
+    return {
+        type: 'trip',
+        tripId: trip._id,
+        createdAt: trip.createdAt,
+        updatedAt: trip.updatedAt,
+        status: trip.status,
+        orderId: order?._id || trip.order,
+        orderSerial: order?.serial_no || null,
+        start_location: trip.start_location || '',
+        end_location: trip.end_location || '',
+        start_type: startMeta.type,
+        end_type: endMeta.type,
+        start_date: startMeta.date,
+        end_date: endMeta.date,
+        miles,
+        gross,
+        driver: trip.driver ? { _id: trip.driver._id, name: trip.driver.name, corporateID: trip.driver.corporateID } : null,
+        truck: trip.truck ? { _id: trip.truck._id, unitNumber: trip.truck.unitNumber, plateNumber: trip.truck.plateNumber } : null,
+        trailer: trip.trailer ? { _id: trip.trailer._id, unitNumber: trip.trailer.unitNumber } : null
+    };
+}
+
+function withEmptyMoves(trips) {
+    const items = [];
+    let prev = null;
+    for (const t of trips) {
+        const cur = buildTripLogItem(t);
+        if (
+            prev &&
+            prev.type === 'trip' &&
+            prev.end_location &&
+            cur.start_location &&
+            String(prev.end_location).trim().toLowerCase() !== String(cur.start_location).trim().toLowerCase() &&
+            String(prev.orderId || '') !== String(cur.orderId || '')
+        ) {
+            items.push({
+                type: 'empty',
+                createdAt: cur.createdAt,
+                from_location: prev.end_location,
+                to_location: cur.start_location,
+                after_order_serial: prev.orderSerial,
+                before_order_serial: cur.orderSerial,
+                after_trip_id: prev.tripId,
+                before_trip_id: cur.tripId
+            });
+        }
+        items.push(cur);
+        prev = cur;
+    }
+    return items;
+}
+
+exports.getTruckTripLogs = async (req, res) => {
+    try {
+        const { truckId } = req.params;
+        const { from, to, limit, includeEmptyMiles } = req.query;
+        const tenantId = req.user.tenantId;
+        const companyId = normalizeCompanyId(req);
+
+        const filter = { tenantId, truck: truckId, deletedAt: null };
+        if (from || to) {
+            filter.createdAt = {};
+            if (from) filter.createdAt.$gte = new Date(from);
+            if (to) filter.createdAt.$lte = new Date(to);
+        }
+
+        const qLimit = Math.min(Math.max(Number(limit) || 500, 1), 2000);
+        const trips = await Trip.find(filter)
+            .populate('order', 'serial_no shipping_details company totalDistance total_amount')
+            .populate('driver', 'name corporateID')
+            .populate('truck', 'unitNumber plateNumber')
+            .populate('trailer', 'unitNumber')
+            .sort({ createdAt: 1 })
+            .limit(qLimit);
+
+        const scoped = companyId
+            ? trips.filter((t) => t?.order?.company && String(t.order.company) === String(companyId))
+            : trips;
+
+        const logs = withEmptyMoves(scoped);
+        const wantEmptyMiles = String(includeEmptyMiles || '').toLowerCase() === '1' || String(includeEmptyMiles || '').toLowerCase() === 'true';
+        if (wantEmptyMiles) {
+            await enrichEmptyMiles(logs);
+        }
+        const summary = logs.reduce(
+            (acc, l) => {
+                if (l.type === 'trip') acc.loadedMiles += Number(l.miles || 0);
+                if (l.type === 'empty') acc.emptyMiles += Number(l.miles || 0);
+                if (l.type === 'trip') acc.totalGross += Number(l.gross || 0);
+                return acc;
+            },
+            { loadedMiles: 0, emptyMiles: 0, totalGross: 0 }
+        );
+        summary.totalMiles = summary.loadedMiles + summary.emptyMiles;
+        res.json({ status: true, summary, logs });
+    } catch (error) {
+        res.status(500).json({ status: false, message: 'Server error fetching truck logs' });
+    }
+};
+
+exports.getDriverTripLogs = async (req, res) => {
+    try {
+        const { driverId } = req.params;
+        const { from, to, limit, includeEmptyMiles } = req.query;
+        const tenantId = req.user.tenantId;
+        const companyId = normalizeCompanyId(req);
+
+        const filter = { tenantId, drivers: driverId, deletedAt: null };
+        if (from || to) {
+            filter.createdAt = {};
+            if (from) filter.createdAt.$gte = new Date(from);
+            if (to) filter.createdAt.$lte = new Date(to);
+        }
+
+        const qLimit = Math.min(Math.max(Number(limit) || 500, 1), 2000);
+        const trips = await Trip.find(filter)
+            .populate('order', 'serial_no shipping_details company totalDistance total_amount')
+            .populate('driver', 'name corporateID')
+            .populate('truck', 'unitNumber plateNumber')
+            .populate('trailer', 'unitNumber')
+            .sort({ createdAt: 1 })
+            .limit(qLimit);
+
+        const scoped = companyId
+            ? trips.filter((t) => t?.order?.company && String(t.order.company) === String(companyId))
+            : trips;
+
+        const logs = withEmptyMoves(scoped);
+        const wantEmptyMiles = String(includeEmptyMiles || '').toLowerCase() === '1' || String(includeEmptyMiles || '').toLowerCase() === 'true';
+        if (wantEmptyMiles) {
+            await enrichEmptyMiles(logs);
+        }
+        const summary = logs.reduce(
+            (acc, l) => {
+                if (l.type === 'trip') acc.loadedMiles += Number(l.miles || 0);
+                if (l.type === 'empty') acc.emptyMiles += Number(l.miles || 0);
+                if (l.type === 'trip') acc.totalGross += Number(l.gross || 0);
+                return acc;
+            },
+            { loadedMiles: 0, emptyMiles: 0, totalGross: 0 }
+        );
+        summary.totalMiles = summary.loadedMiles + summary.emptyMiles;
+        res.json({ status: true, summary, logs });
+    } catch (error) {
+        res.status(500).json({ status: false, message: 'Server error fetching driver logs' });
+    }
+};
+
 exports.getDriverTripSummary = async (req, res) => {
     try {
         const { driverId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
-        const match = { tenantId, driver: require('mongoose').Types.ObjectId(driverId), deletedAt: null };
+        const match = { tenantId, drivers: require('mongoose').Types.ObjectId(driverId), deletedAt: null };
         if (from || to) {
             match.createdAt = {};
             if (from) match.createdAt.$gte = new Date(from);
             if (to) match.createdAt.$lte = new Date(to);
         }
-        const summary = await Trip.aggregate([
+        const driverProfile = await DriverProfile.findOne({ tenantId, user: driverId }).lean();
+        const soloRate = Number(driverProfile?.ratePerMileSolo ?? driverProfile?.ratePerMile ?? 0) || 0;
+        const teamRate = Number(driverProfile?.ratePerMileTeam ?? driverProfile?.ratePerMile ?? 0) || 0;
+
+        const pipeline = [
             { $match: match },
+            { $addFields: {
+                driverCount: { $size: { $ifNull: ['$drivers', []] } }
+            }},
+            { $addFields: {
+                driverCountEffective: { $max: ['$driverCount', 1] }
+            }},
+            { $addFields: {
+                myMiles: { $divide: [{ $ifNull: ['$miles', 0] }, '$driverCountEffective'] },
+                myKm: { $divide: [{ $ifNull: ['$total_km', 0] }, '$driverCountEffective'] },
+                rateType: { $cond: [{ $gt: ['$driverCountEffective', 1] }, 'team', 'solo'] },
+                rateUsed: { $cond: [{ $gt: ['$driverCountEffective', 1] }, teamRate, soloRate] }
+            }},
+            { $addFields: {
+                myPay: { $multiply: ['$myMiles', '$rateUsed'] }
+            }}
+        ];
+
+        const summary = await Trip.aggregate([
+            ...pipeline,
             { $group: {
                 _id: null,
                 totalTrips: { $sum: 1 },
-                totalMiles: { $sum: { $ifNull: ['$miles', 0] } },
-                totalKm: { $sum: { $ifNull: ['$total_km', 0] } },
-                totalPay: { $sum: { $ifNull: ['$total_driver_pay', 0] } },
+                totalMiles: { $sum: '$myMiles' },
+                totalKm: { $sum: '$myKm' },
+                totalPay: { $sum: '$myPay' }
             } }
         ]);
+
         const byOrder = await Trip.aggregate([
-            { $match: match },
+            ...pipeline,
             { $group: {
                 _id: '$order',
-                miles: { $sum: { $ifNull: ['$miles', 0] } },
-                km: { $sum: { $ifNull: ['$total_km', 0] } },
-                pay: { $sum: { $ifNull: ['$total_driver_pay', 0] } },
-                trips: { $sum: 1 }
+                miles: { $sum: '$myMiles' },
+                km: { $sum: '$myKm' },
+                trips: { $sum: 1 },
+                pay: { $sum: '$myPay' },
+                rateUsed: { $max: '$rateUsed' },
+                rateType: { $last: '$rateType' }
             } },
+            {
+                $lookup: {
+                    from: 'orders',
+                    localField: '_id',
+                    foreignField: '_id',
+                    as: 'orderDoc'
+                }
+            },
+            { $unwind: { path: '$orderDoc', preserveNullAndEmptyArrays: true } },
+            { $addFields: { orderSerial: '$orderDoc.serial_no' } },
+            { $project: { orderDoc: 0 } },
             { $sort: { trips: -1 } }
         ]);
-        res.json({ status: true, summary: summary[0] || { totalTrips: 0, totalMiles: 0, totalKm: 0, totalPay: 0 }, byOrder });
+
+        const computedPay = summary[0] ? summary[0].totalPay : 0;
+        const baseSummary = summary[0] || { totalTrips: 0, totalMiles: 0, totalKm: 0 };
+        res.json({
+            status: true,
+            summary: { ...baseSummary, totalPay: computedPay, soloRate, teamRate },
+            byOrder
+        });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error summarizing driver trips' });
     }
@@ -227,11 +533,224 @@ exports.getTruckTripSummary = async (req, res) => {
                 km: { $sum: { $ifNull: ['$total_km', 0] } },
                 trips: { $sum: 1 }
             } },
+            {
+                $lookup: {
+                    from: 'orders',
+                    localField: '_id',
+                    foreignField: '_id',
+                    as: 'orderDoc'
+                }
+            },
+            { $unwind: { path: '$orderDoc', preserveNullAndEmptyArrays: true } },
+            { $addFields: { orderSerial: '$orderDoc.serial_no' } },
+            { $project: { orderDoc: 0 } },
             { $sort: { trips: -1 } }
         ]);
         res.json({ status: true, summary: summary[0] || { totalTrips: 0, totalMiles: 0, totalKm: 0 }, byOrder });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error summarizing truck trips' });
+    }
+};
+
+exports.getTrucksGrossEarnings = async (req, res) => {
+    try {
+        const tenantId = req.user.tenantId;
+        const companyIdRaw = req.user?.company?._id || req.user?.company;
+        const companyId =
+            companyIdRaw && mongoose.Types.ObjectId.isValid(String(companyIdRaw))
+                ? new mongoose.Types.ObjectId(String(companyIdRaw))
+                : null;
+        const permissions = req.user?.permissions || [];
+        if (!(req.user?.is_admin === 1 || permissions.includes('orders') || permissions.includes('accounting'))) {
+            return res.status(403).json({ status: false, message: 'Not authorized' });
+        }
+
+        const { from, to, status } = req.query;
+        const { start, end } = resolveRange(from, to);
+        const match = {
+            tenantId,
+            deletedAt: null,
+            truck: { $ne: null },
+            createdAt: { $gte: start, $lte: end }
+        };
+        if (status && String(status).toLowerCase() !== 'all') {
+            match.status = status;
+        } else if (!status) {
+            match.status = { $ne: 'cancelled' };
+        }
+
+        const pipeline = [
+            { $match: match },
+            {
+                $lookup: {
+                    from: 'orders',
+                    localField: 'order',
+                    foreignField: '_id',
+                    as: 'orderDoc'
+                }
+            },
+            { $unwind: '$orderDoc' },
+            ...(companyId ? [{ $match: { 'orderDoc.company': companyId } }] : []),
+            {
+                $addFields: {
+                    orderDistance: { $ifNull: ['$orderDoc.totalDistance', 0] },
+                    orderAmount: { $ifNull: ['$orderDoc.total_amount', 0] },
+                    tripMiles: { $ifNull: ['$miles', 0] }
+                }
+            },
+            {
+                $addFields: {
+                    gross: {
+                        $cond: [
+                            { $gt: ['$orderDistance', 0] },
+                            { $multiply: ['$orderAmount', { $divide: ['$tripMiles', '$orderDistance'] }] },
+                            0
+                        ]
+                    }
+                }
+            },
+            { $sort: { updatedAt: -1, createdAt: -1 } },
+            {
+                $group: {
+                    _id: '$truck',
+                    totalTrips: { $sum: 1 },
+                    totalMiles: { $sum: '$tripMiles' },
+                    totalGross: { $sum: '$gross' },
+                    lastTripAt: { $first: '$updatedAt' },
+                    lastLocation: { $first: '$end_location' },
+                    lastDriver: { $first: '$driver' }
+                }
+            }
+        ];
+
+        const agg = await Trip.aggregate(pipeline);
+        const byTruck = new Map(agg.map((r) => [String(r._id), r]));
+
+        const truckFilter = { tenantId, deletedAt: null };
+        if (companyId) truckFilter.company = companyId;
+        const trucks = await Truck.find(truckFilter).select('_id plateNumber unitNumber').lean();
+
+        const driverIds = agg.map((r) => r.lastDriver).filter(Boolean);
+        const drivers = driverIds.length
+            ? await User.find({ _id: { $in: driverIds } }).select('_id name corporateID').lean()
+            : [];
+        const driverMap = new Map(drivers.map((d) => [String(d._id), d]));
+
+        const result = (trucks || []).map((t) => {
+            const row = byTruck.get(String(t._id));
+            const lastDriver = row?.lastDriver ? driverMap.get(String(row.lastDriver)) : null;
+            return {
+                truckId: t._id,
+                plateNumber: t.plateNumber || '',
+                unitNumber: t.unitNumber || '',
+                totalTrips: row?.totalTrips || 0,
+                totalMiles: Number(row?.totalMiles || 0),
+                totalGross: Number(row?.totalGross || 0),
+                lastTripAt: row?.lastTripAt || null,
+                lastLocation: row?.lastLocation || '',
+                lastDriver: lastDriver ? { _id: lastDriver._id, name: lastDriver.name, corporateID: lastDriver.corporateID } : null
+            };
+        });
+
+        result.sort((a, b) => (b.totalGross || 0) - (a.totalGross || 0));
+        res.json({ status: true, from: start, to: end, trucks: result });
+    } catch (error) {
+        res.status(500).json({ status: false, message: 'Server error computing gross earnings' });
+    }
+};
+
+exports.getTruckGrossEarningsDetail = async (req, res) => {
+    try {
+        const tenantId = req.user.tenantId;
+        const companyIdRaw = req.user?.company?._id || req.user?.company;
+        const companyId =
+            companyIdRaw && mongoose.Types.ObjectId.isValid(String(companyIdRaw))
+                ? new mongoose.Types.ObjectId(String(companyIdRaw))
+                : null;
+        const permissions = req.user?.permissions || [];
+        if (!(req.user?.is_admin === 1 || permissions.includes('orders') || permissions.includes('accounting'))) {
+            return res.status(403).json({ status: false, message: 'Not authorized' });
+        }
+
+        const { truckId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(truckId)) {
+            return res.status(400).json({ status: false, message: 'Invalid truck id' });
+        }
+
+        const { from, to, status } = req.query;
+        const { start, end } = resolveRange(from, to);
+        const match = {
+            tenantId,
+            deletedAt: null,
+            truck: mongoose.Types.ObjectId(truckId),
+            createdAt: { $gte: start, $lte: end }
+        };
+        if (status && String(status).toLowerCase() !== 'all') {
+            match.status = status;
+        } else if (!status) {
+            match.status = { $ne: 'cancelled' };
+        }
+
+        const pipeline = [
+            { $match: match },
+            {
+                $lookup: {
+                    from: 'orders',
+                    localField: 'order',
+                    foreignField: '_id',
+                    as: 'orderDoc'
+                }
+            },
+            { $unwind: '$orderDoc' },
+            ...(companyId ? [{ $match: { 'orderDoc.company': companyId } }] : []),
+            {
+                $addFields: {
+                    orderDistance: { $ifNull: ['$orderDoc.totalDistance', 0] },
+                    orderAmount: { $ifNull: ['$orderDoc.total_amount', 0] },
+                    tripMiles: { $ifNull: ['$miles', 0] }
+                }
+            },
+            {
+                $addFields: {
+                    gross: {
+                        $cond: [
+                            { $gt: ['$orderDistance', 0] },
+                            { $multiply: ['$orderAmount', { $divide: ['$tripMiles', '$orderDistance'] }] },
+                            0
+                        ]
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: '$order',
+                    orderSerial: { $first: '$orderDoc.serial_no' },
+                    orderTotalAmount: { $first: '$orderDoc.total_amount' },
+                    orderTotalDistance: { $first: '$orderDoc.totalDistance' },
+                    orderCurrency: { $first: '$orderDoc.revenue_currency' },
+                    trips: { $sum: 1 },
+                    miles: { $sum: '$tripMiles' },
+                    gross: { $sum: '$gross' },
+                    lastTripAt: { $max: '$updatedAt' }
+                }
+            },
+            { $sort: { lastTripAt: -1 } }
+        ];
+
+        const rows = await Trip.aggregate(pipeline);
+        const summary = rows.reduce(
+            (acc, r) => {
+                acc.totalTrips += Number(r.trips || 0);
+                acc.totalMiles += Number(r.miles || 0);
+                acc.totalGross += Number(r.gross || 0);
+                return acc;
+            },
+            { totalTrips: 0, totalMiles: 0, totalGross: 0 }
+        );
+
+        res.json({ status: true, from: start, to: end, summary, orders: rows });
+    } catch (error) {
+        res.status(500).json({ status: false, message: 'Server error computing truck gross detail' });
     }
 };
 
