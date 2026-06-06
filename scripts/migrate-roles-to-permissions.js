@@ -1,11 +1,27 @@
+/**
+ * USAGE:
+ *   node scripts/migrate-roles-to-permissions.js            # DRY RUN (no writes)
+ *   node scripts/migrate-roles-to-permissions.js --apply    # backup, then migrate
+ */
 require('dotenv').config();
 const connectDB = require('../db/config');
 const User = require('../db/Users');
+const { backupCollections } = require('./_backupHelper');
 
 async function migrate() {
   try {
+    const apply = process.argv.includes('--apply');
     await connectDB();
     console.log('Connected to MongoDB');
+    console.log(apply ? '\n🔧 APPLY MODE — will back up then write changes\n' : '\n🔍 DRY RUN — no changes will be written (use --apply to migrate)\n');
+
+    // Always back up the users collection BEFORE applying any change
+    if (apply) {
+      console.log('Creating backup of users (role/permissions) before migration...');
+      await backupCollections('roles-backup', [
+        { collection: 'users', projection: { _id: 1, role: 1, is_admin: 1, permissions: 1, allowedModules: 1, modulesCustomized: 1 } },
+      ]);
+    }
 
     // Use lean() to get raw MongoDB documents since we removed 'role' from the Mongoose schema
     const users = await User.find({}, null, { includeInactive: true }).lean();
@@ -68,14 +84,20 @@ async function migrate() {
          updateData.$set.is_admin = 1;
       }
 
-      await User.updateOne(
-        { _id: user._id },
-        updateData
-      );
+      if (apply) {
+        await User.updateOne(
+          { _id: user._id },
+          updateData
+        );
+      }
       updatedCount++;
     }
 
-    console.log(`Successfully migrated ${updatedCount} users.`);
+    if (apply) {
+      console.log(`\n✅ Successfully migrated ${updatedCount} users.`);
+    } else {
+      console.log(`\n🔍 Dry run complete — ${updatedCount} users would be migrated. Run with --apply to write.`);
+    }
     process.exit(0);
   } catch (error) {
     console.error('Migration failed:', error);

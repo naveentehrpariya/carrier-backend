@@ -14,6 +14,7 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
 const connectDB = require('../db/config');
+const { backupCollections } = require('./_backupHelper');
 
 // Collections that had the Date.now() default bug
 const COLLECTIONS = [
@@ -44,6 +45,15 @@ async function run() {
   await connectDB();
   console.log(`\n${apply ? '🔧 APPLY MODE — writing changes' : '🔍 DRY RUN — no changes will be written'}`);
   console.log(`Collections: ${targets.join(', ')}\n`);
+
+  // Always back up createdAt of all target collections BEFORE applying
+  if (apply) {
+    console.log('Creating backup of createdAt before applying...');
+    await backupCollections('createdAt-backup', targets.map(c => ({
+      collection: c,
+      projection: { _id: 1, createdAt: 1 },
+    })));
+  }
 
   let grandTotal = 0;
   let grandFixed = 0;
