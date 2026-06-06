@@ -16,6 +16,9 @@ const schema = new mongoose.Schema({
    logo: { 
       type:String,
    },
+   pdf_logo: {
+      type: String,
+   },
    name: { 
       type:String,
       required:[true, 'Please enter company name.']
@@ -66,7 +69,7 @@ Cross-border shipments require custom stamps or deductions may apply.`
    },
    createdAt: {
        type: Date,
-       default: Date.now()
+       default: Date.now
    }
 });
 

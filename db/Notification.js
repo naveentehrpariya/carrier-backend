@@ -16,7 +16,7 @@ const schema = new mongoose.Schema({
    order: { type: mongoose.Schema.Types.ObjectId, ref: 'orders' },
    createdAt: {
       type: Date,
-      default: Date.now()     
+      default: Date.now     
    },
    read_status: {
       type: Date,

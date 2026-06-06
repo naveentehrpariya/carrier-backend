@@ -5,6 +5,7 @@ const JSONerror = require("../utils/jsonErrorHandler");
 const logger = require("../utils/logger");
 const axios = require("axios");
 const { checkCarrierLimit } = require("../middlewares/planLimitsMiddleware");
+const { logActivity } = require("../utils/activityLogger");
 
 exports.addCarrier = catchAsync(async (req, res, next) => {
   const hasCarriersPermission = req.user?.permissions?.includes('carriers') || req.user?.permissions?.includes('subadmin');
@@ -58,7 +59,7 @@ exports.addCarrier = catchAsync(async (req, res, next) => {
   }
 
   await Carrier.syncIndexes();
-  Carrier.create({
+  const result = await Carrier.create({
     name: name,
     email: email,
     secondary_email: secondary_email,
@@ -71,19 +72,22 @@ exports.addCarrier = catchAsync(async (req, res, next) => {
     state: state,
     city: city,
     zipcode: zipcode,
-    created_by:req.user._id,
+    created_by: req.user._id,
     mc_code: mc_code,
     company: companyId,
     tenantId,
-  }).then(result => {
-    res.send({
-      status: true,
-      driver :result,
-      message: "Carrier has been added.",
-    });
-  }).catch(err => {
-    JSONerror(res, err, next);
-    logger(err);
+  });
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'carrier',
+    description: `Added carrier "${result.name}" (MC: ${result.mc_code})`,
+    resourceId: result._id,
+    resourceName: result.name,
+  });
+  return res.send({
+    status: true,
+    carrier: result,
+    message: "Carrier has been added.",
   });
 });
 
@@ -145,6 +149,13 @@ exports.deleteCarrier = catchAsync(async (req, res) => {
       carrier.deletedAt = Date.now();
       const result = await carrier.save();
       if (result) {
+        logActivity(req, {
+          action: 'DELETE',
+          module: 'carrier',
+          description: `Deleted carrier "${carrier.name}" (MC: ${carrier.mc_code})`,
+          resourceId: carrier._id,
+          resourceName: carrier.name,
+        });
         return res.status(200).json({
           status: true,
           message: `Carrier has been removed.`,
@@ -224,22 +235,32 @@ exports.updateCarrier = catchAsync(async (req, res, next) => {
       updateData.emails = emailsArray;
     }
 
-    const updateQuery = { _id: req.params.id };
-    if (req.tenantId) updateQuery.tenantId = req.tenantId;
+    const tenantId = req.tenantId || req.user?.tenantId;
+    if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required." });
+    }
+    const updateQuery = { _id: req.params.id, tenantId };
     const updatedUser = await Carrier.findOneAndUpdate(updateQuery, updateData, {
-      new: true, 
+      new: true,
       runValidators: true,
     });
-    if(!updatedUser){ 
-      res.send({
+    if(!updatedUser){
+      return res.send({
         status: false,
-        carrier : updatedUser,
+        carrier: null,
         message: "Failed to update carrier information.",
       });
-    } 
-    res.send({
+    }
+    logActivity(req, {
+      action: 'UPDATE',
+      module: 'carrier',
+      description: `Updated carrier "${updatedUser.name}"`,
+      resourceId: updatedUser._id,
+      resourceName: updatedUser.name,
+    });
+    return res.send({
       status: true,
-      error :updatedUser,
+      carrier: updatedUser,
       message: "Carrier has been updated.",
     });
   } catch (error) {
@@ -252,20 +273,23 @@ exports.updateCarrier = catchAsync(async (req, res, next) => {
 });
 
 exports.carrierDetail = catchAsync(async (req, res, next) => {
-  const criteria = { _id: req.params.id };
-  if (req.tenantId) criteria.tenantId = req.tenantId;
+  const tenantId = req.tenantId || req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(400).json({ status: false, message: "Tenant context is required." });
+  }
+  const criteria = { _id: req.params.id, tenantId };
   const c = await Carrier.findOne(criteria);
-  if(!c){ 
-    res.send({
+  if(!c){
+    return res.send({
       status: false,
-      result : null,
+      result: null,
       message: "Carrier not found",
     });
-  } 
+  }
   res.send({
     status: true,
-    result : c,
-    message: "Carrier has been updated.",
+    result: c,
+    message: "Carrier details retrieved.",
   });
 });
 
@@ -288,10 +312,8 @@ exports.getDistance = async (req, res) => {
   )}&destination=${encodeURIComponent(destination)}${
     waypoints.length ? `&waypoints=optimize:true|${waypoints.map(encodeURIComponent).join("|")}` : "" }&key=${apiKey}`;
 
-    console.log("url",url)
   try {
     const response = await axios.get(url);
-    console.log("response?.data", response);
     if (response?.data?.routes.length === 0 || response?.data?.status !== "OK") {
       return res.status(200).json({
         status: false,
@@ -309,7 +331,6 @@ exports.getDistance = async (req, res) => {
         msg:response?.data?.error_message,
       })
     }
-    console.log("legs",legs)
     if(legs){
       legs.forEach((leg) => {
         totalDistance += leg?.distance?.value; 
@@ -333,7 +354,6 @@ exports.getDistance = async (req, res) => {
       totalDurationMin: Math.round(totalDuration / 60),
     });
   } catch (error) {
-    console.log("Directions API Error:", error.response?.data || error.message);
     res.status(200).json({
       status: false,
       msg: error.response?.data?.error_message || error.message || "Failed to fetch route info"

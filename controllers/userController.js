@@ -2,6 +2,7 @@ const User = require("../db/Users");
 const APIFeatures = require("../utils/APIFeatures");
 const AppError = require("../utils/AppError");
 const catchAsync = require("../utils/catchAsync");
+const { logActivity } = require("../utils/activityLogger");
 
 const filterObj = async (obj, ...allowed) => { 
    let newObj = {};
@@ -14,7 +15,7 @@ const filterObj = async (obj, ...allowed) => {
 
 exports.updateCurrentUserData = catchAsync( async (req, res, next) => { 
    if(req.body.password || req.body.confirmPassword){
-      res.json({
+      return res.json({
          status:false,
          message:"'Password can not changed via this request.'"
       });
@@ -25,11 +26,19 @@ exports.updateCurrentUserData = catchAsync( async (req, res, next) => {
       runValidators : true
    });
 
-   if(req.body.email !== ''){
-     user.mailVerifiedAt = null
+   // Only reset email verification if the email actually changed
+   if(req.body.email && req.body.email !== '' && req.body.email !== req.user.email){
+     user.mailVerifiedAt = null;
      await user.save();
    }
 
+   logActivity(req, {
+      action: 'UPDATE',
+      module: 'employee',
+      description: `User "${user.name}" updated their profile`,
+      resourceId: user._id,
+      resourceName: user.name,
+   });
    return res.status(200).json({
       status:true,
       user: user,
@@ -38,8 +47,15 @@ exports.updateCurrentUserData = catchAsync( async (req, res, next) => {
 });
 
 
-exports.deleteCurrentUser = catchAsync( async (req, res, next) => { 
+exports.deleteCurrentUser = catchAsync( async (req, res, next) => {
    const user = await User.findByIdAndUpdate(req.user.id, { status:"inactive"});
+   logActivity(req, {
+      action: 'STATUS_CHANGE',
+      module: 'employee',
+      description: `User "${req.user.name}" deactivated their account`,
+      resourceId: req.user._id,
+      resourceName: req.user.name,
+   });
    return res.status(200).json({
       status:true,
       user:user,

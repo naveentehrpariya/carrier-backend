@@ -7,69 +7,69 @@ const {
   getProfile,
   logout
 } = require('../controllers/multiTenantAuthController');
-const { 
-  requireSuperAdmin,
-  validateToken 
-} = require('../middleware/tenantResolver');
+const {
+  authenticateJWT,
+  requireSuperAdmin
+} = require('../middleware/auth');
 
 // Import controllers
 const superAdminTenantController = require('../controllers/superAdminTenantController');
 const superAdminAnalyticsController = require('../controllers/superAdminAnalyticsController');
 const superAdminBillingController = require('../controllers/superAdminBillingController');
 
-// Authentication routes
-router.post('/login', requireSuperAdmin, superAdminLogin);
-router.get('/profile', validateToken, getProfile);
+// Authentication routes — login is public, everything else requires auth + super-admin role
+router.post('/login', superAdminLogin);
+router.get('/profile', authenticateJWT, requireSuperAdmin, getProfile);
 router.post('/logout', logout);
 
 // Tenant emulation routes
-router.post('/emulate-tenant', validateToken, emulateTenant);
-router.post('/stop-emulation', validateToken, stopEmulation);
+router.post('/emulate-tenant', authenticateJWT, requireSuperAdmin, emulateTenant);
+router.post('/stop-emulation', authenticateJWT, requireSuperAdmin, stopEmulation);
 
 // Tenant management routes
-router.get('/tenants', validateToken, superAdminTenantController.getTenants);
-router.post('/tenants', validateToken, superAdminTenantController.createTenant);
-router.get('/tenants/:id', validateToken, superAdminTenantController.getTenantDetails);
-router.patch('/tenants/:id', validateToken, superAdminTenantController.updateTenant);
-router.delete('/tenants/:id', validateToken, superAdminTenantController.deleteTenant);
-router.patch('/tenants/:id/status', validateToken, superAdminTenantController.updateTenantStatus);
-router.post('/tenants/:id/invite-admin', validateToken, superAdminTenantController.inviteTenantAdmin);
-router.post('/tenants/:tenantId/ensure-company', validateToken, superAdminTenantController.ensureCompanyRecord);
+router.get('/tenants', authenticateJWT, requireSuperAdmin, superAdminTenantController.getTenants);
+router.post('/tenants', authenticateJWT, requireSuperAdmin, superAdminTenantController.createTenant);
+router.get('/tenants/:id', authenticateJWT, requireSuperAdmin, superAdminTenantController.getTenantDetails);
+router.patch('/tenants/:id', authenticateJWT, requireSuperAdmin, superAdminTenantController.updateTenant);
+router.delete('/tenants/:id', authenticateJWT, requireSuperAdmin, superAdminTenantController.deleteTenant);
+router.patch('/tenants/:id/status', authenticateJWT, requireSuperAdmin, superAdminTenantController.updateTenantStatus);
+router.post('/tenants/:id/invite-admin', authenticateJWT, requireSuperAdmin, superAdminTenantController.inviteTenantAdmin);
+router.post('/tenants/:tenantId/ensure-company', authenticateJWT, requireSuperAdmin, superAdminTenantController.ensureCompanyRecord);
 // Permanent tenant deletion
-router.delete('/tenants/:tenantId/hard-delete', validateToken, superAdminTenantController.hardDeleteTenant);
+router.delete('/tenants/:tenantId/hard-delete', authenticateJWT, requireSuperAdmin, superAdminTenantController.hardDeleteTenant);
 // Tenant subscription management
-router.get('/tenants/:tenantId/subscription', validateToken, superAdminTenantController.getTenantSubscriptionDetails);
-router.put('/tenants/:tenantId/subscription', validateToken, superAdminTenantController.updateTenantSubscriptionPlan);
+router.get('/tenants/:tenantId/subscription', authenticateJWT, requireSuperAdmin, superAdminTenantController.getTenantSubscriptionDetails);
+router.put('/tenants/:tenantId/subscription', authenticateJWT, requireSuperAdmin, superAdminTenantController.updateTenantSubscriptionPlan);
 // Subscription plan management
-router.get('/subscription-plans', validateToken, superAdminTenantController.getSubscriptionPlans);
+router.get('/subscription-plans', authenticateJWT, requireSuperAdmin, superAdminTenantController.getSubscriptionPlans);
 router.get('/public/subscription-plans', superAdminTenantController.getSubscriptionPlans); // Public route for frontend
-router.post('/subscription-plans', validateToken, superAdminTenantController.createSubscriptionPlan);
-router.patch('/subscription-plans/:id', validateToken, superAdminTenantController.updateSubscriptionPlan);
-router.delete('/subscription-plans/:id', validateToken, superAdminTenantController.deleteSubscriptionPlan);
+router.post('/subscription-plans', authenticateJWT, requireSuperAdmin, superAdminTenantController.createSubscriptionPlan);
+router.patch('/subscription-plans/:id', authenticateJWT, requireSuperAdmin, superAdminTenantController.updateSubscriptionPlan);
+router.delete('/subscription-plans/:id', authenticateJWT, requireSuperAdmin, superAdminTenantController.deleteSubscriptionPlan);
 
 // Platform analytics routes
-router.get('/analytics/overview', validateToken, superAdminAnalyticsController.getPlatformOverview);
-router.get('/analytics/tenants', validateToken, superAdminAnalyticsController.getTenantsAnalytics);
-router.get('/analytics/revenue', validateToken, superAdminAnalyticsController.getRevenueAnalytics);
-router.get('/analytics/usage', validateToken, superAdminAnalyticsController.getUsageAnalytics);
-router.get('/analytics/growth', validateToken, superAdminAnalyticsController.getGrowthAnalytics);
+router.get('/analytics/overview', authenticateJWT, requireSuperAdmin, superAdminAnalyticsController.getPlatformOverview);
+router.get('/analytics/tenants', authenticateJWT, requireSuperAdmin, superAdminAnalyticsController.getTenantsAnalytics);
+router.get('/analytics/revenue', authenticateJWT, requireSuperAdmin, superAdminAnalyticsController.getRevenueAnalytics);
+router.get('/analytics/usage', authenticateJWT, requireSuperAdmin, superAdminAnalyticsController.getUsageAnalytics);
+router.get('/analytics/growth', authenticateJWT, requireSuperAdmin, superAdminAnalyticsController.getGrowthAnalytics);
 
 // Billing management routes
-router.get('/billing/overview', validateToken, superAdminBillingController.getBillingOverview);
-router.get('/billing/invoices', validateToken, superAdminBillingController.getInvoices);
-router.get('/billing/subscriptions', validateToken, superAdminBillingController.getSubscriptions);
-router.patch('/billing/subscriptions/:id', validateToken, superAdminBillingController.updateSubscription);
-router.post('/billing/invoices/:id/send', validateToken, superAdminBillingController.sendInvoice);
+router.get('/billing/overview', authenticateJWT, requireSuperAdmin, superAdminBillingController.getBillingOverview);
+router.get('/billing/invoices', authenticateJWT, requireSuperAdmin, superAdminBillingController.getInvoices);
+router.get('/billing/subscriptions', authenticateJWT, requireSuperAdmin, superAdminBillingController.getSubscriptions);
+router.patch('/billing/subscriptions/:id', authenticateJWT, requireSuperAdmin, superAdminBillingController.updateSubscription);
+router.post('/billing/invoices/:id/send', authenticateJWT, requireSuperAdmin, superAdminBillingController.sendInvoice);
 
 // System management routes
-router.get('/system/health', validateToken, superAdminTenantController.getSystemHealth);
-router.get('/system/logs', validateToken, superAdminTenantController.getSystemLogs);
-router.post('/system/maintenance', validateToken, superAdminTenantController.toggleMaintenance);
+router.get('/system/health', authenticateJWT, requireSuperAdmin, superAdminTenantController.getSystemHealth);
+router.get('/system/logs', authenticateJWT, requireSuperAdmin, superAdminTenantController.getSystemLogs);
+router.post('/system/maintenance', authenticateJWT, requireSuperAdmin, superAdminTenantController.toggleMaintenance);
 
 // User management routes (super admin users)
-router.get('/super-admins', validateToken, superAdminTenantController.getSuperAdmins);
-router.post('/super-admins', validateToken, superAdminTenantController.createSuperAdmin);
-router.patch('/super-admins/:id', validateToken, superAdminTenantController.updateSuperAdmin);
-router.delete('/super-admins/:id', validateToken, superAdminTenantController.deleteSuperAdmin);
+router.get('/super-admins', authenticateJWT, requireSuperAdmin, superAdminTenantController.getSuperAdmins);
+router.post('/super-admins', authenticateJWT, requireSuperAdmin, superAdminTenantController.createSuperAdmin);
+router.patch('/super-admins/:id', authenticateJWT, requireSuperAdmin, superAdminTenantController.updateSuperAdmin);
+router.delete('/super-admins/:id', authenticateJWT, requireSuperAdmin, superAdminTenantController.deleteSuperAdmin);
 
 module.exports = router;

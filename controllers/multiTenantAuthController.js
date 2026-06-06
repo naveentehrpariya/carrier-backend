@@ -3,11 +3,15 @@ const mongoose = require('mongoose');
 const { promisify } = require('util');
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
+if (!process.env.SECRET_ACCESS) {
+  console.error('⚠️  CRITICAL: SECRET_ACCESS env var not set — using insecure fallback. Set it in .env immediately!');
+}
 const SECRET_ACCESS = process.env.SECRET_ACCESS || 'MYSECRET';
 const User = require('../db/Users');
 const SuperAdmin = require('../db/SuperAdmin');
 const Tenant = require('../db/Tenant');
 const Company = require('../db/Company');
+const { logActivity } = require('../utils/activityLogger');
 
 // Import utilities
 const { generateTenantUrl, generateSuperAdminUrl } = require('../middleware/tenantResolver');
@@ -47,11 +51,20 @@ const resolveTenantPlanModules = async (tenant) => {
 };
 
 /**
- * Generate JWT token
+ * Generate JWT token (regular sessions)
  */
 const signToken = (payload) => {
   return jwt.sign(payload, SECRET_ACCESS, {
     expiresIn: process.env.JWT_EXPIRES_IN || '7d',
+  });
+};
+
+/**
+ * Generate short-lived JWT for super admin emulation sessions (1 hour max)
+ */
+const signEmulationToken = (payload) => {
+  return jwt.sign(payload, SECRET_ACCESS, {
+    expiresIn: process.env.JWT_EMULATION_EXPIRES_IN || '1h',
   });
 };
 
@@ -207,17 +220,9 @@ const landingLogin = catchAsync(async (req, res, next) => {
 
     res.cookie('jwt', token, cookieOptions);
 
-    console.log('✅ Login successful, sending response:', {
-      token: token ? 'EXISTS' : 'NULL',
-      userType: 'tenant_user',
-      userId: user._id,
-      userName: user.name,
-      tenantId: user.tenantId
-    });
-
     const planModules = await resolveTenantPlanModules(tenant);
     const userModules = sanitizeModules(user.allowedModules);
-    
+
     const isTenantAdmin = user.role === 3 || user.is_admin === 1;
     let effectiveModules;
     if (isTenantAdmin) {
@@ -228,6 +233,17 @@ const landingLogin = catchAsync(async (req, res, next) => {
     }
     if (effectiveModules.length === 0 && planModules.length > 0) effectiveModules = planModules;
     if (effectiveModules.length === 0) effectiveModules = ['outsourcing'];
+
+    // Log login event for tenant user
+    req.user = user;
+    req.tenantId = user.tenantId;
+    logActivity(req, {
+      action: 'LOGIN',
+      module: 'employee',
+      description: `User "${user.name}" logged in`,
+      resourceId: user._id,
+      resourceName: user.name,
+    });
 
     return res.json({
       status: true,
@@ -292,6 +308,14 @@ const tenantLogin = catchAsync(async (req, res, next) => {
     return next(new AppError('Invalid email or password', 401));
   }
 
+  // Check tenant subscription status — block if tenant not found or not active
+  if (!req.tenant) {
+    return next(new AppError('Tenant not found or not configured', 403));
+  }
+  if (req.tenant.status !== 'active') {
+    return next(new AppError('Company account is suspended', 403));
+  }
+
   const planModules = await resolveTenantPlanModules(req.tenant);
   const userModules = sanitizeModules(user.allowedModules);
   
@@ -305,6 +329,16 @@ const tenantLogin = catchAsync(async (req, res, next) => {
   }
   if (effectiveModules.length === 0 && planModules.length > 0) effectiveModules = planModules;
   if (effectiveModules.length === 0) effectiveModules = ['outsourcing'];
+
+  // Log login before sending token
+  req.user = user;
+  logActivity(req, {
+    action: 'LOGIN',
+    module: 'employee',
+    description: `User "${user.name}" logged in`,
+    resourceId: user._id,
+    resourceName: user.name,
+  });
 
   // Create token with tenant context
   createSendToken(user, 200, res, {
@@ -458,17 +492,10 @@ const validateToken = catchAsync(async (req, res, next) => {
       return next(new AppError('User no longer exists', 401));
     }
 
-    // Check if this user is actually a super admin (for backward compatibility with multitenant login)
-    const superAdmin = await SuperAdmin.findOne({ userId: currentUser._id, status: 'active' });
-    if (superAdmin) {
-      req.user = currentUser;
-      req.isSuperAdminUser = true;
-      return next();
-    }
-
     // For tenant users, verify tenant context matches
-    if (req.tenantId && currentUser.tenantId !== req.tenantId) {
-      return next(new AppError('Invalid tenant access', 403));
+    if (req.tenantId && String(currentUser.tenantId) !== String(req.tenantId)) {
+      console.log('Tenant ID mismatch. Forcing user tenant context:', { reqTenantId: req.tenantId, userTenantId: currentUser.tenantId });
+      req.tenantId = currentUser.tenantId;
     }
 
     // Ensure tenant context is available for module/limits enforcement even on landing-host requests
@@ -537,8 +564,8 @@ const emulateTenant = catchAsync(async (req, res, next) => {
     return next(new AppError('Tenant not found', 404));
   }
 
-  // Generate new token with emulation flags
-  const emulationToken = signToken({
+  // Generate short-lived token (1 hour) for the emulation session
+  const emulationToken = signEmulationToken({
     id: req.user._id,
     role: 'super_admin',
     isSuperAdmin: true,
@@ -547,11 +574,9 @@ const emulateTenant = catchAsync(async (req, res, next) => {
     originalUserId: req.user._id
   });
 
-  // Set cookie for browser session
+  // Cookie expires in 1 hour — matches token expiry
   const cookieOptions = {
-    expires: new Date(
-      Date.now() + (process.env.JWT_COOKIE_EXPIRES_IN || 7) * 24 * 60 * 60 * 1000
-    ),
+    expires: new Date(Date.now() + 60 * 60 * 1000),
     httpOnly: true,
     sameSite: 'lax'
   };
@@ -761,12 +786,6 @@ const getProfile = catchAsync(async (req, res, next) => {
     const tenant = req.tenant;
     let planModules = await resolveTenantPlanModules(tenant);
 
-    console.log(`🔍 DEBUG [getProfile] - Tenant: ${req.tenant?.name}, Cached Modules: ${planModules}`);
-
-    if (req.tenant && req.tenant.subscription && req.tenant.subscription.plan) {
-      console.log(`🔍 DEBUG [getProfile] - Tenant Plan Ref: ${req.tenant.subscription.plan}`);
-    }
-    
     // Admins (role 3) get everything the plan allows
     if (req.user.role === 3 || req.user.is_admin === 1) {
       profile.allowedModules = planModules;

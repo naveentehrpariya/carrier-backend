@@ -9,6 +9,7 @@ const Carrier = require('../db/Carrier');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
 const bcrypt = require('bcrypt');
 const { getTenantUsageSummary } = require('../middlewares/planLimitsMiddleware');
+const { logActivity } = require('../utils/activityLogger');
 
 /**
  * Get tenant information
@@ -259,6 +260,14 @@ const updateTenantSettings = catchAsync(async (req, res, next) => {
     return next(new AppError('Tenant not found', 404));
   }
 
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated tenant settings`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+  });
+
   res.json({
     status: true,
     data: { tenant },
@@ -357,6 +366,11 @@ const getTenantAnalytics = catchAsync(async (req, res, next) => {
     tenantId: req.tenantId,
     createdAt: { $gte: startDate }
   };
+
+  // Allow filtering by module/type (e.g. outsourcing vs regular)
+  if (req.query.type && ['outsourcing', 'regular'].includes(req.query.type)) {
+    baseFilter.order_type = req.query.type;
+  }
 
   // Get analytics data
   const [
@@ -497,6 +511,15 @@ const upgradePlan = catchAsync(async (req, res, next) => {
     { new: true }
   );
 
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Upgraded subscription plan to "${newPlan.name}"`,
+    resourceId: tenant?._id,
+    resourceName: newPlan.name,
+    details: { planSlug },
+  });
+
   res.json({
     status: true,
     data: { tenant },
@@ -554,60 +577,53 @@ const updateUserModules = catchAsync(async (req, res, next) => {
   const tenantId = req.tenantId;
   if (!tenantId) return next(new AppError('Tenant context required', 400));
 
-  const raw = req.body?.allowedModules;
+  const raw = req.body?.permissions ?? req.body?.allowedModules;
   if (!Array.isArray(raw) || raw.length === 0) {
-    return next(new AppError('Please select at least one module', 400));
+    return next(new AppError('Please select at least one permission', 400));
   }
 
-  const valid = ['outsourcing', 'regular'];
+  // All assignable permissions — order modules + feature areas
+  const VALID_PERMISSIONS = ['outsourcing', 'regular', 'accounting', 'customers', 'carriers', 'employees'];
   const requested = raw
-    .map((m) => String(m).toLowerCase())
-    .filter((m) => valid.includes(m));
+    .map((m) => String(m).toLowerCase().trim())
+    .filter((m) => VALID_PERMISSIONS.includes(m));
 
   if (requested.length === 0) {
-    return next(new AppError('Invalid modules provided', 400));
+    return next(new AppError('Invalid permissions provided', 400));
   }
 
-  const tenant = await Tenant.findOne({ tenantId })
-    .select('subscription.plan subscription.planSlug subscription.legacyPlan subscription.allowedModules')
-    .lean();
-
-  let planModules = Array.isArray(tenant?.subscription?.allowedModules) ? tenant.subscription.allowedModules : [];
-  if (!planModules.length) {
-    let planRecord = null;
-    const planSlug = tenant?.subscription?.planSlug;
-    const planRef = tenant?.subscription?.plan;
-    if (planSlug) {
-      planRecord = await SubscriptionPlan.findOne({ slug: planSlug }).select('allowedModules').lean();
-    } else if (typeof planRef === 'string') {
-      planRecord = await SubscriptionPlan.findOne({ slug: planRef }).select('allowedModules').lean();
-    } else if (planRef) {
-      planRecord = await SubscriptionPlan.findById(planRef).select('allowedModules').lean();
-    }
-    planModules = Array.isArray(planRecord?.allowedModules) ? planRecord.allowedModules : valid;
-  }
-
-  const effective = requested.filter((m) => planModules.includes(m));
-  if (!effective.length) {
-    return next(new AppError('Selected modules are not enabled for this company', 400));
-  }
+  // Only admins can assign 'employees' permission
+  const callerIsAdmin = req.user.is_admin === 1 || req.user.role === 3;
+  const filtered = requested.filter(p => p !== 'employees' || callerIsAdmin);
 
   const criteria = { _id: req.params.id, tenantId };
 
-  let isCustomized = true;
-  if (effective.length === planModules.length) {
-    isCustomized = false;
-  }
+  // Determine which order modules are active (for allowedModules field sync)
+  const orderModules = ['outsourcing', 'regular'].filter(m => filtered.includes(m));
+  const isCustomized = orderModules.length > 0;
 
   const user = await User.findOneAndUpdate(
     criteria,
-    { allowedModules: effective, modulesCustomized: isCustomized },
+    {
+      permissions: filtered,
+      allowedModules: orderModules,
+      modulesCustomized: isCustomized
+    },
     { new: true, runValidators: true }
   ).select('-password');
 
   if (!user) {
     return next(new AppError('User not found', 404));
   }
+
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'employee',
+    description: `Updated permissions for user "${user.name}"`,
+    resourceId: user._id,
+    resourceName: user.name,
+    details: { permissions: filtered },
+  });
 
   res.json({
     status: true,
@@ -701,6 +717,14 @@ const inviteUser = catchAsync(async (req, res, next) => {
   // Send invitation email (implement email service)
   // await sendUserInvitationEmail(user, tempPassword);
 
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'employee',
+    description: `Invited user "${user.name}" (${user.email})`,
+    resourceId: user._id,
+    resourceName: user.name,
+  });
+
   res.status(201).json({
     status: true,
     data: { user, tempPassword },
@@ -728,6 +752,15 @@ const updateUserRole = catchAsync(async (req, res, next) => {
     return next(new AppError('User not found', 404));
   }
 
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'employee',
+    description: `Updated role for user "${user.name}" to role ${role}`,
+    resourceId: user._id,
+    resourceName: user.name,
+    details: { role, position },
+  });
+
   res.json({
     status: true,
     data: { user },
@@ -752,6 +785,14 @@ const removeUser = catchAsync(async (req, res, next) => {
   if (!user) {
     return next(new AppError('User not found', 404));
   }
+
+  logActivity(req, {
+    action: 'DELETE',
+    module: 'employee',
+    description: `Removed user "${user.name}" (${user.email})`,
+    resourceId: user._id,
+    resourceName: user.name,
+  });
 
   res.json({
     status: true,

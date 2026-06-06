@@ -4,6 +4,7 @@ const Customer = require("../db/Customer");
 const JSONerror = require("../utils/jsonErrorHandler");
 const logger = require("../utils/logger");
 const { checkCustomerLimit } = require("../middlewares/planLimitsMiddleware");
+const { logActivity } = require("../utils/activityLogger");
 
 exports.addCustomer = catchAsync(async (req, res, next) => {
   const hasCustomersPermission = req.user?.permissions?.includes('customers') || req.user?.permissions?.includes('subadmin');
@@ -73,7 +74,7 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
 
  await Customer.syncIndexes();
  const normalizedAssignedTo = assigned_to ? assigned_to : null;
- Customer.create({
+ const result = await Customer.create({
    name: name,
    email: email,
    secondary_email: secondary_email,
@@ -90,15 +91,18 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
    zipcode: zipcode,
    assigned_to: normalizedAssignedTo,
    created_by:req.user._id,
- }).then(result => {
-   res.send({
-     status: true,
-     customers :result,
-     message: "Customer has been added.",
-   });
- }).catch(err => {
-   JSONerror(res, err, next);
-   logger(err);
+ });
+ logActivity(req, {
+   action: 'CREATE',
+   module: 'customer',
+   description: `Added customer "${result.name}"`,
+   resourceId: result._id,
+   resourceName: result.name,
+ });
+ return res.send({
+   status: true,
+   customers: result,
+   message: "Customer has been added.",
  });
 });
 
@@ -170,13 +174,13 @@ exports.customerDetails = catchAsync(async (req, res, next) => {
   }
   
   const customer = await Customer.findOne(criteria).populate('assigned_to');
-  if(!customer){ 
-    res.send({
+  if(!customer){
+    return res.send({
       status: false,
       result : null,
       message: "Customer not found or not authorized",
     });
-  } 
+  }
   res.send({
     status: true,
     result : customer,
@@ -251,16 +255,23 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
     runValidators: true,
   });
 
-  if(!updatedUser){ 
-    res.send({
+  if(!updatedUser){
+    return res.send({
       status: false,
-      customer : updatedUser,
+      customer: null,
       message: "Failed to update customer information.",
     });
-  } 
-  res.send({
+  }
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'customer',
+    description: `Updated customer "${updatedUser.name}"`,
+    resourceId: updatedUser._id,
+    resourceName: updatedUser.name,
+  });
+  return res.send({
     status: true,
-    error : updatedUser,
+    customer: updatedUser,
     message: "Customer has been updated.",
   });
 });
@@ -289,6 +300,13 @@ exports.deleteCustomer = catchAsync(async (req, res) => {
       customer.deletedAt = Date.now();
       const result = await customer.save();
       if (result) {
+        logActivity(req, {
+          action: 'DELETE',
+          module: 'customer',
+          description: `Deleted customer "${customer.name}"`,
+          resourceId: customer._id,
+          resourceName: customer.name,
+        });
         return res.status(200).json({
           status: true,
           message: `customer has been removed.`,

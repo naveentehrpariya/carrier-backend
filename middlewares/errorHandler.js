@@ -1,52 +1,31 @@
 
-const errorHandler = (err, req, res, next) =>{ 
+const errorHandler = (err, req, res, next) => { 
+   // Handle Mongoose Validation Errors
+   if (err.name === 'ValidationError') {
+      const messages = Object.values(err.errors).map(val => val.message);
+      return res.status(400).json({
+         status: false,
+         errors: messages,
+         message: "Validation Error",
+      });
+   }
 
-      //   VALIDATION_ERROR: 400,
-      //   UNAUTHORIZED: 401,
-      //   FORBIDDEN: 403,
-      //   NOT_FOUND: 404,
-      //   SERVER_ERROR: 500,
-   
-      const statusCode = res.statusCode ? res.statusCode  : 500;
-      
-      switch(statusCode){ 
-   
-         case 500:
-         res.json({
-            title: "server error",
-            message : err.message,
-            stack : err.stack
-         });
-         break;
-   
-         case 400:
-         res.json({
-            title: "Not Found",
-            message : err.message,
-            stack : err.stack
-         });
-         break;
-   
-         case 401:
-         res.json({
-            title: "Unauthenticated",
-            message : err.message,
-            stack : err.stack
-         });
-         break;
-   
-         case 403:
-         res.json({
-            title: "Forbidden",
-            message : err.message,
-            stack : err.stack
-         });
-         break; 
+   // Handle MongoDB Duplicate Key Errors
+   if (err.code === 11000) {
+      const field = Object.keys(err.keyValue)[0];
+      return res.status(400).json({
+         status: false,
+         errors: [`A record with that ${field} already exists.`],
+         message: "Duplicate Error",
+      });
+   }
 
-         default:
-         console.log("No Error, All good !");
-         break;
-      }
+   const statusCode = err.statusCode || (res.statusCode === 200 ? 500 : res.statusCode);
    
-   }     
+   res.status(statusCode).json({
+      status: false,
+      message: err.message || "Internal Server Error",
+      stack: process.env.NODE_ENV === 'production' ? null : err.stack
+   });
+}     
 module.exports = errorHandler;

@@ -16,7 +16,7 @@ const schema = new mongoose.Schema({
    added_by: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
    createdAt: {
       type: Date,
-      default: Date.now()     
+      default: Date.now     
    },
    deletedAt: {
       type: Date,

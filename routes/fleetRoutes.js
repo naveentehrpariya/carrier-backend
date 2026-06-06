@@ -7,6 +7,7 @@ const fileupload = require('../utils/fileupload');
 const FleetDoc = require('../db/FleetDoc');
 const truckController = require('../controllers/truckController');
 const trailerController = require('../controllers/trailerController');
+const truckExpenseController = require('../controllers/truckExpenseController');
 const { requireModuleAccess } = require('../middlewares/planModulesMiddleware');
 
 const upload = multer({ dest: require('os').tmpdir() + '/uploads' });
@@ -17,6 +18,13 @@ router.route('/fleet/trucks/detail/:id').get(validateToken, resolveTenant, requi
 router.route('/fleet/trucks/add').post(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.addTruck);
 router.route('/fleet/trucks/update/:id').post(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.updateTruck);
 router.route('/fleet/trucks/remove/:id').get(validateToken, resolveTenant, requireModuleAccess('regular'), truckController.removeTruck);
+
+// Truck Expenses
+router.route('/truck/:truckId/expenses').get(validateToken, resolveTenant, truckExpenseController.getExpenses);
+router.route('/truck/:truckId/expense').post(validateToken, resolveTenant, truckExpenseController.addExpense);
+router.route('/truck/:truckId/expense/:expenseId').put(validateToken, resolveTenant, truckExpenseController.updateExpense);
+router.route('/truck/:truckId/expense/:expenseId').delete(validateToken, resolveTenant, truckExpenseController.deleteExpense);
+router.route('/truck/:truckId/profit-summary').get(validateToken, resolveTenant, truckExpenseController.getTruckProfitSummary);
 
 // Trailers
 router.route('/fleet/trailers/listings').get(validateToken, resolveTenant, requireModuleAccess('regular'), trailerController.trailers_listing);

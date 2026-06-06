@@ -207,12 +207,13 @@ const generateSuperAdminUrl = (domain = process.env.DOMAIN || 'localhost:3000') 
  * Used for routes that need tenant context but don't want full tenant resolution
  */
 const ensureTenantContext = catchAsync(async (req, res, next) => {
-  // Prefer tenantId from emulation or previously set context
+  // Prefer tenantId from emulation or previously set context (already authenticated)
   let tParam = req.tenantId;
 
-  // Fallback to query or header if not set
+  // Fallback to query param only — never trust the x-tenant-id header from
+  // unauthenticated callers as it allows arbitrary tenant context injection
   if (!tParam) {
-    const tParamRaw = req.query?.tenant || req.headers['x-tenant-id'];
+    const tParamRaw = req.query?.tenant;
     tParam = (tParamRaw || '').toString().trim().toLowerCase();
   }
 

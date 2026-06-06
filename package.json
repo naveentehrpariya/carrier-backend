@@ -63,6 +63,7 @@
     "paypal-rest-sdk": "^1.8.1",
     "pusher": "^5.1.2",
     "pusher-js": "^8.0.2",
+    "puppeteer": "^24.10.2",
     "razorpay": "^2.9.4",
     "react-toastify": "^9.1.1",
     "semver": "^7.6.3",

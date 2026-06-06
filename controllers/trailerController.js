@@ -3,6 +3,7 @@ const FleetDoc = require('../db/FleetDoc');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
+const { logActivity } = require('../utils/activityLogger');
 
 exports.addTrailer = catchAsync(async (req, res, next) => {
   try {
@@ -19,6 +20,13 @@ exports.addTrailer = catchAsync(async (req, res, next) => {
       ratePerMile: Number(ratePerMile) || 0,
       createdBy: req.user?._id
     });
+    logActivity(req, {
+      action: 'CREATE',
+      module: 'fleet',
+      description: `Added trailer "${trailer.unitNumber || trailer.plateNumber}"`,
+      resourceId: trailer._id,
+      resourceName: trailer.unitNumber || trailer.plateNumber,
+    });
     res.status(201).json({ status: true, message: 'Trailer added', trailer });
   } catch (err) {
     JSONerror(res, err, next);
@@ -33,6 +41,9 @@ exports.trailers_listing = catchAsync(async (req, res, next) => {
     const filter = { tenantId };
     if (companyId) {
       filter.company = companyId;
+    }
+    if (req.query.active === 'true') {
+      filter.isActive = true;
     }
     filter.$or = [{ deletedAt: null }, { deletedAt: { $exists: false } }];
     const trailers = await Trailer.find(filter).sort({ createdAt: -1 });
@@ -56,6 +67,13 @@ exports.removeTrailer = catchAsync(async (req, res, next) => {
     if (!updated) {
       return res.status(404).json({ status: false, message: 'Trailer not found' });
     }
+    logActivity(req, {
+      action: 'DELETE',
+      module: 'fleet',
+      description: `Removed trailer "${updated.unitNumber || updated.plateNumber}"`,
+      resourceId: updated._id,
+      resourceName: updated.unitNumber || updated.plateNumber,
+    });
     res.json({ status: true, message: 'Trailer removed (soft delete)', trailer: updated });
   } catch (err) {
     JSONerror(res, err, next);
@@ -72,6 +90,13 @@ exports.updateTrailer = catchAsync(async (req, res, next) => {
       payload.ratePerMile = Number(payload.ratePerMile) || 0;
     }
     const trailer = await Trailer.findOneAndUpdate({ _id: id, tenantId }, payload, { new: true });
+    logActivity(req, {
+      action: 'UPDATE',
+      module: 'fleet',
+      description: `Updated trailer "${trailer?.unitNumber || trailer?.plateNumber}"`,
+      resourceId: trailer?._id,
+      resourceName: trailer?.unitNumber || trailer?.plateNumber,
+    });
     res.json({ status: true, message: 'Trailer updated', trailer });
   } catch (err) {
     JSONerror(res, err, next);

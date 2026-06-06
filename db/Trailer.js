@@ -17,6 +17,7 @@ const trailerSchema = new mongoose.Schema({
   model: { type: String },
   ratePerMile: { type: Number, default: 0 },
   notes: { type: String },
+  isActive: { type: Boolean, default: true },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
   createdAt: { type: Date, default: Date.now },
   deletedAt: { type: Date, default: null }

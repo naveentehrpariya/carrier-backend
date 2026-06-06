@@ -120,9 +120,12 @@ subscriptionPlanSchema.methods.hasFeature = function(feature) {
   return this.features.includes(feature);
 };
 
-// Method to check if plan has permission
+// Method to check if plan has a module or feature permission
 subscriptionPlanSchema.methods.hasPermission = function(permission) {
-  return this.permissions.includes(permission);
+  return (
+    (Array.isArray(this.allowedModules) && this.allowedModules.includes(permission)) ||
+    (Array.isArray(this.features) && this.features.includes(permission))
+  );
 };
 
 // Query middleware to only return active plans by default (skip for superadmin operations)

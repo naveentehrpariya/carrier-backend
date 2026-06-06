@@ -1,10 +1,12 @@
 const Truck = require('../db/Truck');
 const FleetDoc = require('../db/FleetDoc');
 const Trip = require('../db/Trip');
+const OwnerOperator = require('../db/OwnerOperator');
 const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
+const { logActivity } = require('../utils/activityLogger');
 
 function normalizeCompanyId(req) {
   const raw = req.user?.company?._id || req.user?.company;
@@ -18,15 +20,56 @@ exports.addTruck = catchAsync(async (req, res, next) => {
   try {
     const tenantId = req.tenantId || req.user?.tenantId;
     if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
-    const { plateNumber, unitNumber, make, model, year, vin, capacity, notes } = req.body;
+    const {
+      plateNumber,
+      unitNumber,
+      make,
+      model,
+      year,
+      vin,
+      capacity,
+      notes,
+      insuranceMonthly,
+      parkingMonthly,
+      ownerOperated,
+      ownerOperator
+    } = req.body;
     if (!plateNumber) return res.status(400).json({ status: false, message: 'Plate number is required' });
     const exists = await Truck.findOne({ tenantId, plateNumber });
     if (exists) return res.status(400).json({ status: false, message: 'Truck with this plate already exists' });
+    const isOwnerOperated = ownerOperated === true || ownerOperated === 'true' || ownerOperated === 1 || ownerOperated === '1';
+    let ownerOperatorDoc = null;
+    if (isOwnerOperated) {
+      if (!ownerOperator) {
+        return res.status(400).json({ status: false, message: 'Owner operator is required for owner operated truck' });
+      }
+      ownerOperatorDoc = await OwnerOperator.findOne({
+        _id: ownerOperator,
+        tenantId,
+        status: 'active',
+        $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
+      }).lean();
+      if (!ownerOperatorDoc) {
+        return res.status(400).json({ status: false, message: 'Selected owner operator is inactive or not found' });
+      }
+    }
     const truck = await Truck.create({
       tenantId,
       company: req.user?.company ? req.user.company._id : null,
       plateNumber, unitNumber, make, model, year, vin, capacity, notes,
+      insuranceMonthly: Number(insuranceMonthly || 0),
+      parkingMonthly: Number(parkingMonthly || 0),
+      ownerOperated: isOwnerOperated,
+      ownerOperator: isOwnerOperated ? ownerOperatorDoc?._id : null,
+      ownerOperatorAssignedAt: isOwnerOperated ? new Date() : null,
       createdBy: req.user?._id
+    });
+    logActivity(req, {
+      action: 'CREATE',
+      module: 'fleet',
+      description: `Added truck "${truck.unitNumber || truck.plateNumber}"`,
+      resourceId: truck._id,
+      resourceName: truck.unitNumber || truck.plateNumber,
     });
     res.status(201).json({ status: true, message: 'Truck added', truck });
   } catch (err) {
@@ -44,7 +87,10 @@ exports.trucks_listing = catchAsync(async (req, res, next) => {
       filter.company = companyId;
     }
     filter.$or = [{ deletedAt: null }, { deletedAt: { $exists: false } }];
-    const trucks = await Truck.find(filter).sort({ createdAt: -1 }).lean();
+    const trucks = await Truck.find(filter)
+      .populate('ownerOperator', 'fullName ownerOperatorId status')
+      .sort({ createdAt: -1 })
+      .lean();
     const truckIds = (trucks || []).map((t) => t._id).filter(Boolean);
 
     const tripAgg = truckIds.length
@@ -107,6 +153,13 @@ exports.removeTruck = catchAsync(async (req, res, next) => {
     if (!updated) {
       return res.status(404).json({ status: false, message: 'Truck not found' });
     }
+    logActivity(req, {
+      action: 'DELETE',
+      module: 'fleet',
+      description: `Removed truck "${updated.unitNumber || updated.plateNumber}"`,
+      resourceId: updated._id,
+      resourceName: updated.unitNumber || updated.plateNumber,
+    });
     res.json({ status: true, message: 'Truck removed (soft delete)', truck: updated });
   } catch (err) {
     JSONerror(res, err, next);
@@ -118,7 +171,40 @@ exports.updateTruck = catchAsync(async (req, res, next) => {
   try {
     const tenantId = req.tenantId || req.user?.tenantId;
     const id = req.params.id;
-    const truck = await Truck.findOneAndUpdate({ _id: id, tenantId }, req.body, { new: true });
+    const updateData = { ...req.body };
+    const isOwnerOperated = updateData.ownerOperated === true || updateData.ownerOperated === 'true' || updateData.ownerOperated === 1 || updateData.ownerOperated === '1';
+    if ('ownerOperated' in updateData) {
+      updateData.ownerOperated = isOwnerOperated;
+      if (!isOwnerOperated) {
+        updateData.ownerOperator = null;
+        updateData.ownerOperatorAssignedAt = null;
+      } else {
+        if (!updateData.ownerOperator) {
+          return res.status(400).json({ status: false, message: 'Owner operator is required for owner operated truck' });
+        }
+        const ownerOperatorDoc = await OwnerOperator.findOne({
+          _id: updateData.ownerOperator,
+          tenantId,
+          status: 'active',
+          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
+        }).lean();
+        if (!ownerOperatorDoc) {
+          return res.status(400).json({ status: false, message: 'Selected owner operator is inactive or not found' });
+        }
+        updateData.ownerOperatorAssignedAt = new Date();
+      }
+    }
+    const truck = await Truck.findOneAndUpdate({ _id: id, tenantId }, updateData, { new: true }).populate(
+      'ownerOperator',
+      'fullName ownerOperatorId status'
+    );
+    logActivity(req, {
+      action: 'UPDATE',
+      module: 'fleet',
+      description: `Updated truck "${truck?.unitNumber || truck?.plateNumber}"`,
+      resourceId: truck?._id,
+      resourceName: truck?.unitNumber || truck?.plateNumber,
+    });
     res.json({ status: true, message: 'Truck updated', truck });
   } catch (err) {
     JSONerror(res, err, next);
@@ -136,7 +222,7 @@ exports.truck_detail = catchAsync(async (req, res, next) => {
     const filter = { _id: id, tenantId, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
     if (companyId) filter.company = companyId;
 
-    const truck = await Truck.findOne(filter).lean();
+    const truck = await Truck.findOne(filter).populate('ownerOperator', 'fullName ownerOperatorId status').lean();
     if (!truck) return res.status(404).json({ status: false, message: 'Truck not found' });
     res.json({ status: true, truck });
   } catch (err) {

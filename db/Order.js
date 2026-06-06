@@ -38,6 +38,19 @@ const schema = new mongo.Schema({
     drivers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'users' }],
     truck: { type: mongoose.Schema.Types.ObjectId, ref: 'trucks' },
     trailer: { type: mongoose.Schema.Types.ObjectId, ref: 'trailers' },
+    ownerOperator: { type: mongoose.Schema.Types.ObjectId, ref: 'owneroperators', default: null, index: true },
+    isOwnerOperatedTruck: { type: Boolean, default: false, index: true },
+    settle_amount: { type: Number, default: 0 },
+    owner_profit: { type: Number, default: 0 },
+    driver_assignment_mode: {
+        type: String,
+        enum: ['company_driver', 'owner_driver'],
+        default: 'company_driver'
+    },
+    driver_assignment_status: {
+        type: String,
+        default: 'company_driver_assigned'
+    },
     total_amount: {
         type:Number,
         required:[true, 'Please enter total amount of this order.'],
@@ -111,6 +124,30 @@ const schema = new mongo.Schema({
        type: String,
        default:"cad",
     },
+    amount_currency: {
+        type: String,
+        default: "cad",
+    },
+    input_currency: {
+        type: String,
+        default: "cad",
+    },
+    fx_to_cad: {
+        type: Number,
+        default: 1,
+    },
+    input_total_amount: {
+        type: Number,
+        default: 0,
+    },
+    input_carrier_amount: {
+        type: Number,
+        default: 0,
+    },
+    input_settle_amount: {
+        type: Number,
+        default: 0,
+    },
     order_status :{
         type: String,
         default:"added",
@@ -128,7 +165,7 @@ const schema = new mongo.Schema({
     created_by: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
     createdAt: {
         type: Date,
-        default: Date.now()   
+        default: Date.now   // function reference, not invocation — evaluated per-document
     },
     deletedAt: {
         type: Date,
@@ -178,6 +215,11 @@ schema.virtual('carrier_final_payment_status').get(function () {
 schema.virtual('profit').get(function () {
     const totalAmount = this.total_amount || 0;
     const isOutsourcing = this.order_type === 'outsourcing';
+    const isOwnerOperated = this.order_type === 'regular' && this.isOwnerOperatedTruck;
+    if (isOwnerOperated) {
+        const settleAmount = Number(this.settle_amount || 0);
+        return totalAmount - settleAmount;
+    }
     const carrierAmount = isOutsourcing ? (this.carrier_amount || 0) : 0;
     const staffCommissionRate = isOutsourcing ? (this.created_by?.staff_commision || 0) : 0;
     const commission = totalAmount * (staffCommissionRate / 100);
@@ -202,6 +244,8 @@ schema.index({ tenantId: 1, carrier: 1 });
 schema.index({ tenantId: 1, order_status: 1 });
 schema.index({ tenantId: 1, customer_payment_status: 1 });
 schema.index({ tenantId: 1, carrier_payment_status: 1 });
+schema.index({ tenantId: 1, ownerOperator: 1, createdAt: -1 });
+schema.index({ tenantId: 1, isOwnerOperatedTruck: 1, createdAt: -1 });
 
 
 module.exports = mongo.model('orders', schema);

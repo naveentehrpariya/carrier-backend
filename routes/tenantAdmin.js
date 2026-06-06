@@ -23,6 +23,12 @@ const {
   exportData
 } = require('../controllers/tenantAdminController');
 
+const {
+  getActivityLogs,
+  getActivitySummary,
+  getLogUsers,
+} = require('../controllers/activityLogController');
+
 const { validateToken } = require('../controllers/multiTenantAuthController');
 const { resolveTenant } = require('../middleware/tenant');
 
@@ -52,6 +58,11 @@ router.delete('/users/:id', removeUser);
 router.get('/integrations', getIntegrations);
 router.post('/integrations', configureIntegration);
 router.delete('/integrations/:id', removeIntegration);
+
+// Activity Logs Routes
+router.get('/activity-logs', getActivityLogs);
+router.get('/activity-logs/summary', getActivitySummary);
+router.get('/activity-logs/users', getLogUsers);
 
 // Reports Routes
 router.get('/reports/orders', getOrdersReport);

@@ -8,7 +8,130 @@ const Equipment = require("../db/Equipment");
 const Charges = require("../db/Charges");
 const PaymentLogs = require("../db/PaymentLogs");
 const Trip = require("../db/Trip");
+const Truck = require("../db/Truck");
+const OwnerOperatorFinancialRecord = require("../db/OwnerOperatorFinancialRecord");
+const ConversionRate = require("../db/ConversionRate");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
+const { logActivity } = require("../utils/activityLogger");
+
+const SUPPORTED_CURRENCIES = new Set(['CAD', 'USD', 'INR']);
+const BASE_ORDER_CURRENCY = 'CAD';
+const FX_FALLBACK = {
+   CAD_USD: 0.74,
+   USD_CAD: 1.35,
+   USD_INR: 83,
+   INR_USD: 0.012,
+   CAD_INR: 61,
+   INR_CAD: 0.0164,
+};
+function toMonthEndDate(refDate = new Date()) {
+   const d = new Date(refDate);
+   const end = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+   const y = end.getFullYear();
+   const m = String(end.getMonth() + 1).padStart(2, '0');
+   const day = String(end.getDate()).padStart(2, '0');
+   return `${y}-${m}-${day}`;
+}
+
+async function fetchLiveFxRate(sourceCurrency, targetCurrency, referenceDate = new Date()) {
+   const src = normalizeCurrency(sourceCurrency, BASE_ORDER_CURRENCY);
+   const dst = normalizeCurrency(targetCurrency, BASE_ORDER_CURRENCY);
+   if (src === dst) return 1;
+   const date = toMonthEndDate(referenceDate);
+
+   try {
+      const res = await fetch(`https://api.frankfurter.app/${date}?from=${src}&to=${dst}`);
+      const json = await res.json();
+      const rate = Number(json?.rates?.[dst] || 0);
+      if (Number.isFinite(rate) && rate > 0) return rate;
+   } catch (_) {}
+
+   try {
+      const res = await fetch(`https://open.er-api.com/v6/latest/${src}`);
+      const json = await res.json();
+      const rate = Number(json?.rates?.[dst] || 0);
+      if (Number.isFinite(rate) && rate > 0) return rate;
+   } catch (_) {}
+
+   return null;
+}
+
+function normalizeCurrency(value, fallback = BASE_ORDER_CURRENCY) {
+   const code = String(value || fallback).trim().toUpperCase();
+   if (!/^[A-Z]{3}$/.test(code)) return String(fallback).toUpperCase();
+   if (!SUPPORTED_CURRENCIES.has(code)) return String(fallback).toUpperCase();
+   return code;
+}
+
+async function resolveMonthlyRate({ tenantId, sourceCurrency, targetCurrency = BASE_ORDER_CURRENCY, referenceDate = new Date() }) {
+   const src = normalizeCurrency(sourceCurrency, BASE_ORDER_CURRENCY);
+   const dst = normalizeCurrency(targetCurrency, BASE_ORDER_CURRENCY);
+   if (src === dst) return 1;
+   const month = Number(new Date(referenceDate).getMonth()) + 1;
+   const year = Number(new Date(referenceDate).getFullYear());
+   const row = await ConversionRate.findOne({
+      tenantId,
+      month,
+      year,
+      sourceCurrency: src,
+      targetCurrency: dst
+   }).lean();
+   const rate = Number(row?.rate || 0);
+   if (Number.isFinite(rate) && rate > 0) return rate;
+
+   const liveRate = await fetchLiveFxRate(src, dst, referenceDate);
+   if (Number.isFinite(Number(liveRate)) && Number(liveRate) > 0) {
+      await ConversionRate.findOneAndUpdate(
+         {
+            tenantId,
+            month,
+            year,
+            sourceCurrency: src,
+            targetCurrency: dst
+         },
+         {
+            tenantId,
+            month,
+            year,
+            sourceCurrency: src,
+            targetCurrency: dst,
+            rate: Number(liveRate)
+         },
+         { upsert: true, new: true }
+      );
+      return Number(liveRate);
+   }
+
+   return Number(FX_FALLBACK[`${src}_${dst}`] || 1);
+}
+
+async function resolveMonthlyRateToCad({ tenantId, sourceCurrency, referenceDate = new Date() }) {
+   return resolveMonthlyRate({
+      tenantId,
+      sourceCurrency,
+      targetCurrency: BASE_ORDER_CURRENCY,
+      referenceDate
+   });
+}
+
+function convertToCad(amount, rateToCad) {
+   const val = Number(amount || 0);
+   const rate = Number(rateToCad || 1);
+   const converted = val * (Number.isFinite(rate) && rate > 0 ? rate : 1);
+   return Number(converted.toFixed(2));
+}
+
+function normalizeRevenueItemsToCad(items = [], rateToCad = 1) {
+   if (!Array.isArray(items)) return [];
+   return items.map((item) => {
+      const next = { ...(item || {}) };
+      if (typeof next.rate !== 'undefined' && next.rate !== null && next.rate !== '') {
+         const numericRate = Number(next.rate);
+         if (Number.isFinite(numericRate)) next.rate = convertToCad(numericRate, rateToCad);
+      }
+      return next;
+   });
+}
 
 function getTenantId(req) {
    return req.tenantId || req.user?.tenantId || null;
@@ -57,12 +180,31 @@ async function generateUniqueSerialNumber(tenantId) {
       
       if (!existingCounter) {
          const maxOrder = await Order.findOne({ tenantId: tenantId || 'legacy_tenant_001' }, { serial_no: 1 }).sort({ serial_no: -1 }).lean();
-         const maxSerialNo = maxOrder ? maxOrder.serial_no : 1000;
+         // Start from 1000 base. The very first generated number via $inc will be 1001.
+         const maxSerialNo = maxOrder && typeof maxOrder.serial_no === 'number' && maxOrder.serial_no > 1000 ? maxOrder.serial_no : 1000;
          
          existingCounter = await Counter.create({
             _id: counterKey,
             sequence_value: maxSerialNo
          });
+      } else {
+         // Sync counter if it's lagging behind the actual max serial_no
+         const maxOrder = await Order.findOne({ tenantId: tenantId || 'legacy_tenant_001' }, { serial_no: 1 }).sort({ serial_no: -1 }).lean();
+         // But only if there is a max order and it's higher. If there are NO orders, do NOT update the counter to 1000 if it's already higher (e.g. 1008 from a previous bug)
+         if (maxOrder && typeof maxOrder.serial_no === 'number' && existingCounter.sequence_value < maxOrder.serial_no) {
+            existingCounter = await Counter.findOneAndUpdate(
+               { _id: counterKey },
+               { $set: { sequence_value: maxOrder.serial_no } },
+               { new: true }
+            );
+         } else if (!maxOrder && existingCounter.sequence_value > 1000) {
+            // FIX: If there are NO orders but the counter got inflated to something like 1008, reset it down to 1000
+            existingCounter = await Counter.findOneAndUpdate(
+               { _id: counterKey },
+               { $set: { sequence_value: 1000 } },
+               { new: true }
+            );
+         }
       }
       
       let attempts = 0;
@@ -95,6 +237,90 @@ async function generateUniqueSerialNumber(tenantId) {
    }
 }
 
+async function resolveRegularOrderOwnerContext({ tenantId, truckId, totalAmount, settleAmount, driverAssignmentMode }) {
+   const ctx = {
+      isOwnerOperatedTruck: false,
+      ownerOperator: null,
+      settle_amount: 0,
+      owner_profit: 0,
+      carrier_amount: 0,
+      driver_assignment_mode: 'company_driver',
+      driver_assignment_status: 'company_driver_assigned'
+   };
+   if (!truckId) return ctx;
+
+   const truck = await Truck.findOne({
+      _id: truckId,
+      tenantId,
+      $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
+   }).populate('ownerOperator', 'status fullName');
+   if (!truck) {
+      throw new Error('Selected truck not found');
+   }
+
+   if (!truck.ownerOperated) return ctx;
+   if (!truck.ownerOperator || truck.ownerOperator.status !== 'active') {
+      throw new Error('Owner operated truck must be linked with an active owner operator');
+   }
+
+   const settle = Number(settleAmount || 0);
+   const orderTotal = Number(totalAmount || 0);
+   if (settle <= 0) {
+      throw new Error('Settle amount is required for owner operated truck');
+   }
+   if (settle > orderTotal) {
+      throw new Error('Settle amount can not be greater than order total');
+   }
+
+   const mode = driverAssignmentMode === 'owner_driver' ? 'owner_driver' : 'company_driver';
+   return {
+      isOwnerOperatedTruck: true,
+      ownerOperator: truck.ownerOperator._id,
+      settle_amount: settle,
+      owner_profit: orderTotal - settle,
+      carrier_amount: settle,
+      driver_assignment_mode: mode,
+      driver_assignment_status: mode === 'owner_driver' ? 'owner_operator_driver' : 'company_driver_assigned'
+   };
+}
+
+async function syncOwnerOperatorFinancialRecords({ tenantId, companyId, userId, order }) {
+   if (!order?.isOwnerOperatedTruck || !order?.ownerOperator) return;
+   const base = {
+      tenantId,
+      company: companyId || null,
+      ownerOperator: order.ownerOperator,
+      order: order._id,
+      month: new Date(order.createdAt || Date.now()).getMonth() + 1,
+      year: new Date(order.createdAt || Date.now()).getFullYear(),
+      currency: order.revenue_currency || 'cad',
+      createdBy: userId || null
+   };
+
+   await OwnerOperatorFinancialRecord.deleteMany({
+      tenantId,
+      order: order._id,
+      type: { $in: ['SETTLEMENT', 'OWNER_PROFIT', 'DRIVER_DEDUCTION'] }
+   });
+
+   await OwnerOperatorFinancialRecord.insertMany([
+      {
+         ...base,
+         type: 'SETTLEMENT',
+         amount: Number(order.settle_amount || 0),
+         paymentStatus: 'pending',
+         notes: `Settlement for order #${order.serial_no || ''}`.trim()
+      },
+      {
+         ...base,
+         type: 'OWNER_PROFIT',
+         amount: Number(order.owner_profit || 0),
+         paymentStatus: 'pending',
+         notes: `Owner profit for order #${order.serial_no || ''}`.trim()
+      }
+   ]);
+}
+
 exports.create_order = catchAsync(async (req, res, next) => {
    try {
       const tenantId = getTenantId(req);
@@ -123,6 +349,8 @@ exports.create_order = catchAsync(async (req, res, next) => {
          driver,
          truck,
          trailer,
+         settle_amount,
+         driver_assignment_mode,
          
          // Revennue
          revenue_items,
@@ -133,36 +361,154 @@ exports.create_order = catchAsync(async (req, res, next) => {
 
          order_status,
        } = req.body;
+
+      const inputCurrency = normalizeCurrency(revenue_currency, BASE_ORDER_CURRENCY);
+      const fxToCad = await resolveMonthlyRateToCad({
+         tenantId,
+         sourceCurrency: inputCurrency,
+         referenceDate: new Date(),
+      });
+      const totalAmountCad = convertToCad(total_amount, fxToCad);
+      const carrierAmountCad = convertToCad(carrier_amount, fxToCad);
+      const settleAmountCad = convertToCad(settle_amount, fxToCad);
+      const revenueItemsCad = normalizeRevenueItemsToCad(revenue_items, fxToCad);
+      const carrierRevenueItemsCad = normalizeRevenueItemsToCad(carrier_revenue_items, fxToCad);
  
       const newOrderId = await generateUniqueSerialNumber(tenantId);
+      
+      // Ensure we have a truly unique serial number by checking and incrementing if necessary
+      let finalSerialNo = parseInt(newOrderId);
+      
+      // Safety absolute max check first to avoid long loop when gap is huge
+      const absoluteMaxOrder = await Order.findOne({ tenantId: tenantId }).sort({ serial_no: -1 }).lean();
+      
+      if (absoluteMaxOrder && absoluteMaxOrder.serial_no) {
+         const absoluteMax = parseInt(absoluteMaxOrder.serial_no);
+         if (finalSerialNo <= absoluteMax) {
+            finalSerialNo = absoluteMax + 1;
+         }
+      } else {
+         // For a new company with no orders, it MUST start at 1001 (1000 base + 1)
+         // Even if the counter returned something weird like 1009, force it back to 1001.
+         finalSerialNo = 1001;
+      }
+      
+      let isUnique = false;
+      let checkAttempts = 0;
+      const maxCheckAttempts = 100; // Increased to 100 to handle large gaps
+      
+      while (!isUnique && checkAttempts < maxCheckAttempts) {
+         // Some legacy data might have string serial_nos, check both numeric and string
+         const existing = await Order.findOne({ 
+            tenantId: tenantId, 
+            $or: [
+               { serial_no: finalSerialNo },
+               { serial_no: String(finalSerialNo) }
+            ]
+         }).lean();
+         
+         if (existing) {
+            finalSerialNo++;
+            checkAttempts++;
+         } else {
+            isUnique = true;
+            // Sync the counter forward to match our jump if we made any jumps
+            if (checkAttempts > 0) {
+               const counterKey = `serial_no:${tenantId || 'legacy_tenant_001'}`;
+               const mongoose = require('mongoose');
+               const Counter = mongoose.model('counters');
+               await Counter.findOneAndUpdate(
+                  { _id: counterKey },
+                  { $set: { sequence_value: finalSerialNo } },
+                  { upsert: true }
+               );
+            }
+         }
+      }
+      
+      if (!isUnique) {
+         // Fallback: manually fetch absolute max from database and add 1
+         const maxOrder = await Order.findOne({ tenantId: tenantId }).sort({ serial_no: -1 }).lean();
+         const absoluteMax = maxOrder && maxOrder.serial_no ? parseInt(maxOrder.serial_no) : 1000;
+         finalSerialNo = absoluteMax + 1;
+         
+         const counterKey = `serial_no:${tenantId || 'legacy_tenant_001'}`;
+         const mongoose = require('mongoose');
+         const Counter = mongoose.model('counters');
+         await Counter.findOneAndUpdate(
+            { _id: counterKey },
+            { $set: { sequence_value: finalSerialNo } },
+            { upsert: true }
+         );
+      }
+
+      const isRegular = order_type === 'regular';
+      const ownerContext = isRegular
+         ? await resolveRegularOrderOwnerContext({
+              tenantId,
+              truckId: truck,
+              totalAmount: totalAmountCad,
+              settleAmount: settleAmountCad,
+              driverAssignmentMode: driver_assignment_mode
+           })
+         : {
+              isOwnerOperatedTruck: false,
+              ownerOperator: null,
+              settle_amount: 0,
+              owner_profit: 0,
+              carrier_amount
+           };
+
+      const normalizedDrivers = isRegular
+         ? ownerContext.driver_assignment_mode === 'owner_driver'
+            ? []
+            : (drivers || [])
+         : [];
+      const normalizedDriver = normalizedDrivers.length > 0 ? normalizedDrivers[0] : null;
+
       const order = await Order.create({
          company_name,
-         serial_no : parseInt(newOrderId),
+         serial_no : finalSerialNo,
          customer_order_no: customer_order_no ? String(customer_order_no).trim() : null,
          shipping_details,
 
          customer : customer,
          customer_payment_date,
          customer_payment_method,
-         total_amount,
+         total_amount: totalAmountCad,
 
          carrier,
-         carrier_amount, 
+         carrier_amount: isRegular ? Number(ownerContext.carrier_amount || 0) : carrierAmountCad, 
          carrier_payment_date,
          carrier_payment_method,
 
          order_type,
-         drivers: drivers || [],
-         driver,
+         drivers: normalizedDrivers,
+         driver: normalizedDriver,
          truck,
          trailer,
+         ownerOperator: ownerContext.ownerOperator,
+         isOwnerOperatedTruck: ownerContext.isOwnerOperatedTruck,
+         settle_amount: Number(ownerContext.settle_amount || 0),
+         owner_profit: Number(ownerContext.owner_profit || 0),
+         driver_assignment_mode: ownerContext.driver_assignment_mode || 'company_driver',
+         driver_assignment_status:
+            (ownerContext.driver_assignment_mode || 'company_driver') === 'owner_driver'
+               ? 'owner_operator_driver'
+               : (normalizedDrivers.length > 0 ? 'company_driver_assigned' : 'company_driver_unassigned'),
 
-         revenue_items,
-         carrier_revenue_items,
-         revenue_currency,
+         revenue_items: revenueItemsCad,
+         carrier_revenue_items: carrierRevenueItemsCad,
+         revenue_currency: BASE_ORDER_CURRENCY.toLowerCase(),
+         amount_currency: BASE_ORDER_CURRENCY.toLowerCase(),
+         input_currency: inputCurrency.toLowerCase(),
+         fx_to_cad: Number(fxToCad || 1),
+         input_total_amount: Number(total_amount || 0),
+         input_carrier_amount: Number(carrier_amount || 0),
+         input_settle_amount: Number(settle_amount || 0),
          totalDistance,
          order_status,
-         tenantId: req.tenantId,
+         tenantId: tenantId,
          company:req.user && req.user.company ? req.user.company._id : null,
 
          created_by : req.user._id,
@@ -184,13 +530,13 @@ exports.create_order = catchAsync(async (req, res, next) => {
             const startLoc = locations[0];
             const endLoc = locations[locations.length - 1];
             const defaultTrip = new Trip({
-               tenantId: req.tenantId || req.user?.tenantId,
+               tenantId: tenantId,
                order: order._id,
                trip_no: 1,
                start_stop_index: 0,
                end_stop_index: locations.length - 1,
-               driver: order.order_type === 'regular' ? order.driver : null,
-               drivers: order.order_type === 'regular' ? (order.drivers || []) : [],
+               driver: order.order_type === 'regular' && order.driver_assignment_mode !== 'owner_driver' ? order.driver : null,
+               drivers: order.order_type === 'regular' && order.driver_assignment_mode !== 'owner_driver' ? (order.drivers || []) : [],
                truck: order.order_type === 'regular' ? order.truck : null,
                trailer: order.order_type === 'regular' ? order.trailer : null,
                carrier: order.order_type === 'outsourcing' ? order.carrier : null,
@@ -206,6 +552,21 @@ exports.create_order = catchAsync(async (req, res, next) => {
          }
       } catch (tripErr) {
          console.error('Default trip creation failed:', tripErr);
+      }
+      logActivity(req, {
+         action: 'CREATE',
+         module: 'order',
+         description: `Created order #${order.serial_no}`,
+         resourceId: order._id,
+         resourceName: `Order #${order.serial_no}`,
+      });
+      if (order.isOwnerOperatedTruck && order.ownerOperator) {
+         await syncOwnerOperatorFinancialRecords({
+            tenantId,
+            companyId: req.user?.company?._id || req.user?.company || null,
+            userId: req.user?._id,
+            order
+         });
       }
       res.json({
          status:true,
@@ -224,19 +585,138 @@ exports.update_order = catchAsync(async (req, res, next) => {
          return res.status(400).json({ status: false, message: "Tenant context is required." });
       }
       const companyId = normalizeCompanyId(req);
-      const updateData = req.body;
+
+      // Whitelist allowed update fields — never let client override tenantId, order_type, serial_no, or created_by
+      const ALLOWED_UPDATE_FIELDS = [
+         'customer', 'carrier', 'driver', 'truck', 'trailer', 'drivers',
+         'customer_order_no', 'company_name', 'reference_no',
+         'total_amount', 'carrier_amount', 'profit',
+         'shipping_details', 'totalDistance', 'notes',
+         'order_status', 'pickup_date', 'delivery_date',
+         'commodity', 'equipment', 'charges', 'extra_charges',
+         'documents', 'invoice_number', 'po_number',
+         'billing_address', 'billing_city', 'billing_state', 'billing_zip',
+         'settle_amount', 'driver_assignment_mode',
+         'revenue_items', 'carrier_revenue_items', 'revenue_currency',
+      ];
+      const updateData = {};
+      for (const key of ALLOWED_UPDATE_FIELDS) {
+         if (key in req.body) updateData[key] = req.body[key];
+      }
+
       const criteria = { _id: req.params.id, tenantId };
       if (companyId) criteria.company = companyId;
-      const order = await Order.findOneAndUpdate(criteria, updateData, {
-         new: true, 
-         runValidators: true,
-      });
-      if(!order) {
+      if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+         criteria.order_type = { $in: req.allowedOrderTypes };
+      }
+      const existingOrder = await Order.findOne(criteria);
+      if(!existingOrder) {
          return res.status(404).json({
             status: false,
             message: "Order not found."
          });
       }
+
+      const hasAmountRelatedUpdate =
+         ('total_amount' in updateData) ||
+         ('carrier_amount' in updateData) ||
+         ('settle_amount' in updateData) ||
+         ('revenue_items' in updateData) ||
+         ('carrier_revenue_items' in updateData) ||
+         ('revenue_currency' in updateData);
+
+      if (hasAmountRelatedUpdate) {
+         const inputCurrency = normalizeCurrency(
+            updateData.revenue_currency || existingOrder.input_currency || existingOrder.revenue_currency || BASE_ORDER_CURRENCY,
+            BASE_ORDER_CURRENCY
+         );
+         const fxToCad = await resolveMonthlyRateToCad({
+            tenantId,
+            sourceCurrency: inputCurrency,
+            referenceDate: existingOrder.createdAt || new Date(),
+         });
+
+         if ('total_amount' in updateData) {
+            updateData.input_total_amount = Number(updateData.total_amount || 0);
+            updateData.total_amount = convertToCad(updateData.total_amount, fxToCad);
+         }
+         if ('carrier_amount' in updateData) {
+            updateData.input_carrier_amount = Number(updateData.carrier_amount || 0);
+            updateData.carrier_amount = convertToCad(updateData.carrier_amount, fxToCad);
+         }
+         if ('settle_amount' in updateData) {
+            updateData.input_settle_amount = Number(updateData.settle_amount || 0);
+            updateData.settle_amount = convertToCad(updateData.settle_amount, fxToCad);
+         }
+         if ('revenue_items' in updateData) {
+            updateData.revenue_items = normalizeRevenueItemsToCad(updateData.revenue_items, fxToCad);
+         }
+         if ('carrier_revenue_items' in updateData) {
+            updateData.carrier_revenue_items = normalizeRevenueItemsToCad(updateData.carrier_revenue_items, fxToCad);
+         }
+
+         updateData.revenue_currency = BASE_ORDER_CURRENCY.toLowerCase();
+         updateData.amount_currency = BASE_ORDER_CURRENCY.toLowerCase();
+         updateData.input_currency = inputCurrency.toLowerCase();
+         updateData.fx_to_cad = Number(fxToCad || 1);
+      }
+
+      const nextOrderType = existingOrder.order_type;
+      if (nextOrderType === 'regular') {
+         const nextTruck = updateData.truck || existingOrder.truck;
+         const nextTotalAmount = ('total_amount' in updateData) ? updateData.total_amount : existingOrder.total_amount;
+         const nextSettle = ('settle_amount' in updateData) ? updateData.settle_amount : existingOrder.settle_amount;
+         const nextDriverMode = updateData.driver_assignment_mode || existingOrder.driver_assignment_mode;
+         const ownerContext = await resolveRegularOrderOwnerContext({
+            tenantId,
+            truckId: nextTruck,
+            totalAmount: nextTotalAmount,
+            settleAmount: nextSettle,
+            driverAssignmentMode: nextDriverMode
+         });
+         updateData.isOwnerOperatedTruck = ownerContext.isOwnerOperatedTruck;
+         updateData.ownerOperator = ownerContext.ownerOperator;
+         updateData.settle_amount = Number(ownerContext.settle_amount || 0);
+         updateData.owner_profit = Number(ownerContext.owner_profit || 0);
+         updateData.carrier_amount = Number(ownerContext.carrier_amount || 0);
+         updateData.driver_assignment_mode = ownerContext.driver_assignment_mode || 'company_driver';
+         const incomingDrivers = Array.isArray(updateData.drivers) ? updateData.drivers : (existingOrder.drivers || []);
+         updateData.driver_assignment_status =
+            (ownerContext.driver_assignment_mode || 'company_driver') === 'owner_driver'
+               ? 'owner_operator_driver'
+               : (incomingDrivers.length > 0 ? 'company_driver_assigned' : 'company_driver_unassigned');
+         if (ownerContext.driver_assignment_mode === 'owner_driver') {
+            updateData.drivers = [];
+            updateData.driver = null;
+         } else if ('drivers' in updateData && Array.isArray(updateData.drivers)) {
+            updateData.driver = updateData.drivers[0] || null;
+         }
+      }
+      const order = await Order.findOneAndUpdate(criteria, updateData, {
+         new: true,
+         runValidators: true,
+      });
+      if (order.isOwnerOperatedTruck && order.ownerOperator) {
+         await syncOwnerOperatorFinancialRecords({
+            tenantId,
+            companyId,
+            userId: req.user?._id,
+            order
+         });
+      } else {
+         await OwnerOperatorFinancialRecord.deleteMany({
+            tenantId,
+            order: order._id,
+            type: { $in: ['SETTLEMENT', 'OWNER_PROFIT', 'DRIVER_DEDUCTION'] }
+         });
+      }
+      logActivity(req, {
+         action: 'UPDATE',
+         module: 'order',
+         description: `Updated order #${order.serial_no}`,
+         resourceId: order._id,
+         resourceName: `Order #${order.serial_no}`,
+      });
       res.status(200).json({
          status: true,
          order,
@@ -254,6 +734,10 @@ exports.update_order = catchAsync(async (req, res, next) => {
 exports.order_listing = catchAsync(async (req, res, next) => {
    const { search, customer_id, carrier_id, driver_id, truck_id, trailer_id, created_by_id, sortby, status, paymentStatus } = req.query;
    
+   console.log('[order_listing] Request received');
+   console.log('[order_listing] User company:', req.user?.company?._id || req.user?.company);
+   console.log('[order_listing] User tenantId:', req.user?.tenantId);
+   
    const queryObj = {
       $or: [
          { deletedAt: null },
@@ -263,11 +747,13 @@ exports.order_listing = catchAsync(async (req, res, next) => {
    };
 
    const tenantId = getTenantId(req);
+   console.log('[order_listing] Resolved tenantId:', tenantId);
    if (!tenantId) {
       return res.status(400).json({ status: false, message: "Tenant context is required.", orders: [], page: 1, totalPages: 0 });
    }
    queryObj.tenantId = tenantId;
    const companyId = normalizeCompanyId(req);
+   console.log('[order_listing] Normalized companyId:', companyId);
    if (companyId) {
       queryObj.$and = queryObj.$and || [];
       queryObj.$and.push({
@@ -280,8 +766,13 @@ exports.order_listing = catchAsync(async (req, res, next) => {
    }
 
    if(paymentStatus){
-      queryObj.carrier_payment_status = paymentStatus;
-      queryObj.customer_payment_status = paymentStatus;
+      queryObj.$and = queryObj.$and || [];
+      queryObj.$and.push({
+         $or: [
+            { carrier_payment_status: paymentStatus },
+            { customer_payment_status: paymentStatus }
+         ]
+      });
    }
    
    // Sanitize and validate customer_id
@@ -331,7 +822,11 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       if (!mongoose.Types.ObjectId.isValid(v)) {
          throw new Error('invalid_object_id');
       }
-      queryObj[key] = v;
+      if (key === 'driver') {
+         queryObj['drivers'] = v;
+      } else {
+         queryObj[key] = v;
+      }
    };
 
    // Assigned fleet filters (Regular orders)
@@ -357,12 +852,15 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       queryObj.order_status = status;
    }
 
-   // Apply created_by filter only for staff users (role === 1) - use strict numeric check
-   if (req.user && Number(req.user.role) === 1) {
-      queryObj.created_by = req.user._id;
-      // Debug logging in non-production
-      if (process.env.NODE_ENV !== 'production') {
-         console.log('Staff user filter applied:', { userId: req.user._id, permissions: req.user.permissions, query: queryObj });
+   // Scope listings for non-admin users to their own records/assignments
+   const isEmulating = req.isEmulating || req.isSuperAdminUser;
+   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || isEmulating;
+   if (req.user && !isAdminUser) {
+      if (Number(req.user.role) === 0 || req.user?.permissions?.includes('driver')) {
+         queryObj.$and = queryObj.$and || [];
+         queryObj.$and.push({ $or: [{ driver: req.user._id }, { drivers: req.user._id }] });
+      } else {
+         queryObj.created_by = req.user._id;
       }
    }
 
@@ -380,6 +878,11 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       }
    }
 
+   // Restrict listing to order types the user is allowed to access
+   if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+      queryObj.order_type = { $in: req.allowedOrderTypes };
+   }
+
       // Set default sort to serial_no descending if not provided
       if (!req.query.sort) {
          req.query.sort = '-serial_no';
@@ -387,7 +890,7 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       
       let Query = new APIFeatures(
          Order.find(queryObj)
-            .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'truck', 'trailer'])
+            .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
             .populate('documents_count'),
          req.query
       ).sort();
@@ -423,6 +926,136 @@ exports.order_listing = catchAsync(async (req, res, next) => {
    });
 });
 
+exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
+   const puppeteer = require('puppeteer');
+   const fs = require('fs');
+   const path = require('path');
+   const Company = require('../db/Company');
+
+   let browser = null;
+   try {
+      let { html, filename } = req.body;
+      if (!html) {
+         return res.status(400).json({ status: false, message: 'HTML content is required' });
+      }
+
+      // 1. Resolve company logo URL
+      let companyLogoUrl = req.tenant?.settings?.customizations?.theme?.logo || '';
+      const companyId = req.user?.company?._id || req.user?.company;
+      if (companyId) {
+         const companyDoc = await Company.findById(companyId).lean();
+         if (companyDoc && (companyDoc.pdf_logo || companyDoc.logo)) {
+            companyLogoUrl = companyDoc.pdf_logo || companyDoc.logo;
+         }
+      }
+
+      // 2. Fetch or load the logo as Base64 to ensure it renders in the PDF offline
+      let base64Logo = '';
+      if (companyLogoUrl) {
+         try {
+            const response = await fetch(companyLogoUrl);
+            if (response.ok) {
+               const arrayBuffer = await response.arrayBuffer();
+               const buffer = Buffer.from(arrayBuffer);
+               const contentType = response.headers.get('content-type') || 'image/png';
+               base64Logo = `data:${contentType};base64,${buffer.toString('base64')}`;
+            }
+         } catch (e) {
+            console.error('Failed to fetch remote logo for PDF', e);
+         }
+      }
+      
+      if (!base64Logo) {
+         try {
+            const localLogoPath = path.join(__dirname, '../../frontend/public/logo.png');
+            if (fs.existsSync(localLogoPath)) {
+               const buffer = fs.readFileSync(localLogoPath);
+               base64Logo = `data:image/png;base64,${buffer.toString('base64')}`;
+            }
+         } catch (e) {
+            console.error('Failed to read local logo', e);
+         }
+      }
+
+      // 3. Replace all logo images in HTML with the Base64 string
+      if (base64Logo) {
+         html = html.replace(/(<img[^>]*alt=['"]logo['"][^>]*>)/gi, (match) => {
+            return match.replace(/src=['"][^'"]*['"]/i, `src="${base64Logo}"`);
+         });
+      }
+
+      const fullHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+         <meta charset="utf-8" />
+         <script src="https://cdn.tailwindcss.com"></script>
+         <style>
+            @page { size: A4; margin: 12mm; }
+            html, body { 
+               background: white; 
+               -webkit-print-color-adjust: exact; 
+               print-color-adjust: exact; 
+               font-family: Arial, Helvetica, sans-serif;
+            }
+            .pdf-section, .table-section, .remittance-section, .shipping-detail-item, .bill-to-section, .location-block, tr {
+               page-break-inside: avoid !important;
+               break-inside: avoid !important;
+            }
+            img { max-width: 100%; height: auto; }
+            
+            /* Ensure layout behaves consistently in PDF */
+            .flex { display: flex; }
+            .grid { display: grid; }
+            .justify-between { justify-content: space-between; }
+            .items-center { align-items: center; }
+            .items-start { align-items: flex-start; }
+            .text-right { text-align: right; }
+            
+            /* Fix for overlapping issues */
+            .border-b { border-bottom: 1px solid #e5e7eb; }
+            .pb-4 { padding-bottom: 1rem; }
+            .mb-4 { margin-bottom: 1rem; }
+         </style>
+      </head>
+      <body>
+         ${html}
+      </body>
+      </html>
+      `;
+
+      browser = await puppeteer.launch({
+         headless: true,
+         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
+      });
+      const page = await browser.newPage();
+      
+      // Better rendering configuration for external assets like logos
+      await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
+      await page.setContent(fullHtml, { waitUntil: ['networkidle0', 'load', 'domcontentloaded'] });
+      
+      // Small delay to ensure any dynamic images (like logos) are fully rendered
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      const pdfBuffer = await page.pdf({
+         format: 'A4',
+         printBackground: true,
+         preferCSSPageSize: true,
+      });
+
+      const safeFilename = filename ? filename.replace(/[^a-z0-9-_.]+/gi, '_') : 'document.pdf';
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+      return res.status(200).send(Buffer.from(pdfBuffer));
+   } catch (err) {
+      JSONerror(res, err, next);
+   } finally {
+      if (browser) {
+         try { await browser.close(); } catch (e) {}
+      }
+   }
+});
+
 exports.order_listing_account = catchAsync(async (req, res) => {
    try {
       const { search } = req.query;
@@ -445,8 +1078,13 @@ exports.order_listing_account = catchAsync(async (req, res) => {
       if (search && search.length >1) {
          const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // escape regex
          queryObj.customer_order_no = { $regex: new RegExp(safeSearch, 'i') };
-      } 
-      
+      }
+
+      // Restrict to allowed order types
+      if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+         queryObj.order_type = { $in: req.allowedOrderTypes };
+      }
+
    // Set default sort to serial_no descending if not provided
    if (!req.query.sort) {
       req.query.sort = '-serial_no';
@@ -454,7 +1092,7 @@ exports.order_listing_account = catchAsync(async (req, res) => {
    
    let Query = new APIFeatures(
       Order.find(queryObj)
-         .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'truck', 'trailer'])
+         .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
          .populate('documents_count'),
       req.query
    ).sort();
@@ -508,6 +1146,9 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
       let order;
       const criteria = { _id: req.params.id, tenantId };
       if (companyId) criteria.company = companyId;
+      if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+         criteria.order_type = { $in: req.allowedOrderTypes };
+      }
       if(req.params.type === 'customer'){ 
             const update = {
                customer_payment_status : status,
@@ -547,6 +1188,14 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
           message: "failed to update order information.",
         });
       }
+      logActivity(req, {
+         action: 'PAYMENT',
+         module: 'order',
+         description: `Updated ${req.params.type} payment status to "${status}" on order #${order.serial_no}`,
+         resourceId: order._id,
+         resourceName: `Order #${order.serial_no}`,
+         details: { paymentType: req.params.type, status, method },
+      });
       res.send({
          status: true,
          order: order,
@@ -570,6 +1219,9 @@ exports.updateOrderStatus = catchAsync(async (req, res) => {
       const companyId = normalizeCompanyId(req);
       const criteria = { _id: req.params.id, tenantId };
       if (companyId) criteria.company = companyId;
+      if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+         criteria.order_type = { $in: req.allowedOrderTypes };
+      }
       const order  = await Order.findOneAndUpdate(criteria, {
          order_status : status,
          updatedAt : Date.now(),
@@ -583,6 +1235,14 @@ exports.updateOrderStatus = catchAsync(async (req, res) => {
           message: "failed to update order information.",
         });
       }
+      logActivity(req, {
+         action: 'STATUS_CHANGE',
+         module: 'order',
+         description: `Changed order #${order.serial_no} status to "${status}"`,
+         resourceId: order._id,
+         resourceName: `Order #${order.serial_no}`,
+         details: { newStatus: status },
+      });
       res.send({
         status: true,
         order: order,
@@ -606,6 +1266,9 @@ exports.addnote = catchAsync(async (req, res) => {
       const companyId = normalizeCompanyId(req);
       const criteria = { _id: req.params.id, tenantId };
       if (companyId) criteria.company = companyId;
+      if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+         criteria.order_type = { $in: req.allowedOrderTypes };
+      }
       const order  = await Order.findOneAndUpdate(criteria, {
          notes : notes,
          updatedAt : Date.now(),
@@ -656,9 +1319,9 @@ exports.overview = catchAsync(async (req, res) => {
    if(isRegularUser){
       // For regular users (non-admin, non-emulating), include created_by filter
       // Or if they are a driver (role 0), filter by driver assignment
-      if (req.user.role === 0) {
+      if (req.user.role === 0 || req.user?.permissions?.includes('driver')) {
          queryFilter = {
-            driver: req.user._id,
+            $or: [{ driver: req.user._id }, { drivers: req.user._id }],
             ...baseDeletedFilter
          };
       } else {
@@ -672,12 +1335,12 @@ exports.overview = catchAsync(async (req, res) => {
       queryFilter = baseDeletedFilter;
    }
 
-   // Scope dashboard counts by tenant when available
-   if (req.tenantId) {
-      queryFilter.tenantId = req.tenantId;
-   } else if (process.env.NODE_ENV !== 'production') {
-      console.warn('⚠️ Overview: No tenantId provided - this might show all data!');
+   // Scope dashboard counts by tenant — mandatory
+   const overviewTenantId = getTenantId(req);
+   if (!overviewTenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required." });
    }
+   queryFilter.tenantId = overviewTenantId;
 
    const companyId = normalizeCompanyId(req);
    if (companyId) {
@@ -690,13 +1353,36 @@ exports.overview = catchAsync(async (req, res) => {
          ]
       });
    }
-   
-   
+
+   // Restrict counts to the modules the user is allowed to see
+   const requestedType = String(req.query.type || '').toLowerCase();
+   if (requestedType && ['outsourcing', 'regular'].includes(requestedType)) {
+      if (!Array.isArray(req.allowedOrderTypes) || req.allowedOrderTypes.length === 0 || req.allowedOrderTypes.includes(requestedType)) {
+         queryFilter.order_type = requestedType;
+      } else {
+         queryFilter.order_type = { $in: req.allowedOrderTypes };
+      }
+   } else if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+      queryFilter.order_type = { $in: req.allowedOrderTypes };
+   }
+
    // Count documents with proper filter
    totalLoads = await Order.countDocuments(queryFilter);
    intransitLoads = await Order.countDocuments({ order_status: 'intransit', ...queryFilter });
    completedLoads = await Order.countDocuments({ order_status: 'completed', ...queryFilter });
    pendingLoads = await Order.countDocuments({ order_status: 'added', ...queryFilter });
+
+   // Calculate total profit and revenue
+   const allOrdersForProfit = await Order.find(queryFilter)
+         .select('total_amount carrier_amount order_type created_by')
+         .populate({ path: 'created_by', select: 'staff_commision' });
+   
+   let totalProfit = 0;
+   let totalRevenue = 0;
+   allOrdersForProfit.forEach(o => {
+      totalProfit += Number(o.profit) || 0;
+      totalRevenue += Number(o.total_amount) || 0;
+   });
 
    // carrier payments
    carrierpendingPayments = await Order.countDocuments({ carrier_payment_status: { $ne: 'paid' }, ...queryFilter });
@@ -734,11 +1420,34 @@ exports.overview = catchAsync(async (req, res) => {
       });
    }
 
+   const baseCurrency = BASE_ORDER_CURRENCY;
+
    res.json({
       status: true,
       message: 'Dashboard data retrieved successfully.',
+      baseCurrency,
       chartData: chartData,
       lists: [
+         {
+            icon:"van",
+            bg:'bg-green-700',
+            title : 'Total Revenue',
+            data: Number(totalRevenue || 0).toFixed(2),
+            rawValue: Number(totalRevenue || 0),
+            kind: 'currency',
+            baseCurrency,
+            link: '/orders'
+         },
+         {
+            icon:"van",
+            bg:'bg-green-700',
+            title : 'Total Profit',
+            data: Number(totalProfit || 0).toFixed(2),
+            rawValue: Number(totalProfit || 0),
+            kind: 'currency',
+            baseCurrency,
+            link: '/orders'
+         },
          { icon:"van",bg:'bg-green-700', title : 'Total Loads', data: totalLoads, link: '/orders' },
          { icon:"van",bg:'bg-green-700', title : 'Intransit Loads', data: intransitLoads, link:"/orders?status=intransit" },
          { icon:"van",bg:'bg-green-700', title : 'Completed Loads', data: completedLoads, link:"/orders?status=completed" },
@@ -750,6 +1459,37 @@ exports.overview = catchAsync(async (req, res) => {
          { icon:"card",bg:'bg-green-700', title : 'Customer Pending Payments', data: customerpendingPayments, link:"/payments?title=Customer Pending Payments&type=customer&status=pending" },
          { icon:"card",bg:'bg-green-700', title : 'Customer Done Payments', data: customercompletedPayments, link:"/payments?title=Customer Completed Payments&type=customer&status=paid" },
       ] 
+   });
+});
+
+exports.getFxRate = catchAsync(async (req, res) => {
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required." });
+   }
+   const source = normalizeCurrency(req.query?.source || BASE_ORDER_CURRENCY, BASE_ORDER_CURRENCY);
+   const target = normalizeCurrency(req.query?.target || BASE_ORDER_CURRENCY, BASE_ORDER_CURRENCY);
+   const month = Number(req.query?.month || 0);
+   const year = Number(req.query?.year || 0);
+   const referenceDate =
+      Number.isFinite(month) && month >= 1 && month <= 12 && Number.isFinite(year) && year > 2000
+         ? new Date(year, month - 1, 1)
+         : new Date();
+
+   const rate = await resolveMonthlyRate({
+      tenantId,
+      sourceCurrency: source,
+      targetCurrency: target,
+      referenceDate
+   });
+
+   return res.json({
+      status: true,
+      sourceCurrency: source,
+      targetCurrency: target,
+      month: referenceDate.getMonth() + 1,
+      year: referenceDate.getFullYear(),
+      rate: Number(rate || 1),
    });
 });
 
@@ -766,14 +1506,17 @@ exports.order_detail = catchAsync(async (req, res) => {
    if (req.tenantId) {
       criteria.tenantId = req.tenantId;
    }
+   if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+      criteria.order_type = { $in: req.allowedOrderTypes };
+   }
    const order = await Order.findOne(criteria)
-      .populate(['created_by', 'customer', 'carrier'])
+      .populate(['created_by', 'customer', 'carrier', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
       .populate('documents_count');
-   
-    if(!order){ 
-      res.json({
+
+    if(!order){
+      return res.json({
          status: false,
-         orders: null, 
+         orders: null,
          message: "Order not found."
        });
     }
@@ -842,12 +1585,17 @@ exports.lockOrder = catchAsync(async (req, res) => {
          message: "Order not found."
        });
    }
-   if(order.lock){
-      order.lock = null;
-   } else {
-      order.lock = true
-   }
+   const newLockState = !order.lock;
+   order.lock = newLockState || null;
    await order.save();
+   logActivity(req, {
+      action: 'STATUS_CHANGE',
+      module: 'order',
+      description: `${newLockState ? 'Locked' : 'Unlocked'} order #${order.serial_no}`,
+      resourceId: order._id,
+      resourceName: `Order #${order.serial_no}`,
+      details: { locked: !!newLockState },
+   });
    res.json({
       status: true,
       'Message': "Order locked status updated.",
@@ -872,14 +1620,21 @@ exports.deleteOrder = catchAsync(async (req, res) => {
    const criteria = { _id: id, tenantId };
    if (companyId) criteria.company = companyId;
    const order = await Order.findOne(criteria);
-   if(!order){ 
-      res.json({
+   if(!order){
+      return res.json({
          status: false,
          message: "Order not found."
        });
    }
    order.deletedAt = Date.now();
    await order.save();
+   logActivity(req, {
+      action: 'DELETE',
+      module: 'order',
+      description: `Deleted order #${order.serial_no}`,
+      resourceId: order._id,
+      resourceName: `Order #${order.serial_no}`,
+   });
    res.json({
       status: true,
       message: "Order deleted successfully."
@@ -918,6 +1673,13 @@ exports.addCummodity = catchAsync(async (req, res, next) => {
       tenantId,
       company: req.user && req.user.company ? req.user.company._id : null,
    }).then(result => {
+      logActivity(req, {
+         action: 'CREATE',
+         module: 'settings',
+         description: `Added commodity "${result.name}"`,
+         resourceId: result._id,
+         resourceName: result.name,
+      });
       res.send({
          status: true,
          message: "Commudity has been added.",
@@ -948,6 +1710,12 @@ exports.removeCummodity = catchAsync(async (req, res, next) => {
            message: "Commodity not found for this tenant."
          });
        }
+       logActivity(req, {
+         action: 'DELETE',
+         module: 'settings',
+         description: `Removed commodity (ID: ${id})`,
+         resourceId: id,
+       });
        res.send({
          status: true,
          message: "Commudity has been permanently removed.",
@@ -1016,6 +1784,13 @@ exports.addEquipment = catchAsync(async (req, res, next) => {
       tenantId,
       company: req.user && req.user.company ? req.user.company._id : null,
    }).then(result => {
+      logActivity(req, {
+         action: 'CREATE',
+         module: 'settings',
+         description: `Added equipment type "${result.name}"`,
+         resourceId: result._id,
+         resourceName: result.name,
+      });
       res.send({
          status: true,
          message: "Equipment has been added.",
@@ -1046,6 +1821,12 @@ exports.removeEquipment = catchAsync(async (req, res, next) => {
            message: "Equipment not found for this tenant."
          });
        }
+       logActivity(req, {
+         action: 'DELETE',
+         module: 'settings',
+         description: `Removed equipment type (ID: ${id})`,
+         resourceId: id,
+       });
        res.send({
          status: true,
          message: "Equipment has been permanently removed.",
@@ -1107,10 +1888,17 @@ exports.addCharges = catchAsync(async (req, res, next) => {
             message: "Charge item already exists for this tenant."
          });
       }
-      await Charges.create({
+      const charge = await Charges.create({
          tenantId,
          name: value.trim(),
          company: req.user && req.user.company ? req.user.company._id : null,
+      });
+      logActivity(req, {
+         action: 'CREATE',
+         module: 'settings',
+         description: `Added charge item "${charge.name}"`,
+         resourceId: charge._id,
+         resourceName: charge.name,
       });
       res.send({
          status: true,
@@ -1141,6 +1929,12 @@ exports.removeCharge = catchAsync(async (req, res, next) => {
            message: "Charge not found for this tenant."
          });
        }
+       logActivity(req, {
+         action: 'DELETE',
+         module: 'settings',
+         description: `Removed charge item (ID: ${id})`,
+         resourceId: id,
+       });
        res.send({
          status: true,
          message: "Charge has been permanently removed.",
@@ -1178,14 +1972,14 @@ exports.chargesLists = catchAsync(async (req, res, next) => {
 
 exports.orderPayments = catchAsync(async (req, res, next) => {
    const { search, customer_id, carrier_id, sortby } = req.query;
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required.", orders: [], page: 1, totalPages: 0 });
+   }
    const queryObj = {
+      tenantId,
       $or: [{ deletedAt: null }]
    };
-
-   // Scope by tenant when available (including emulation)
-   if (req.tenantId) {
-      queryObj.tenantId = req.tenantId;
-   }
 
    // Sanitize and validate customer_id
    if(customer_id){
@@ -1230,22 +2024,22 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
    // Apply created_by filter only for staff users (role === 1) - use strict numeric check
    if (req.user && Number(req.user.role) === 1) {
       queryObj.created_by = req.user._id;
-      // Debug logging in non-production
-      if (process.env.NODE_ENV !== 'production') {
-         console.log('Staff user payments filter applied:', { userId: req.user._id, permissions: req.user.permissions, query: queryObj });
-      }
    }
 
    // Sanitize search parameter
    if (search && search.length > 1) {
       const searchValue = search.trim();
-      // Check if search is a number for serial_no search
+      const safeSearch = searchValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       if (!isNaN(searchValue)) {
          queryObj.serial_no = parseInt(searchValue);
       } else {
-         // For non-numeric searches, you might want to search in other fields
-         // Currently keeping empty to only search serial numbers
-         queryObj.serial_no = -1; // This will not match any valid serial_no
+         queryObj.$and = queryObj.$and || [];
+         queryObj.$and.push({
+            $or: [
+               { customer_order_no: { $regex: safeSearch, $options: 'i' } },
+               { company_name: { $regex: safeSearch, $options: 'i' } }
+            ]
+         });
       }
    }
 
@@ -1253,7 +2047,7 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
    if (!req.query.sort) {
       req.query.sort = '-serial_no';
    }
-   
+
    let Query = new APIFeatures(
       Order.find(queryObj)
          .populate(['created_by', 'customer', 'carrier'])
@@ -1275,12 +2069,14 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
 
 exports.all_payments_status = catchAsync(async (req, res, next) => {
    const { search, type, status } = req.query;
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required.", lists: [], page: 1, totalPages: 0 });
+   }
    const queryObj = {
+      tenantId,
       $or: [{ deletedAt: null }]
    };
-   if (req.tenantId) {
-      queryObj.tenantId = req.tenantId;
-   }
    if(type == 'carrier'){
       if(status == 'pending'){
          queryObj.carrier_payment_status = { $ne: 'paid' };

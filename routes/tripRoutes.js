@@ -12,6 +12,8 @@ router.route('/driver/:driverId/trips/logs').get(validateToken, resolveTenant, t
 router.route('/driver/:driverId/trips/summary').get(validateToken, resolveTenant, tripController.getDriverTripSummary);
 router.route('/truck/:truckId/trips/summary').get(validateToken, resolveTenant, tripController.getTruckTripSummary);
 router.route('/truck/:truckId/trips/logs').get(validateToken, resolveTenant, tripController.getTruckTripLogs);
+router.route('/empty-moves/ignore').post(validateToken, resolveTenant, tripController.ignoreEmptyMove);
+router.route('/empty-moves/note').post(validateToken, resolveTenant, tripController.saveEmptyMoveNote);
 router.route('/trip/:tripId').delete(validateToken, resolveTenant, tripController.deleteTrip);
 
 module.exports = router;

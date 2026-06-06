@@ -4,6 +4,7 @@ const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
 const bcrypt = require('bcrypt');
+const { logActivity } = require('../utils/activityLogger');
 
 const createCorporateId = async () => {
   let corporateID;
@@ -46,6 +47,13 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     const corporateID = await createCorporateId();
     const hashedPassword = await bcrypt.hash(password || Math.random().toString(36).slice(2), 12);
 
+    let companyId = req.user?.company?._id || req.user?.company || null;
+    if (!companyId) {
+      const Company = require('../db/Company');
+      const foundCompany = await Company.findOne({ tenantId });
+      if (foundCompany) companyId = foundCompany._id;
+    }
+
     const user = await User.create({
       name,
       email,
@@ -56,7 +64,7 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       phone,
       address,
       permissions: ['driver'],
-      company: req.user?.company ? req.user.company._id : null,
+      company: companyId,
       position: 'Driver',
       tenantId,
       modulesCustomized: false
@@ -91,6 +99,13 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     });
 
     user.password = undefined;
+    logActivity(req, {
+      action: 'CREATE',
+      module: 'employee',
+      description: `Added driver "${user.name}" (${user.email})`,
+      resourceId: user._id,
+      resourceName: user.name,
+    });
     return res.status(201).json({
       status: true,
       message: 'Driver created successfully',
@@ -158,6 +173,13 @@ exports.editDriver = catchAsync(async (req, res, next) => {
       { new: true, upsert: true }
     );
 
+    logActivity(req, {
+      action: 'UPDATE',
+      module: 'employee',
+      description: `Updated driver "${user.name}"`,
+      resourceId: user._id,
+      resourceName: user.name,
+    });
     return res.json({
       status: true,
       message: 'Driver updated successfully',
@@ -176,12 +198,12 @@ exports.driversLists = catchAsync(async (req, res, next) => {
     if (!tenantId) {
       return res.status(400).json({ status: false, message: 'Tenant context is required', lists: [] });
     }
-    const companyId = req.user?.company ? req.user.company._id : null;
-    const filter = { tenantId, permissions: 'driver' };
+    const companyId = req.user?.company?._id || req.user?.company || null;
+    const filter = { tenantId, $or: [{ permissions: 'driver' }, { role: 0 }] };
     if (companyId) {
       filter.company = companyId;
     }
-    const users = await User.find(filter)
+    const users = await User.find(filter, null, { includeInactive: true })
       .select('name email status tenantId createdAt position phone country address corporateID created_by permissions')
       .sort({ createdAt: -1 })
       .lean();
@@ -212,9 +234,9 @@ exports.removeDriver = catchAsync(async (req, res, next) => {
     if (!tenantId) {
       return res.status(400).json({ status: false, message: 'Tenant context is required' });
     }
-    const companyId = req.user?.company ? req.user.company._id : null;
+    const companyId = req.user?.company?._id || req.user?.company || null;
     const id = req.params.id;
-    const filter = { _id: id, tenantId, permissions: 'driver' };
+    const filter = { _id: id, tenantId, $or: [{ permissions: 'driver' }, { role: 0 }] };
     if (companyId) {
       filter.company = companyId;
     }
@@ -226,6 +248,13 @@ exports.removeDriver = catchAsync(async (req, res, next) => {
     user.status = 'inactive';
     await user.save({ validateBeforeSave: false });
     await DriverProfile.findOneAndUpdate({ tenantId, user: user._id }, { deletedAt: new Date() });
+    logActivity(req, {
+      action: 'DELETE',
+      module: 'employee',
+      description: `Removed driver "${user.name}"`,
+      resourceId: user._id,
+      resourceName: user.name,
+    });
     return res.json({ status: true, message: 'Driver removed (soft delete)', userId: user._id });
   } catch (err) {
     JSONerror(res, err, next);

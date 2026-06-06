@@ -3,8 +3,12 @@ const Order = require('../db/Order');
 const User = require('../db/Users');
 const DriverProfile = require('../db/DriverProfile');
 const Truck = require('../db/Truck');
+const TruckExpense = require('../db/TruckExpense');
+const IgnoredEmptyMove = require('../db/IgnoredEmptyMove');
+const EmptyMoveNote = require('../db/EmptyMoveNote');
 const mongoose = require('mongoose');
 const axios = require('axios');
+const { logActivity } = require('../utils/activityLogger');
 
 const emptyDistanceCache = new Map();
 
@@ -142,14 +146,21 @@ exports.splitOrder = async (req, res) => {
                 rate = profile?.ratePerMile || 0;
             }
 
+            // Ensure drivers array always contains the primary driver (fix for trip lookup)
+            const primaryDriver = seg.driver || (seg.drivers && seg.drivers.length > 0 ? seg.drivers[0] : null);
+            const driversArr = Array.isArray(seg.drivers) ? [...seg.drivers] : [];
+            if (primaryDriver && !driversArr.some((d) => String(d) === String(primaryDriver))) {
+                driversArr.unshift(primaryDriver);
+            }
+
             const trip = new Trip({
                 tenantId,
                 order: orderId,
                 trip_no: i + 1,
                 start_stop_index: seg.start_stop_index,
                 end_stop_index: seg.end_stop_index,
-                driver: seg.driver || (seg.drivers && seg.drivers.length > 0 ? seg.drivers[0] : null),
-                drivers: seg.drivers || [],
+                driver: primaryDriver,
+                drivers: driversArr,
                 truck: seg.truck,
                 trailer: seg.trailer,
                 carrier: seg.carrier,
@@ -168,6 +179,14 @@ exports.splitOrder = async (req, res) => {
             createdTrips.push(trip);
         }
 
+        logActivity(req, {
+            action: 'UPDATE',
+            module: 'order',
+            description: `Split order into ${createdTrips.length} trip(s) (Order ID: ${orderId})`,
+            resourceId: orderId,
+            resourceName: `Order #${order.serial_no}`,
+            details: { tripCount: createdTrips.length },
+        });
         res.json({
             status: true,
             message: 'Order split successfully into trips',
@@ -187,6 +206,7 @@ exports.getOrderTrips = async (req, res) => {
 
         const trips = await Trip.find({ order: orderId, tenantId, deletedAt: null })
             .populate('driver', 'name email corporateID phone')
+            .populate('drivers', 'name email corporateID phone')
             .populate('truck', 'unitNumber plateNumber')
             .populate('trailer', 'unitNumber plateNumber')
             .populate('carrier', 'name mc_code phone email')
@@ -214,6 +234,13 @@ exports.updateTrip = async (req, res) => {
             return res.status(404).json({ status: false, message: 'Trip not found' });
         }
 
+        logActivity(req, {
+            action: 'UPDATE',
+            module: 'order',
+            description: `Updated trip #${trip.trip_no} (Trip ID: ${tripId})`,
+            resourceId: tripId,
+            resourceName: `Trip #${trip.trip_no}`,
+        });
         res.json({ status: true, message: 'Trip updated successfully', trip });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error updating trip' });
@@ -354,11 +381,29 @@ exports.getTruckTripLogs = async (req, res) => {
             ? trips.filter((t) => t?.order?.company && String(t.order.company) === String(companyId))
             : trips;
 
-        const logs = withEmptyMoves(scoped);
+        // Fetch ignored empty moves for this truck
+        const ignoredMoves = await IgnoredEmptyMove.find({ tenantId, truck: truckId }).lean();
+        const ignoredSet = new Set(ignoredMoves.map(m => `${m.after_trip}_${m.before_trip}`));
+
+        // Fetch empty move notes
+        const emptyNotes = await EmptyMoveNote.find({ tenantId, truck: truckId }).lean();
+        const notesMap = new Map(emptyNotes.map(m => [`${m.after_trip}_${m.before_trip}`, m.note]));
+
         const wantEmptyMiles = String(includeEmptyMiles || '').toLowerCase() === '1' || String(includeEmptyMiles || '').toLowerCase() === 'true';
+        let logs = wantEmptyMiles ? withEmptyMoves(scoped) : scoped.map(buildTripLogItem);
+
         if (wantEmptyMiles) {
             await enrichEmptyMiles(logs);
         }
+
+        // Filter out ignored empty moves and attach notes
+        logs = logs.filter(l => !(l.type === 'empty' && ignoredSet.has(`${l.after_trip_id}_${l.before_trip_id}`))).map(l => {
+            if (l.type === 'empty') {
+                l.note = notesMap.get(`${l.after_trip_id}_${l.before_trip_id}`) || '';
+            }
+            return l;
+        });
+
         const summary = logs.reduce(
             (acc, l) => {
                 if (l.type === 'trip') acc.loadedMiles += Number(l.miles || 0);
@@ -382,7 +427,12 @@ exports.getDriverTripLogs = async (req, res) => {
         const tenantId = req.user.tenantId;
         const companyId = normalizeCompanyId(req);
 
-        const filter = { tenantId, drivers: driverId, deletedAt: null };
+        const driverObjId = new mongoose.Types.ObjectId(driverId);
+        const filter = {
+            tenantId,
+            deletedAt: null,
+            $or: [{ drivers: driverObjId }, { driver: driverObjId }]
+        };
         if (from || to) {
             filter.createdAt = {};
             if (from) filter.createdAt.$gte = new Date(from);
@@ -402,11 +452,29 @@ exports.getDriverTripLogs = async (req, res) => {
             ? trips.filter((t) => t?.order?.company && String(t.order.company) === String(companyId))
             : trips;
 
-        const logs = withEmptyMoves(scoped);
+        // Fetch ignored empty moves for this driver
+        const ignoredMoves = await IgnoredEmptyMove.find({ tenantId, driver: driverId }).lean();
+        const ignoredSet = new Set(ignoredMoves.map(m => `${m.after_trip}_${m.before_trip}`));
+
+        // Fetch empty move notes
+        const emptyNotes = await EmptyMoveNote.find({ tenantId, driver: driverId }).lean();
+        const notesMap = new Map(emptyNotes.map(m => [`${m.after_trip}_${m.before_trip}`, m.note]));
+
         const wantEmptyMiles = String(includeEmptyMiles || '').toLowerCase() === '1' || String(includeEmptyMiles || '').toLowerCase() === 'true';
+        let logs = wantEmptyMiles ? withEmptyMoves(scoped) : scoped.map(buildTripLogItem);
+
         if (wantEmptyMiles) {
             await enrichEmptyMiles(logs);
         }
+
+        // Filter out ignored empty moves and attach notes
+        logs = logs.filter(l => !(l.type === 'empty' && ignoredSet.has(`${l.after_trip_id}_${l.before_trip_id}`))).map(l => {
+            if (l.type === 'empty') {
+                l.note = notesMap.get(`${l.after_trip_id}_${l.before_trip_id}`) || '';
+            }
+            return l;
+        });
+
         const summary = logs.reduce(
             (acc, l) => {
                 if (l.type === 'trip') acc.loadedMiles += Number(l.miles || 0);
@@ -428,7 +496,13 @@ exports.getDriverTripSummary = async (req, res) => {
         const { driverId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
-        const match = { tenantId, drivers: require('mongoose').Types.ObjectId(driverId), deletedAt: null };
+        const driverObjId = new mongoose.Types.ObjectId(driverId);
+        // Match trips where driver is in drivers[] OR in single driver field (covers both storage patterns)
+        const match = {
+            tenantId,
+            deletedAt: null,
+            $or: [{ drivers: driverObjId }, { driver: driverObjId }]
+        };
         if (from || to) {
             match.createdAt = {};
             if (from) match.createdAt.$gte = new Date(from);
@@ -441,7 +515,14 @@ exports.getDriverTripSummary = async (req, res) => {
         const pipeline = [
             { $match: match },
             { $addFields: {
-                driverCount: { $size: { $ifNull: ['$drivers', []] } }
+                // Count drivers from the drivers[] array. If empty but driver field set, treat as 1 (solo).
+                driverCount: {
+                    $cond: [
+                        { $gt: [{ $size: { $ifNull: ['$drivers', []] } }, 0] },
+                        { $size: '$drivers' },
+                        1
+                    ]
+                }
             }},
             { $addFields: {
                 driverCountEffective: { $max: ['$driverCount', 1] }
@@ -510,12 +591,54 @@ exports.getTruckTripSummary = async (req, res) => {
         const { truckId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
-        const match = { tenantId, truck: require('mongoose').Types.ObjectId(truckId), deletedAt: null };
+        const companyId = normalizeCompanyId(req);
+        
+        const match = { tenantId, truck: new mongoose.Types.ObjectId(truckId), deletedAt: null };
         if (from || to) {
             match.createdAt = {};
             if (from) match.createdAt.$gte = new Date(from);
             if (to) match.createdAt.$lte = new Date(to);
         }
+        
+        // Fetch all raw trips within range to compute empty moves dynamically
+        const rawTrips = await Trip.find(match)
+            .populate('order', 'serial_no shipping_details company totalDistance total_amount')
+            .sort({ createdAt: 1 })
+            .lean();
+
+        const scoped = companyId
+            ? rawTrips.filter((t) => t?.order?.company && String(t.order.company) === String(companyId))
+            : rawTrips;
+
+        // Fetch ignored empty moves for this truck
+        const ignoredMoves = await IgnoredEmptyMove.find({ tenantId, truck: truckId }).lean();
+        const ignoredSet = new Set(ignoredMoves.map(m => `${m.after_trip}_${m.before_trip}`));
+
+        // Fetch empty move notes
+        const emptyNotes = await EmptyMoveNote.find({ tenantId, truck: truckId }).lean();
+        const notesMap = new Map(emptyNotes.map(m => [`${m.after_trip}_${m.before_trip}`, m.note]));
+
+        // Extract empty moves
+        const logs = withEmptyMoves(scoped);
+        await enrichEmptyMiles(logs);
+        
+        const emptyTrips = logs.filter(l => l.type === 'empty' && !ignoredSet.has(`${l.after_trip_id}_${l.before_trip_id}`)).map((e, idx) => ({
+            _id: `empty_${idx}`,
+            type: 'empty',
+            miles: Number(e.miles || 0),
+            km: Number(e.miles || 0) * 1.60934,
+            trips: 1,
+            orderSerial: 'Empty Move',
+            from_location: e.from_location,
+            to_location: e.to_location,
+            after_trip_id: e.after_trip_id,
+            before_trip_id: e.before_trip_id,
+            note: notesMap.get(`${e.after_trip_id}_${e.before_trip_id}`) || ''
+        }));
+
+        const emptyTripsTotalMiles = emptyTrips.reduce((acc, e) => acc + e.miles, 0);
+        const emptyTripsTotalKm = emptyTrips.reduce((acc, e) => acc + e.km, 0);
+
         const summary = await Trip.aggregate([
             { $match: match },
             { $group: {
@@ -525,6 +648,7 @@ exports.getTruckTripSummary = async (req, res) => {
                 totalKm: { $sum: { $ifNull: ['$total_km', 0] } }
             } }
         ]);
+        
         const byOrder = await Trip.aggregate([
             { $match: match },
             { $group: {
@@ -542,11 +666,19 @@ exports.getTruckTripSummary = async (req, res) => {
                 }
             },
             { $unwind: { path: '$orderDoc', preserveNullAndEmptyArrays: true } },
-            { $addFields: { orderSerial: '$orderDoc.serial_no' } },
+            { $addFields: { orderSerial: '$orderDoc.serial_no', type: 'trip' } },
             { $project: { orderDoc: 0 } },
             { $sort: { trips: -1 } }
         ]);
-        res.json({ status: true, summary: summary[0] || { totalTrips: 0, totalMiles: 0, totalKm: 0 }, byOrder });
+        
+        const finalSummary = summary[0] || { totalTrips: 0, totalMiles: 0, totalKm: 0 };
+        finalSummary.totalMiles += emptyTripsTotalMiles;
+        finalSummary.totalKm += emptyTripsTotalKm;
+        
+        // Merge normal order trips and empty trips
+        const combinedByOrder = [...byOrder, ...emptyTrips];
+
+        res.json({ status: true, summary: finalSummary, byOrder: combinedByOrder });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error summarizing truck trips' });
     }
@@ -636,16 +768,42 @@ exports.getTrucksGrossEarnings = async (req, res) => {
             : [];
         const driverMap = new Map(drivers.map((d) => [String(d._id), d]));
 
+        // Aggregate expenses per truck for this period
+        const truckObjectIds = trucks.map((t) => t._id).filter(Boolean);
+        const expenseAgg = truckObjectIds.length
+            ? await TruckExpense.aggregate([
+                {
+                    $match: {
+                        tenantId,
+                        truck: { $in: truckObjectIds },
+                        deletedAt: null,
+                        date: { $gte: start, $lte: end }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$truck',
+                        totalExpenses: { $sum: '$amount' }
+                    }
+                }
+            ])
+            : [];
+        const expenseMap = new Map(expenseAgg.map((e) => [String(e._id), e.totalExpenses]));
+
         const result = (trucks || []).map((t) => {
             const row = byTruck.get(String(t._id));
             const lastDriver = row?.lastDriver ? driverMap.get(String(row.lastDriver)) : null;
+            const totalGross = Number(row?.totalGross || 0);
+            const totalExpenses = Number(expenseMap.get(String(t._id)) || 0);
             return {
                 truckId: t._id,
                 plateNumber: t.plateNumber || '',
                 unitNumber: t.unitNumber || '',
                 totalTrips: row?.totalTrips || 0,
                 totalMiles: Number(row?.totalMiles || 0),
-                totalGross: Number(row?.totalGross || 0),
+                totalGross,
+                totalExpenses,
+                profit: totalGross - totalExpenses,
                 lastTripAt: row?.lastTripAt || null,
                 lastLocation: row?.lastLocation || '',
                 lastDriver: lastDriver ? { _id: lastDriver._id, name: lastDriver.name, corporateID: lastDriver.corporateID } : null
@@ -682,7 +840,7 @@ exports.getTruckGrossEarningsDetail = async (req, res) => {
         const match = {
             tenantId,
             deletedAt: null,
-            truck: mongoose.Types.ObjectId(truckId),
+            truck: new mongoose.Types.ObjectId(truckId),
             createdAt: { $gte: start, $lte: end }
         };
         if (status && String(status).toLowerCase() !== 'all') {
@@ -738,6 +896,50 @@ exports.getTruckGrossEarningsDetail = async (req, res) => {
         ];
 
         const rows = await Trip.aggregate(pipeline);
+
+        // Auto-create fixed monthly expenses (insurance, parking) if truck has them configured
+        const truck = await Truck.findOne({ _id: truckId, tenantId }).lean();
+        if (truck) {
+            const month = start.getMonth();
+            const year = start.getFullYear();
+            const fixedTypes = [
+                { type: 'insurance', field: 'insuranceMonthly' },
+                { type: 'parking', field: 'parkingMonthly' }
+            ];
+            for (const { type, field } of fixedTypes) {
+                const amount = Number(truck[field] || 0);
+                if (amount <= 0) continue;
+                const exists = await TruckExpense.findOne({
+                    tenantId, truck: truck._id, isFixed: true, type,
+                    fixedMonth: month, fixedYear: year, deletedAt: null
+                });
+                if (!exists) {
+                    const date = new Date(year, month, 1);
+                    await TruckExpense.create({
+                        tenantId, company: truck.company, truck: truck._id,
+                        type, amount, paid_by: 'owner',
+                        description: `Auto: ${type.charAt(0).toUpperCase() + type.slice(1)} for ${date.toLocaleString('default', { month: 'long' })} ${year}`,
+                        date, isFixed: true, fixedMonth: month, fixedYear: year
+                    });
+                }
+            }
+        }
+
+        // Fetch all expenses for this truck in this period (after auto-creation)
+        const expenseRows = await TruckExpense.find({
+            tenantId,
+            truck: new mongoose.Types.ObjectId(truckId),
+            deletedAt: null,
+            date: { $gte: start, $lte: end }
+        }).sort({ isFixed: -1, date: -1 }).lean();
+
+        const expenseByType = {};
+        let totalExpenses = 0;
+        for (const e of expenseRows) {
+            expenseByType[e.type] = (expenseByType[e.type] || 0) + Number(e.amount || 0);
+            totalExpenses += Number(e.amount || 0);
+        }
+
         const summary = rows.reduce(
             (acc, r) => {
                 acc.totalTrips += Number(r.trips || 0);
@@ -747,8 +949,10 @@ exports.getTruckGrossEarningsDetail = async (req, res) => {
             },
             { totalTrips: 0, totalMiles: 0, totalGross: 0 }
         );
+        summary.totalExpenses = totalExpenses;
+        summary.profit = summary.totalGross - totalExpenses;
 
-        res.json({ status: true, from: start, to: end, summary, orders: rows });
+        res.json({ status: true, from: start, to: end, summary, orders: rows, expenses: expenseRows, expenseByType });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error computing truck gross detail' });
     }
@@ -841,9 +1045,75 @@ exports.deleteTrip = async (req, res) => {
             createdTrips.push(newTrip);
         }
 
+        logActivity(req, {
+            action: 'DELETE',
+            module: 'order',
+            description: `Deleted trip and rebuilt ${createdTrips.length} trip(s)`,
+            resourceId: req.params?.tripId || req.body?.tripId,
+        });
         res.json({ status: true, message: 'Trip deleted, locations & trips updated', trips: createdTrips, removed_location_index: removedIndex });
     } catch (error) {
         console.error('Delete Trip Error:', error);
         res.status(500).json({ status: false, message: 'Server error deleting trip' });
+    }
+};
+
+exports.ignoreEmptyMove = async (req, res) => {
+    try {
+        const { truckId, driverId, after_trip_id, before_trip_id } = req.body;
+        const tenantId = req.user.tenantId;
+
+        if (!after_trip_id || !before_trip_id) {
+            return res.status(400).json({ status: false, message: 'Missing trip references' });
+        }
+
+        const existing = await IgnoredEmptyMove.findOne({ tenantId, after_trip: after_trip_id, before_trip: before_trip_id, ...(truckId ? { truck: truckId } : { driver: driverId }) });
+        if (existing) {
+            return res.json({ status: true, message: 'Already ignored' });
+        }
+
+        await IgnoredEmptyMove.create({
+            tenantId,
+            truck: truckId || null,
+            driver: driverId || null,
+            after_trip: after_trip_id,
+            before_trip: before_trip_id
+        });
+
+        res.json({ status: true, message: 'Empty move ignored' });
+    } catch (error) {
+        res.status(500).json({ status: false, message: 'Server error ignoring empty move' });
+    }
+};
+
+exports.saveEmptyMoveNote = async (req, res) => {
+    try {
+        const { truckId, driverId, after_trip_id, before_trip_id, note } = req.body;
+        const tenantId = req.user.tenantId;
+
+        if (!after_trip_id || !before_trip_id) {
+            return res.status(400).json({ status: false, message: 'Missing trip references' });
+        }
+
+        const filter = {
+            tenantId,
+            after_trip: after_trip_id,
+            before_trip: before_trip_id,
+            ...(truckId ? { truck: truckId } : { driver: driverId })
+        };
+
+        if (!note || note.trim() === '') {
+            await EmptyMoveNote.deleteOne(filter);
+        } else {
+            await EmptyMoveNote.findOneAndUpdate(
+                filter,
+                { note, updatedAt: Date.now() },
+                { upsert: true, new: true }
+            );
+        }
+
+        res.json({ status: true, message: 'Note saved successfully' });
+    } catch (error) {
+        res.status(500).json({ status: false, message: 'Server error saving empty move note' });
     }
 };

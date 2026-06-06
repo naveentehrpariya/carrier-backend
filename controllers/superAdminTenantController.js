@@ -11,6 +11,7 @@ const Carrier = require('../db/Carrier');
 const { generateTenantUrl } = require('../middleware/tenantResolver');
 const bcrypt = require('bcrypt');
 const mongoose = require('mongoose');
+const { logActivity } = require('../utils/activityLogger');
 
 /**
  * Get all tenants with pagination and filtering
@@ -194,7 +195,9 @@ const createTenant = catchAsync(async (req, res, next) => {
         maxCarriers: subscriptionPlan.limits.maxCarriers
       },
       planFeatures: subscriptionPlan.features,
-      allowedModules: subscriptionPlan.allowedModules || ['outsourcing', 'regular']
+      allowedModules: Array.isArray(subscriptionPlan.allowedModules) && subscriptionPlan.allowedModules.length > 0
+        ? subscriptionPlan.allowedModules
+        : []
     };
   } else if (subscription?.plan) {
     // Old format - using string plan name (now supported by Mixed type)
@@ -350,6 +353,14 @@ Cross-border shipments require custom stamps or deductions may apply.`
     url: generateTenantUrl(tenant.subdomain)
   };
 
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'settings',
+    description: `Created new tenant "${tenant.name}" (${tenant.tenantId})`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+  });
+
   res.status(201).json({
     status: true,
     data: {
@@ -393,6 +404,14 @@ const updateTenant = catchAsync(async (req, res, next) => {
     return next(new AppError('Tenant not found', 404));
   }
 
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated tenant "${tenant.name}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+  });
+
   res.json({
     status: true,
     data: { tenant },
@@ -420,6 +439,15 @@ const updateTenantStatus = catchAsync(async (req, res, next) => {
     return next(new AppError('Tenant not found', 404));
   }
 
+  logActivity(req, {
+    action: 'STATUS_CHANGE',
+    module: 'settings',
+    description: `Changed tenant "${tenant.name}" status to "${status}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+    details: { newStatus: status },
+  });
+
   res.json({
     status: true,
     data: { tenant },
@@ -442,6 +470,14 @@ const deleteTenant = catchAsync(async (req, res, next) => {
   tenant.subscription.status = 'cancelled';
   tenant.updatedAt = new Date();
   await tenant.save();
+
+  logActivity(req, {
+    action: 'DELETE',
+    module: 'settings',
+    description: `Soft-deleted tenant "${tenant.name}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+  });
 
   res.json({
     status: true,
@@ -491,6 +527,15 @@ const hardDeleteTenant = catchAsync(async (req, res, next) => {
     ]);
 
     await Tenant.deleteOne({ _id: tenant._id });
+
+    logActivity(req, {
+      action: 'DELETE',
+      module: 'settings',
+      description: `Permanently deleted tenant "${tenant.name}" (${slug}) and all related data`,
+      resourceId: tenant._id,
+      resourceName: tenant.name,
+      details: { tenantId: slug, permanent: true },
+    });
 
     return res.json({
       status: true,
@@ -552,6 +597,14 @@ const inviteTenantAdmin = catchAsync(async (req, res, next) => {
   // Send invitation email (implement email service)
   // await sendAdminInvitationEmail(adminUser, tenant, tempPassword);
 
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'employee',
+    description: `Invited tenant admin "${adminUser.name}" (${adminUser.email}) for tenant "${tenant.name}"`,
+    resourceId: adminUser._id,
+    resourceName: adminUser.name,
+  });
+
   const responsePayload = {
     status: true,
     data: { 
@@ -603,6 +656,14 @@ const createSubscriptionPlan = catchAsync(async (req, res, next) => {
     createdBy: req.user._id
   });
 
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'settings',
+    description: `Created subscription plan "${plan.name}"`,
+    resourceId: plan._id,
+    resourceName: plan.name,
+  });
+
   res.status(201).json({
     status: true,
     data: { plan },
@@ -623,6 +684,14 @@ const updateSubscriptionPlan = catchAsync(async (req, res, next) => {
   if (!plan) {
     return next(new AppError('Subscription plan not found', 404));
   }
+
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated subscription plan "${plan.name}"`,
+    resourceId: plan._id,
+    resourceName: plan.name,
+  });
 
   // Sync plan changes to all active tenants using this plan
   if (req.body.allowedModules || req.body.limits || req.body.features) {
@@ -676,6 +745,14 @@ const deleteSubscriptionPlan = catchAsync(async (req, res, next) => {
   if (!plan) {
     return next(new AppError('Subscription plan not found', 404));
   }
+
+  logActivity(req, {
+    action: 'DELETE',
+    module: 'settings',
+    description: `Deactivated subscription plan "${plan.name}"`,
+    resourceId: plan._id,
+    resourceName: plan.name,
+  });
 
   res.json({
     status: true,
@@ -767,6 +844,14 @@ const createSuperAdmin = catchAsync(async (req, res, next) => {
   // Remove password from response
   superAdmin.password = undefined;
 
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'employee',
+    description: `Created super admin "${superAdmin.name}" (${superAdmin.email})`,
+    resourceId: superAdmin._id,
+    resourceName: superAdmin.name,
+  });
+
   res.status(201).json({
     status: true,
     data: { superAdmin },
@@ -788,6 +873,14 @@ const updateSuperAdmin = catchAsync(async (req, res, next) => {
     return next(new AppError('Super admin not found', 404));
   }
 
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'employee',
+    description: `Updated super admin "${superAdmin.name}"`,
+    resourceId: superAdmin._id,
+    resourceName: superAdmin.name,
+  });
+
   res.json({
     status: true,
     data: { superAdmin },
@@ -804,6 +897,15 @@ const deleteSuperAdmin = catchAsync(async (req, res, next) => {
   if (!superAdmin) {
     return next(new AppError('Super admin not found', 404));
   }
+
+  logActivity(req, {
+    action: 'DELETE',
+    module: 'employee',
+    description: `Deactivated super admin "${superAdmin.name}"`,
+    resourceId: superAdmin._id,
+    resourceName: superAdmin.name,
+  });
+
   res.json({
     status: true,
     message: 'Super admin deleted successfully'
@@ -907,6 +1009,15 @@ const updateTenantSubscriptionPlan = catchAsync(async (req, res, next) => {
     { new: true, runValidators: true }
   ).populate('subscription.plan');
   
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated subscription for tenant "${tenant.name}" to plan "${subscriptionPlan.name}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+    details: { planSlug: subscriptionPlan.slug },
+  });
+
   res.json({
     status: true,
     data: {

@@ -5,6 +5,14 @@ const User = require('../db/Users');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
 const mongoose = require('mongoose');
 
+// Guard: all debug routes are disabled in production
+router.use((req, res, next) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ status: false, message: 'Not found' });
+  }
+  next();
+});
+
 // Debug endpoint to check database status
 router.get('/db-status', async (req, res) => {
   try {
@@ -109,6 +117,43 @@ router.post('/test-lookup', async (req, res) => {
     
   } catch (error) {
     console.error('❌ Lookup test error:', error);
+    res.status(500).json({
+      status: false,
+      error: error.message,
+      debug: true
+    });
+  }
+});
+
+// Test endpoint to check orders without authentication
+router.get('/orders-test', async (req, res) => {
+  try {
+    const Order = require('../db/Order');
+    const tenantId = req.query.tenantId || 'cross-miles-carrier-inc';
+    
+    const orders = await Order.find({ tenantId })
+      .sort({ serial_no: -1 })
+      .limit(10)
+      .lean();
+    
+    res.json({
+      status: true,
+      count: orders.length,
+      tenantId: tenantId,
+      orders: orders.map(o => ({
+        _id: o._id,
+        serial_no: o.serial_no,
+        order_status: o.order_status,
+        order_type: o.order_type,
+        total_amount: o.total_amount,
+        settle_amount: o.settle_amount,
+        isOwnerOperatedTruck: o.isOwnerOperatedTruck,
+        driver_assignment_mode: o.driver_assignment_mode,
+        createdAt: o.createdAt
+      })),
+      debug: true
+    });
+  } catch (error) {
     res.status(500).json({
       status: false,
       error: error.message,

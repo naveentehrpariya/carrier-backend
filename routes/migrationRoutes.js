@@ -1,6 +1,10 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const router = express.Router();
+const { authenticateJWT, requireSuperAdmin } = require('../middleware/auth');
+
+// All migration routes require super-admin authentication
+router.use(authenticateJWT, requireSuperAdmin);
 
 // Route to migrate serial_no fields from string to number
 router.post('/migrate-serial-numbers', async (req, res) => {

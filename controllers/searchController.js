@@ -59,7 +59,7 @@ exports.globalSearch = async (req, res) => {
     const hasOutsourcing = allowedModules.includes('outsourcing') || userPermissions.includes('outsourcing');
     const hasRegular = allowedModules.includes('regular') || userPermissions.includes('regular');
     const hasCarriersAccess = userPermissions.includes('carriers') || userPermissions.includes('subadmin') || req.user?.is_admin === 1 || hasOutsourcing;
-    const hasCustomersAccess = userPermissions.includes('customers') || userPermissions.includes('subadmin') || req.user?.is_admin === 1 || true; // global search usually allows customers
+    const hasCustomersAccess = userPermissions.includes('customers') || userPermissions.includes('subadmin') || req.user?.is_admin === 1;
     const hasEmployeesAccess = userPermissions.includes('employees') || userPermissions.includes('subadmin') || req.user?.is_admin === 1 || hasRegular;
 
     const orderQuery = {

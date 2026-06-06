@@ -4,16 +4,21 @@ const catchAsync = require("../utils/catchAsync");
 const {promisify} = require("util");
 const AppError = require("../utils/AppError");
 const SendEmail = require("../utils/Email");
+const { logActivity } = require("../utils/activityLogger");
 
 const crypto = require("crypto");
 const JSONerror = require("../utils/jsonErrorHandler");
 const logger = require("../utils/logger");
-const SECRET_ACCESS = process.env && process.env.SECRET_ACCESS || "MYSECRET";
+if (!process.env.SECRET_ACCESS) {
+  console.error('⚠️  CRITICAL: SECRET_ACCESS env var not set — using insecure fallback. Set it in .env immediately!');
+}
+const SECRET_ACCESS = process.env.SECRET_ACCESS || 'MYSECRET';
 const bcrypt = require('bcrypt');
 const Company = require("../db/Company");
 const EmployeeDoc = require("../db/EmployeeDoc");
 const Tenant = require("../db/Tenant");
 const SuperAdmin = require("../db/SuperAdmin");
+const fileupload = require('../utils/fileupload');
 
 const signToken = async (id) => {
   const token = jwt.sign(
@@ -70,7 +75,6 @@ const validateToken = catchAsync ( async (req, res, next) => {
     });
   }
 });
-  
 const editUser = catchAsync(async (req, res, next) => {
   // Authorization check: allow if is_admin === 1 OR role === 3 (Tenant Admin)
   const hasEmployeesPermission = req.user?.permissions?.includes('employees') || req.user?.permissions?.includes('subadmin');
@@ -86,15 +90,17 @@ const editUser = catchAsync(async (req, res, next) => {
     delete req.body.tenantId;
   }
 
-  // Get tenant context
+  // Get tenant context — required, never optional
   const tenantIdFromContext = req.tenantId || req.user?.tenantId;
-  
-  // Find user within tenant context - include inactive users
-  const filter = { _id: req.params.id };
-  if (tenantIdFromContext) {
-    filter.tenantId = tenantIdFromContext;
+  if (!tenantIdFromContext) {
+    return res.status(400).json({
+      status: false,
+      message: "Tenant context is required to edit a user."
+    });
   }
-  
+
+  // Find user strictly within the same tenant
+  const filter = { _id: req.params.id, tenantId: tenantIdFromContext };
   const existedUser = await User.findOne(filter, null, { includeInactive: true });
   
   if (!existedUser) {
@@ -120,11 +126,20 @@ const editUser = catchAsync(async (req, res, next) => {
     }
   } 
   
+  // Commission validation on update
+  const editNeedsCommission = req.body.permissions?.includes('regular') || req.body.permissions?.includes('outsourcing') || req.body.permissions?.includes('subadmin');
+  if (editNeedsCommission && (req.body.staff_commision === undefined || req.body.staff_commision === null || req.body.staff_commision === '')) {
+    return res.status(400).json({
+      status: false,
+      message: "Staff commission is required for regular, outsourcing, or subadmin roles."
+    });
+  }
+
   try {
     const payload = {
       name: req.body.name,
-      email: req.body.email, 
-      staff_commision : (req.body.permissions?.includes('regular') || req.body.permissions?.includes('outsourcing') || req.body.permissions?.includes('subadmin')) ? req.body.staff_commision : null,
+      email: req.body.email,
+      staff_commision: editNeedsCommission ? req.body.staff_commision : null,
       country: req.body.country,
       phone: req.body.phone,
       position: req.body.position,
@@ -133,8 +148,15 @@ const editUser = catchAsync(async (req, res, next) => {
       modulesCustomized: false
     };
     const result = await User.findByIdAndUpdate(req.params.id, payload, { new: true, includeInactive: true });
-    
+
     result.password = undefined;
+    logActivity(req, {
+      action: 'UPDATE',
+      module: 'employee',
+      description: `Updated employee "${result.name}" (${result.email})`,
+      resourceId: result._id,
+      resourceName: result.name,
+    });
     res.send({
       status: true,
       user: result,
@@ -155,14 +177,14 @@ const suspandUser = catchAsync(async (req, res, next) => {
     });
   }
   
-  // Get tenant context for security
+  // Get tenant context for security — mandatory, never skip
   const tenantIdFromContext = req.tenantId || req.user?.tenantId;
-  
-  // Build filter with tenant context
-  const filter = { _id: req.params.id };
-  if (tenantIdFromContext) {
-    filter.tenantId = tenantIdFromContext;
+  if (!tenantIdFromContext) {
+    return res.status(400).json({ status: false, message: "Tenant context is required." });
   }
+
+  // Build filter with tenant context
+  const filter = { _id: req.params.id, tenantId: tenantIdFromContext };
   
   // Include inactive users in the search
   const existedUser = await User.findOne(filter, null, { includeInactive: true });
@@ -188,6 +210,14 @@ const suspandUser = catchAsync(async (req, res, next) => {
       updatedUser.password = undefined;
     }
     
+    logActivity(req, {
+      action: 'STATUS_CHANGE',
+      module: 'employee',
+      description: `Employee "${existedUser.name}" account ${actionMessage}`,
+      resourceId: existedUser._id,
+      resourceName: existedUser.name,
+      details: { newStatus },
+    });
     res.send({
       status: true,
       user: updatedUser,
@@ -200,13 +230,13 @@ const suspandUser = catchAsync(async (req, res, next) => {
 });
 
 const signup = catchAsync(async (req, res, next) => {
-  // Extract fields and explicitly exclude tenantId from body
+  // Extract fields and explicitly exclude privileged fields from body
   const { permissions, name, email, avatar, password, generateAutoPassword, staff_commision, position, country, phone, address } = req.body;
-  
-  // Prevent client from setting tenantId
-  if ('tenantId' in req.body) {
-    delete req.body.tenantId;
-  }
+
+  // Prevent client from injecting privileged fields
+  if ('tenantId' in req.body) delete req.body.tenantId;
+  if ('is_admin' in req.body) delete req.body.is_admin;
+  if ('role' in req.body) delete req.body.role;
   
   // Authorization check: allow if is_admin === 1 or role === 3 or has permission
   const hasEmployeesPermission = req.user?.permissions?.includes('employees') || req.user?.permissions?.includes('subadmin');
@@ -221,23 +251,35 @@ const signup = catchAsync(async (req, res, next) => {
   const creator = req.user;
   const tenantIdFromContext = req.tenantId || (creator && creator.tenantId);
 
-  // Debug logging for development
-  if (process.env.NODE_ENV !== 'production') {
-    console.log('🔧 signup tenant context:', {
-      userId: creator?._id?.toString(),
-      userEmail: creator?.email,
-      reqTenantId: req.tenantId,
-      userTenantId: creator?.tenantId,
-      tenantIdFromContext
-    });
-  }
-
   // Require tenant context
   if (!tenantIdFromContext) {
     return res.status(400).json({
       status: false,
       message: "Tenant context is required to create an employee"
     });
+  }
+
+  // Commission is required when user has a commission-eligible permission
+  const needsCommission = permissions?.includes('regular') || permissions?.includes('outsourcing') || permissions?.includes('subadmin');
+  if (needsCommission && (staff_commision === undefined || staff_commision === null || staff_commision === '')) {
+    return res.status(400).json({
+      status: false,
+      message: "Staff commission is required for regular, outsourcing, or subadmin roles."
+    });
+  }
+
+  // Resolve company — inherit from creator, or look up by tenantId
+  let companyId = creator?.company?._id || creator?.company || null;
+  if (!companyId) {
+    const Company = require('../db/Company');
+    const foundCompany = await Company.findOne({ tenantId: tenantIdFromContext });
+    if (!foundCompany) {
+      return res.status(400).json({
+        status: false,
+        message: "Company not found for this tenant. Cannot create employee."
+      });
+    }
+    companyId = foundCompany._id;
   }
 
   // Check if email is already used within the same tenant
@@ -279,7 +321,7 @@ const signup = catchAsync(async (req, res, next) => {
       country: country,
       phone: phone,
       address: address,
-      company: creator && creator.company ? creator.company._id : null,
+      company: companyId,
       position: position,
       confirmPassword: generatedPassword,
       tenantId: tenantIdFromContext,
@@ -287,17 +329,14 @@ const signup = catchAsync(async (req, res, next) => {
       modulesCustomized: false
     });
     
-    // Debug logging for development
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('✅ User created successfully:', {
-        userId: result._id?.toString(),
-        email: result.email,
-        tenantId: result.tenantId,
-        createdBy: result.created_by?.toString()
-      });
-    }
-    
     result.password = undefined;
+    logActivity(req, {
+      action: 'CREATE',
+      module: 'employee',
+      description: `Created employee "${name}" (${email})`,
+      resourceId: result._id,
+      resourceName: name,
+    });
     res.send({
       status: true,
       generatedUser : {
@@ -363,6 +402,13 @@ const login = catchAsync ( async (req, res, next) => {
   user.permissions = user.permissions || [];
   user.isTenantAdmin = user.is_admin === 1;
 
+   logActivity(req, {
+     action: 'LOGIN',
+     module: 'auth',
+     description: `User "${user.name}" logged in`,
+     resourceId: user._id,
+     resourceName: user.name,
+   });
    res.status(200).json({
     status :true,
     message:"Login Successfully !!",
@@ -517,7 +563,8 @@ const employeesLisiting = catchAsync ( async (req, res) => {
   const baseFilter = { 
     tenantId: tenantId,
     is_admin: { $ne: 1 }, // Exclude admin users from employee listing
-    permissions: { $ne: 'driver' } // Exclude drivers
+    permissions: { $ne: 'driver' }, // Exclude drivers
+    role: { $ne: 0 } // Exclude legacy drivers
   };
   
   // If dbFilter from tenantDataFilter middleware exists, merge it
@@ -557,13 +604,22 @@ const employeesLisiting = catchAsync ( async (req, res) => {
   }
   
   try {
-    // Use Mongoose query with proper filtering - exclude inactive users
-    const employees = await User.find(baseFilter)
+    // Use Mongoose query with proper filtering - include inactive users so we don't lose historical data
+    const employees = await User.find(baseFilter, null, { includeInactive: true })
       .select('name email status tenantId createdAt position phone country address corporateID created_by permissions staff_commision modulesCustomized')
       .sort({ createdAt: -1 })
       .lean();
     
-    const employeesWithEffective = employees.map((emp) => {
+    // Filter out drivers and admins manually if the DB query didn't catch them
+    const employeesWithEffective = employees
+      .filter(emp => {
+        // Double check they aren't drivers or legacy drivers
+        if (emp.role === 0 || (Array.isArray(emp.permissions) && emp.permissions.includes('driver'))) {
+          return false;
+        }
+        return true;
+      })
+      .map((emp) => {
       // Ensure permissions array exists
       emp.permissions = Array.isArray(emp.permissions) ? emp.permissions : [];
       
@@ -904,6 +960,13 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
       existing.remittance_secondary_email = remittance_secondary_email !== '' && remittance_secondary_email !== undefined ? remittance_secondary_email : existing.remittance_secondary_email;
       existing.rate_confirmation_terms = rate_confirmation_terms !== '' && rate_confirmation_terms !== undefined ? rate_confirmation_terms : existing.rate_confirmation_terms;
       await existing.save();
+      logActivity(req, {
+        action: 'UPDATE',
+        module: 'company',
+        description: `Updated company details "${existing.name}"`,
+        resourceId: existing._id,
+        resourceName: existing.name,
+      });
       return res.send({
         status: true,
         company :existing,
@@ -926,6 +989,13 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
     rate_confirmation_terms: rate_confirmation_terms,
     tenantId: req.tenantId || 'default-tenant',
   }).then(result => {
+    logActivity(req, {
+      action: 'CREATE',
+      module: 'company',
+      description: `Created company "${result.name}"`,
+      resourceId: result._id,
+      resourceName: result.name,
+    });
     res.send({
       status: true,
       company :result,
@@ -934,6 +1004,67 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
   }).catch(err => {
     JSONerror(res, err, next);
     logger(err);
+  });
+});
+
+const uploadCompanyLogo = catchAsync(async (req, res) => {
+  const tenantId = req.tenantId || req.user?.tenantId;
+  if (!tenantId) {
+    return res.status(400).json({
+      status: false,
+      message: "Tenant context is required",
+    });
+  }
+
+  const attachment = req.files?.attachment?.[0] || req.file;
+  if (!attachment) {
+    return res.status(400).json({
+      status: false,
+      message: "No file uploaded",
+    });
+  }
+
+  const variant = 'pdf';
+
+  const companyId = req.user?.company?._id || req.user?.company || null;
+  const filter = { tenantId };
+  if (companyId) filter._id = companyId;
+
+  const company = await Company.findOne(filter);
+  if (!company) {
+    return res.status(404).json({
+      status: false,
+      message: "Company not found",
+    });
+  }
+
+  const uploadResponse = await fileupload(attachment);
+  if (!uploadResponse || !uploadResponse.url) {
+    return res.status(500).json({
+      status: false,
+      message: "File upload failed",
+      error: uploadResponse,
+    });
+  }
+
+  company.pdf_logo = uploadResponse.url;
+  company.logo = uploadResponse.url;
+
+  await company.save();
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'company',
+    description: `Updated company logo "${company.name}"`,
+    resourceId: company._id,
+    resourceName: company.name,
+  });
+
+  return res.status(200).json({
+    status: true,
+    message: "Logo updated successfully.",
+    company,
+    variant,
+    url: uploadResponse.url,
   });
 });
 
@@ -1006,7 +1137,15 @@ const changePassword = async (req, res) => {
         user.changedPasswordAt = Date.now();
         await user.save();
 
-        res.status(200).json({ 
+        logActivity(req, {
+          action: 'UPDATE',
+          module: 'auth',
+          description: `Password changed for "${user.name}" (${user.email})`,
+          resourceId: user._id,
+          resourceName: user.name,
+        });
+
+        res.status(200).json({
           status:true,
           message: 'Password updated successfully.'
          });
@@ -1021,12 +1160,21 @@ const changePassword = async (req, res) => {
 };
 
 const logout = catchAsync(async (req, res) => {
+  if (req.user) {
+    logActivity(req, {
+      action: 'LOGOUT',
+      module: 'auth',
+      description: `User "${req.user.name}" logged out`,
+      resourceId: req.user._id,
+      resourceName: req.user.name,
+    });
+  }
   // Clear the JWT cookie
   res.cookie('jwt', '', {
     expires: new Date(Date.now() + 10 * 1000), // Expire in 10 seconds
     httpOnly: true,
   });
-  
+
   res.status(200).json({
     status: true,
     message: 'Logged out successfully !!!'
@@ -1038,6 +1186,9 @@ const logout = catchAsync(async (req, res) => {
  * Test debug endpoint
  */
 const debugTest = (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ status: false, message: 'Not found' });
+  }
   console.log('🚨 DEBUG TEST ENDPOINT CALLED');
   res.json({ debug: 'working', timestamp: new Date() });
 };
@@ -1046,6 +1197,9 @@ const debugTest = (req, res) => {
  * Test Super Admin Login
  */
 const testSuperAdminLogin = catchAsync(async (req, res, next) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ status: false, message: 'Not found' });
+  }
   const { email, password } = req.body;
   
   console.log('🗺 TEST SUPER ADMIN LOGIN CALLED');
@@ -1104,6 +1258,7 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
   const { email, password, tenantId, isSuperAdmin } = req.body;
   const normalizedEmail = (email || '').trim().toLowerCase();
   const normalizedTenantIdInput = (tenantId || '').trim().toLowerCase();
+  const requestedSuperAdmin = isSuperAdmin === true || String(isSuperAdmin).toLowerCase() === 'true';
   
   if (!email || !password) {
     console.log('❌ Missing email or password');
@@ -1111,55 +1266,70 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
   }
   
   try {
-    // First, try to find super admin by email
-    const superAdmin = await SuperAdmin.findOne({ email: normalizedEmail }).select('+password');
-    
-    if (superAdmin) {
-      console.log('🔍 Found super admin with email:', email);
+    // Prefer tenant login when same email exists in tenant users.
+    // This avoids accidental super-admin login caused by stale SuperAdmin records from old migrations.
+    const userWithEmail = await User.findOne({ email: normalizedEmail }).select('+password').populate('company');
+
+    // Only attempt super-admin login when explicitly requested OR when email doesn't exist as tenant user.
+    if (requestedSuperAdmin || !userWithEmail) {
+      const superAdmin = await SuperAdmin.findOne({ email: normalizedEmail }).select('+password');
       
-      const isPasswordValid = await superAdmin.checkPassword(password, superAdmin.password);
-      if (!isPasswordValid) {
-        console.log('❌ Super admin password invalid');
+      if (superAdmin) {
+        console.log('🔍 Found super admin with email:', email);
+        
+        const isPasswordValid = await superAdmin.checkPassword(password, superAdmin.password);
+        if (!isPasswordValid) {
+          console.log('❌ Super admin password invalid');
+          return res.status(200).json({
+            status: false,
+            message: "Invalid credentials"
+          });
+        }
+        
+        if (superAdmin.status !== 'active') {
+          console.log('❌ Super admin account inactive');
+          return res.status(200).json({
+            status: false,
+            message: "Account is inactive"
+          });
+        }
+        
+      // Create an explicit super-admin token so downstream validation does not
+      // accidentally infer super-admin access from stale/misaligned user links.
+      const token = jwt.sign(
+        {
+          id: superAdmin.userId,
+          role: 'super_admin',
+          isSuperAdmin: true
+        },
+        SECRET_ACCESS,
+        { expiresIn: '14400m' }
+      );
+        
+        res.cookie('jwt', token, {
+          httpOnly: true,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: 'Strict',
+          maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+        });
+        
+        // Get the actual user record
+        const user = await User.findById(superAdmin.userId).populate('company');
+        user.password = undefined;
+        
+        // Update super admin's last login
+        superAdmin.lastLogin = new Date();
+        await superAdmin.save({ validateBeforeSave: false });
+        
         return res.status(200).json({
-          status: false,
-          message: "Invalid credentials"
+          status: true,
+          message: "Login successful!",
+          user,
+          isSuperAdmin: true,
+          token,
+          redirectTo: "/super-admin"
         });
       }
-      
-      if (superAdmin.status !== 'active') {
-        console.log('❌ Super admin account inactive');
-        return res.status(200).json({
-          status: false,
-          message: "Account is inactive"
-        });
-      }
-      
-      // Create JWT token with the user ID (not superAdmin ID)
-      const token = await signToken(superAdmin.userId);
-      
-      res.cookie('jwt', token, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'Strict',
-        maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-      });
-      
-      // Get the actual user record
-      const user = await User.findById(superAdmin.userId).populate('company');
-      user.password = undefined;
-      
-      // Update super admin's last login
-      superAdmin.lastLogin = new Date();
-      await superAdmin.save({ validateBeforeSave: false });
-      
-      return res.status(200).json({
-        status: true,
-        message: "Login successful!",
-        user,
-        isSuperAdmin: true,
-        token,
-        redirectTo: "/super-admin"
-      });
     }
     
     // If not super admin, try to find tenant user
@@ -1169,9 +1339,8 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
     if (tenantId) {
       console.log('🔍 Using provided tenantId:', tenantId);
     } else {
-      // Auto-detect tenant from user email - find any user with this email
+      // Auto-detect tenant from user email - use pre-fetched user
       console.log('🔍 Auto-detecting tenant from user email...');
-      const userWithEmail = await User.findOne({ email: normalizedEmail }).select('+password').populate('company');
       
       if (!userWithEmail) {
         console.log('❌ No user found with email:', email);
@@ -1374,10 +1543,18 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
     } catch (e) {}
 
     user.password = undefined;
-    
+
+    logActivity(req, {
+      action: 'LOGIN',
+      module: 'auth',
+      description: `User "${user.name}" logged in`,
+      resourceId: user._id,
+      resourceName: user.name,
+    });
+
     console.log('✅ MULTITENANT LOGIN SUCCESS - Returning success response');
     console.log('🔐 MULTITENANT LOGIN DEBUGGING END');
-    
+
     res.status(200).json({
       status: true,
       message: "Login successful!",
@@ -1402,4 +1579,4 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
   }
 });
 
-module.exports = { changePassword, addCompanyInfo, suspandUser, editUser, employeesLisiting, signup, login, multiTenantLogin, validateToken, profile, forgotPassword, resetpassword, employeesDocs, employeeDetail, logout, debugTest, testSuperAdminLogin };
+module.exports = { changePassword, addCompanyInfo, uploadCompanyLogo, suspandUser, editUser, employeesLisiting, signup, login, multiTenantLogin, validateToken, profile, forgotPassword, resetpassword, employeesDocs, employeeDetail, logout, debugTest, testSuperAdminLogin };

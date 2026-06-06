@@ -71,7 +71,7 @@ const schema = new mongoose.Schema({
     },
     createdAt: {
        type: Date,
-       default: Date.now()
+       default: Date.now
    },
    deletedAt: {type: Date},
    created_by: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },

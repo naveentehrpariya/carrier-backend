@@ -2,6 +2,14 @@ const express = require('express');
 const router = express.Router();
 const { validateToken } = require('../controllers/multiTenantAuthController');
 const { resolveTenant, optionalTenant } = require('../middleware/tenant');
+
+// Guard: all tenant-debug routes are disabled in production
+router.use((req, res, next) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ status: false, message: 'Not found' });
+  }
+  next();
+});
 const Order = require('../db/Order');
 const Customer = require('../db/Customer');
 const Carrier = require('../db/Carrier');

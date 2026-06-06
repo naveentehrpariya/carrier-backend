@@ -20,8 +20,8 @@ const schema = new mongoose.Schema({
         required: [true, 'Please enter your email address.'],
         lowercase: true,
         validate: [validator.isEmail, 'Please provide a valid email address.'],
-        unique: true,
-        index: true 
+        // NOTE: No global unique — multi-tenant: uniqueness is enforced by
+        // the compound index { tenantId, email } defined below
     },
     avatar: {type: String},
     status: {
@@ -85,6 +85,11 @@ const schema = new mongoose.Schema({
         type: [String],
         default: []
     },
+    allowedModules: {
+        type: [String],
+        enum: ['outsourcing', 'regular'],
+        default: []
+    },
     modulesCustomized: {
         type: Boolean,
         default: false
@@ -92,7 +97,7 @@ const schema = new mongoose.Schema({
 
     createdAt: {
         type: Date,
-        default: Date.now()
+        default: Date.now   // function reference, not invocation — called per-document
     },
     changedPasswordAt: Date,
     passwordResetToken: String,

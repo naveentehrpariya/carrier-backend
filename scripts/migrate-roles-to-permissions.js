@@ -15,7 +15,7 @@ async function migrate() {
     for (const user of users) {
       let permissions = [];
       
-      // Default to admin if is_admin === 1
+      // Company admin: grant access to all modules
       if (user.is_admin === 1 || user.role === 3) {
         permissions = ['regular', 'outsourcing', 'accounting', 'customers', 'employees', 'carriers', 'subadmin'];
       } else {
@@ -25,11 +25,11 @@ async function migrate() {
             permissions = ['driver'];
             break;
           case 1:
-            // Role 1 was Staff/Dispatcher. Give them order managing functionality + customers + carriers
+            // Staff/Dispatcher: all order types + customers + carriers (no employees)
             permissions = ['regular', 'outsourcing', 'customers', 'carriers'];
             break;
           case 2:
-            // Role 2 was Accounting
+            // Accounting: only accounting tab
             permissions = ['accounting'];
             break;
           default:

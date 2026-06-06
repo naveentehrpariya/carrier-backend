@@ -39,7 +39,7 @@ const orderController = require('../controllers/orderController');
 const customerController = require('../controllers/customerController');
 const carrierController = require('../controllers/carrierController');
 const { checkOrderLimit } = require('../middlewares/planLimitsMiddleware');
-const { checkOrderModuleAccess } = require('../middlewares/planModulesMiddleware');
+const { checkOrderModuleAccess, resolveAllowedModulesMiddleware } = require('../middlewares/planModulesMiddleware');
 
 // Import new tenant admin controller
 const tenantAdminController = require('../controllers/tenantAdminController');
@@ -178,17 +178,17 @@ router.get('/user/staff-listing', validateToken, userController.staffListing);
 
 // Order routes with tenant filtering
 router.post('/order/add', validateToken, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
-router.put('/order/update/:id', validateToken, orderController.update_order);
-router.get('/order/listings', validateToken, orderController.order_listing);
-router.get('/order/detail/:id', validateToken, orderController.order_detail);
-router.get('/order_docs/:id', validateToken, orderController.order_docs);
-router.get('/lock-order/:id', validateToken, orderController.lockOrder);
-router.get('/delete-order/:id', validateToken, orderController.deleteOrder);
-router.get('/account/order/listings', validateToken, orderController.order_listing_account);
-router.post('/account/order/update/payment/:id/:type', validateToken, orderController.updateOrderPaymentStatus);
-router.post('/account/order-status/:id', validateToken, orderController.updateOrderStatus);
-router.post('/account/order/addnote/:id', validateToken, orderController.addnote);
-router.get('/overview', validateToken, orderController.overview);
+router.put('/order/update/:id', validateToken, resolveAllowedModulesMiddleware, orderController.update_order);
+router.get('/order/listings', validateToken, resolveAllowedModulesMiddleware, orderController.order_listing);
+router.get('/order/detail/:id', validateToken, resolveAllowedModulesMiddleware, orderController.order_detail);
+router.get('/order_docs/:id', validateToken, resolveAllowedModulesMiddleware, orderController.order_docs);
+router.get('/lock-order/:id', validateToken, resolveAllowedModulesMiddleware, orderController.lockOrder);
+router.get('/delete-order/:id', validateToken, resolveAllowedModulesMiddleware, orderController.deleteOrder);
+router.get('/account/order/listings', validateToken, resolveAllowedModulesMiddleware, orderController.order_listing_account);
+router.post('/account/order/update/payment/:id/:type', validateToken, resolveAllowedModulesMiddleware, orderController.updateOrderPaymentStatus);
+router.post('/account/order-status/:id', validateToken, resolveAllowedModulesMiddleware, orderController.updateOrderStatus);
+router.post('/account/order/addnote/:id', validateToken, resolveAllowedModulesMiddleware, orderController.addnote);
+router.get('/overview', validateToken, resolveAllowedModulesMiddleware, orderController.overview);
 router.get('/cummodityLists', validateToken, orderController.cummodityLists);
 router.post('/removeCummodity', validateToken, orderController.removeCummodity);
 router.post('/addCummodity', validateToken, orderController.addCummodity);
@@ -198,8 +198,8 @@ router.post('/addEquipment', validateToken, orderController.addEquipment);
 router.get('/chargesLists', validateToken, orderController.chargesLists);
 router.post('/removeCharge', validateToken, orderController.removeCharge);
 router.post('/addCharge', validateToken, orderController.addCharges);
-router.get('/payments/listings', validateToken, orderController.orderPayments);
-router.get('/all_payments_status', validateToken, orderController.all_payments_status);
+router.get('/payments/listings', validateToken, resolveAllowedModulesMiddleware, orderController.orderPayments);
+router.get('/all_payments_status', validateToken, resolveAllowedModulesMiddleware, orderController.all_payments_status);
 
 // Customer routes with tenant filtering
 router.get('/customer/listings', validateToken, customerController.customers_listing);

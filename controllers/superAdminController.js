@@ -11,6 +11,7 @@ const Carrier = require('../db/Carrier');
 const Files = require('../db/Files');
 const bcrypt = require('bcrypt');
 const mongoose = require('mongoose');
+const { logActivity } = require('../utils/activityLogger');
 
 const VALID_MODULES = ['outsourcing', 'regular'];
 const sanitizeAllowedModules = (value) => {
@@ -258,6 +259,15 @@ const updateTenantStatus = catchAsync(async (req, res, next) => {
     return next(new AppError('Tenant not found', 404));
   }
 
+  logActivity(req, {
+    action: 'STATUS_CHANGE',
+    module: 'settings',
+    description: `Changed tenant "${tenant.name}" status to "${status}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+    details: { newStatus: status, reason },
+  });
+
   res.json({
     status: true,
     data: { tenant },
@@ -301,6 +311,15 @@ const updateTenantPlan = catchAsync(async (req, res, next) => {
     return next(new AppError('Tenant not found', 404));
   }
 
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated plan for tenant "${tenant.name}" to "${newPlan.name}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+    details: { planSlug, reason },
+  });
+
   res.json({
     status: true,
     data: { tenant },
@@ -341,6 +360,14 @@ const createSubscriptionPlan = catchAsync(async (req, res, next) => {
     createdBy: req.user._id
   });
 
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'settings',
+    description: `Created subscription plan "${plan.name}"`,
+    resourceId: plan._id,
+    resourceName: plan.name,
+  });
+
   res.status(201).json({
     status: true,
     data: { plan },
@@ -353,9 +380,6 @@ const createSubscriptionPlan = catchAsync(async (req, res, next) => {
  */
 const updateSubscriptionPlan = catchAsync(async (req, res, next) => {
   const { id } = req.params;
-  
-  console.log('Update request for plan ID:', id);
-  console.log('Update payload:', JSON.stringify(req.body, null, 2));
 
   const update = { ...req.body, updatedAt: new Date() };
   if (Object.prototype.hasOwnProperty.call(req.body, 'allowedModules')) {
@@ -374,11 +398,8 @@ const updateSubscriptionPlan = catchAsync(async (req, res, next) => {
   );
 
   if (!plan) {
-    console.log('Plan update failed for ID:', id);
     return next(new AppError('Subscription plan not found', 404));
   }
-  
-  console.log('Plan after update:', JSON.stringify(plan, null, 2));
 
   try {
     const updateObj = {};
@@ -402,6 +423,14 @@ const updateSubscriptionPlan = catchAsync(async (req, res, next) => {
   } catch (err) {
     console.error('Failed to sync tenants after plan update:', err);
   }
+
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated subscription plan "${plan.name}"`,
+    resourceId: plan._id,
+    resourceName: plan.name,
+  });
 
   res.json({
     status: true,
@@ -444,6 +473,14 @@ const deleteSubscriptionPlan = catchAsync(async (req, res, next) => {
   }
 
   console.log('Plan deleted successfully:', deletedPlan.name);
+
+  logActivity(req, {
+    action: 'DELETE',
+    module: 'settings',
+    description: `Deleted subscription plan "${deletedPlan.name}"`,
+    resourceId: deletedPlan._id,
+    resourceName: deletedPlan.name,
+  });
 
   res.json({
     status: true,
@@ -585,6 +622,15 @@ const createTenant = catchAsync(async (req, res, next) => {
 
   // Remove password from response
   adminUser.password = undefined;
+
+  logActivity(req, {
+    action: 'CREATE',
+    module: 'settings',
+    description: `Created new tenant "${tenant.name}" (${tenantId})`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+    details: { tenantId, plan: planSlug },
+  });
 
   res.status(201).json({
     status: true,
@@ -760,6 +806,15 @@ const updateTenantSettings = catchAsync(async (req, res, next) => {
     return next(new AppError('Tenant not found', 404));
   }
 
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated settings for tenant "${tenant.name}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+    details: { maxUsers, maxOrders, maxCustomers, maxCarriers },
+  });
+
   res.json({
     status: true,
     data: { tenant },
@@ -796,6 +851,14 @@ const updateTenantInfo = catchAsync(async (req, res, next) => {
   if (!tenant) {
     return next(new AppError('Tenant not found', 404));
   }
+
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `Updated information for tenant "${tenant.name}"`,
+    resourceId: tenant._id,
+    resourceName: tenant.name,
+  });
 
   res.json({
     status: true,

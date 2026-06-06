@@ -5,6 +5,9 @@ const SuperAdmin = require('../db/SuperAdmin');
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
 
+if (!process.env.SECRET_ACCESS) {
+  console.error('⚠️  CRITICAL: SECRET_ACCESS env var not set — using insecure fallback. Set it in .env immediately!');
+}
 const SECRET_ACCESS = process.env.SECRET_ACCESS || 'MYSECRET';
 
 /**
@@ -125,15 +128,16 @@ const requireSuperAdmin = catchAsync(async (req, res, next) => {
   }
   
   if (token) {
-    console.log('🎩 Found token, decoding...');
+    console.log('🎩 Found token, verifying...');
     try {
-      const decoded = jwt.decode(token);
-      console.log('🔍 Decoded token:', JSON.stringify(decoded, null, 2));
+      // Use jwt.verify (not jwt.decode) so signature and expiry are checked
+      const decoded = await promisify(jwt.verify)(token, SECRET_ACCESS);
+      console.log('🔍 Verified token claims:', JSON.stringify({ isSuperAdmin: decoded.isSuperAdmin, isEmulating: decoded.isEmulating }, null, 2));
       // If token indicates super admin privileges or emulation, allow access
       if (decoded.isSuperAdmin || decoded.isEmulating || decoded.originalUserId) {
         console.log('✅ Token has super admin/emulation privileges');
         req.isSuperAdminUser = true;
-        
+
         // Set emulation context if token indicates emulation
         if (decoded.isEmulating) {
           req.isEmulating = true;
@@ -141,13 +145,13 @@ const requireSuperAdmin = catchAsync(async (req, res, next) => {
             req.tenantId = decoded.emulatedTenantId;
           }
         }
-        
+
         return next();
       } else {
         console.log('⚠️ Token does not have required privileges');
       }
     } catch (error) {
-      console.log('❌ Token decode error:', error.message);
+      console.log('❌ Token verify error:', error.message);
       // Continue with regular super admin check
     }
   } else {

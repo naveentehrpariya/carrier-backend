@@ -19,6 +19,8 @@ app.use(tenantResolver);
 
 const connectDB = require('./db/config'); // Adjust path as needed
 connectDB();
+const { startConversionRateJob } = require('./utils/conversionRateJob');
+startConversionRateJob();
 const multer = require('multer');
 const Files = require('./db/Files');
 const Order = require('./db/Order');
@@ -33,17 +35,14 @@ const os = require('os');
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
     return callback(null, true);
   },
   credentials: true
 }));
 
 app.use(morgan('dev'));
-app.use(errorHandler);
-app.use(globalErrorHandler);
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json({limit:'2000mb'}));
+app.use(bodyParser.json({ limit: '50mb' }));
 app.use("/user", require('./routes/authRoutes'));
 app.use("/user", require('./routes/userRoutes'));
 app.use("", require('./routes/carrierRoutes'));
@@ -51,6 +50,7 @@ app.use("", require('./routes/orderRoutes'));
 app.use("", require('./routes/customerRoutes'));
 app.use("", require('./routes/driverRoutes'));
 app.use("", require('./routes/fleetRoutes'));
+app.use("", require('./routes/ownerOperatorRoutes'));
 app.use("", require('./routes/tripRoutes'));
 app.use("", require('./routes/searchRoutes'));
 app.use("/api/migration", require('./routes/migrationRoutes'));
@@ -231,6 +231,10 @@ app.all('*', (req, res, next) => {
       message: `NOT FOUND`
   });
 });
+
+// Error handling middleware must be after all routes
+app.use(errorHandler);
+app.use(globalErrorHandler);
 
 const port = process.env.PORT || '8080';
 app.listen(port, () => { console.log(`On PORT ${port} SERVER RUNNINGGGGG.....`) });
