@@ -20,7 +20,9 @@ const {
   getCustomersReport,
   getCarriersReport,
   getFinancialReport,
-  exportData
+  exportData,
+  getFinanceReport,
+  getFinanceReportPdf
 } = require('../controllers/tenantAdminController');
 
 const {
@@ -70,5 +72,9 @@ router.get('/reports/customers', getCustomersReport);
 router.get('/reports/carriers', getCarriersReport);
 router.get('/reports/financial', getFinancialReport);
 router.post('/export', exportData);
+
+// Finance Report Routes
+router.get('/finance/report', getFinanceReport);
+router.get('/finance/report/pdf', getFinanceReportPdf);
 
 module.exports = router;

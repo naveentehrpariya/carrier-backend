@@ -939,6 +939,550 @@ const exportData = catchAsync(async (req, res, next) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Finance Report helpers
+// ---------------------------------------------------------------------------
+
+const normalizeDeletedFilter = () => ({ deletedAt: { $exists: false } });
+
+const resolveDateRange = (period, startDateParam, endDateParam) => {
+  if (startDateParam || endDateParam) {
+    return {
+      from: startDateParam ? new Date(startDateParam) : new Date(0),
+      to: endDateParam ? new Date(endDateParam) : new Date()
+    };
+  }
+  const to = new Date();
+  const from = new Date();
+  switch (period) {
+    case '60d': from.setDate(from.getDate() - 60); break;
+    case '90d': from.setDate(from.getDate() - 90); break;
+    case '6m':  from.setMonth(from.getMonth() - 6); break;
+    case '1y':  from.setFullYear(from.getFullYear() - 1); break;
+    default:    from.setDate(from.getDate() - 30); // 30d default
+  }
+  return { from, to };
+};
+
+const routeFromShipping = (shipping) => {
+  const blocks = Array.isArray(shipping) ? shipping : [];
+  const locs = blocks.flatMap(b => Array.isArray(b?.locations) ? b.locations : []);
+  const pickup = locs.find(l => String(l?.type || '').toLowerCase() === 'pickup') || locs[0];
+  const delivery = [...locs].reverse().find(l => String(l?.type || '').toLowerCase() === 'delivery') || locs[locs.length - 1];
+  const from = (pickup?.city || pickup?.location || pickup?.address || '').trim();
+  const to = (delivery?.city || delivery?.location || delivery?.address || '').trim();
+  return from && to ? `${from} → ${to}` : from || to || '—';
+};
+
+/**
+ * GET /api/tenant-admin/finance/report
+ * Query: type (outsourcing|regular), period (30d|60d|90d|6m|1y), startDate, endDate
+ */
+const getFinanceReport = catchAsync(async (req, res, next) => {
+  const { type = 'outsourcing', period = '30d', startDate, endDate } = req.query;
+
+  if (!['outsourcing', 'regular'].includes(type)) {
+    return next(new AppError('type must be "outsourcing" or "regular"', 400));
+  }
+
+  const dateRange = resolveDateRange(period, startDate, endDate);
+
+  const baseFilter = {
+    tenantId: req.tenantId,
+    order_type: type,
+    ...normalizeDeletedFilter(),
+    createdAt: { $gte: dateRange.from, $lte: dateRange.to }
+  };
+
+  if (type === 'outsourcing') {
+    const orders = await Order.find(baseFilter)
+      .populate('customer', 'name')
+      .populate('carrier', 'name mc_code')
+      .populate('truck', 'unitNumber plateNumber')
+      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    let totalRevenue = 0, totalCarrierCost = 0;
+    let pendingCustomerAmt = 0, pendingCustomerCount = 0;
+    let pendingCarrierAmt = 0, pendingCarrierCount = 0;
+    let paidCustomerAmt = 0, paidCarrierAmt = 0;
+
+    for (const o of orders) {
+      const rev = Number(o.total_amount) || 0;
+      const cost = Number(o.carrier_amount) || 0;
+      totalRevenue += rev;
+      totalCarrierCost += cost;
+      if (o.customer_payment_status !== 'paid') {
+        pendingCustomerAmt += rev;
+        pendingCustomerCount++;
+      } else {
+        paidCustomerAmt += rev;
+      }
+      if (o.carrier_payment_status !== 'paid') {
+        pendingCarrierAmt += cost;
+        pendingCarrierCount++;
+      } else {
+        paidCarrierAmt += cost;
+      }
+    }
+
+    const grossProfit = totalRevenue - totalCarrierCost;
+    const profitMargin = totalRevenue > 0 ? ((grossProfit / totalRevenue) * 100).toFixed(2) : '0.00';
+
+    return res.json({
+      status: true,
+      data: {
+        type,
+        period,
+        dateRange: { from: dateRange.from, to: dateRange.to },
+        summary: {
+          totalOrders: orders.length,
+          totalRevenue,
+          totalCarrierCost,
+          grossProfit,
+          profitMargin: parseFloat(profitMargin),
+          pendingCustomerAmt,
+          pendingCustomerCount,
+          pendingCarrierAmt,
+          pendingCarrierCount,
+          paidCustomerAmt,
+          paidCarrierAmt
+        },
+        orders
+      }
+    });
+  }
+
+  // regular
+  const orders = await Order.find(baseFilter)
+    .populate('customer', 'name')
+    .populate('truck', 'unitNumber plateNumber')
+    .populate('ownerOperator', 'fullName ownerOperatorId')
+    .select('serial_no customer_order_no total_amount settle_amount owner_profit isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator')
+    .sort({ createdAt: -1 })
+    .lean();
+
+  let totalRevenue = 0;
+  let ownerOperatorOrders = 0, ownerOperatorSettlement = 0, ownerOperatorProfit = 0;
+  let companyDriverOrders = 0, companyDriverRevenue = 0, totalProfit = 0;
+
+  for (const o of orders) {
+    const rev = Number(o.total_amount) || 0;
+    totalRevenue += rev;
+    totalProfit += Number(o.owner_profit) || 0;
+    if (o.isOwnerOperatedTruck) {
+      ownerOperatorOrders++;
+      ownerOperatorSettlement += Number(o.settle_amount) || 0;
+      ownerOperatorProfit += Number(o.owner_profit) || 0;
+    } else {
+      companyDriverOrders++;
+      companyDriverRevenue += rev;
+    }
+  }
+
+  return res.json({
+    status: true,
+    data: {
+      type,
+      period,
+      dateRange: { from: dateRange.from, to: dateRange.to },
+      summary: {
+        totalOrders: orders.length,
+        totalRevenue,
+        ownerOperatorOrders,
+        ownerOperatorSettlement,
+        ownerOperatorProfit,
+        companyDriverOrders,
+        companyDriverRevenue,
+        totalProfit
+      },
+      orders
+    }
+  });
+});
+
+/**
+ * GET /api/tenant-admin/finance/report/pdf
+ * Same query params as getFinanceReport — returns a PDF file
+ */
+const getFinanceReportPdf = catchAsync(async (req, res, next) => {
+  const puppeteer = require('puppeteer');
+
+  const { type = 'outsourcing', period = '30d', startDate, endDate } = req.query;
+
+  if (!['outsourcing', 'regular'].includes(type)) {
+    return next(new AppError('type must be "outsourcing" or "regular"', 400));
+  }
+
+  const dateRange = resolveDateRange(period, startDate, endDate);
+
+  const baseFilter = {
+    tenantId: req.tenantId,
+    order_type: type,
+    ...normalizeDeletedFilter(),
+    createdAt: { $gte: dateRange.from, $lte: dateRange.to }
+  };
+
+  // Fetch orders
+  let orders = [];
+  let summary = {};
+
+  if (type === 'outsourcing') {
+    orders = await Order.find(baseFilter)
+      .populate('customer', 'name')
+      .populate('carrier', 'name mc_code')
+      .populate('truck', 'unitNumber plateNumber')
+      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    let totalRevenue = 0, totalCarrierCost = 0;
+    let pendingCustomerAmt = 0, pendingCustomerCount = 0;
+    let pendingCarrierAmt = 0, pendingCarrierCount = 0;
+    let paidCustomerAmt = 0, paidCarrierAmt = 0;
+
+    for (const o of orders) {
+      const rev = Number(o.total_amount) || 0;
+      const cost = Number(o.carrier_amount) || 0;
+      totalRevenue += rev;
+      totalCarrierCost += cost;
+      if (o.customer_payment_status !== 'paid') { pendingCustomerAmt += rev; pendingCustomerCount++; }
+      else { paidCustomerAmt += rev; }
+      if (o.carrier_payment_status !== 'paid') { pendingCarrierAmt += cost; pendingCarrierCount++; }
+      else { paidCarrierAmt += cost; }
+    }
+
+    const grossProfit = totalRevenue - totalCarrierCost;
+    const profitMargin = totalRevenue > 0 ? ((grossProfit / totalRevenue) * 100).toFixed(2) : '0.00';
+
+    summary = {
+      totalOrders: orders.length, totalRevenue, totalCarrierCost,
+      grossProfit, profitMargin: parseFloat(profitMargin),
+      pendingCustomerAmt, pendingCustomerCount, pendingCarrierAmt, pendingCarrierCount,
+      paidCustomerAmt, paidCarrierAmt
+    };
+  } else {
+    orders = await Order.find(baseFilter)
+      .populate('customer', 'name')
+      .populate('truck', 'unitNumber plateNumber')
+      .populate('ownerOperator', 'fullName ownerOperatorId')
+      .select('serial_no customer_order_no total_amount settle_amount owner_profit isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    let totalRevenue = 0, ownerOperatorOrders = 0, ownerOperatorSettlement = 0;
+    let ownerOperatorProfit = 0, companyDriverOrders = 0, companyDriverRevenue = 0, totalProfit = 0;
+
+    for (const o of orders) {
+      const rev = Number(o.total_amount) || 0;
+      totalRevenue += rev;
+      totalProfit += Number(o.owner_profit) || 0;
+      if (o.isOwnerOperatedTruck) {
+        ownerOperatorOrders++;
+        ownerOperatorSettlement += Number(o.settle_amount) || 0;
+        ownerOperatorProfit += Number(o.owner_profit) || 0;
+      } else {
+        companyDriverOrders++;
+        companyDriverRevenue += rev;
+      }
+    }
+
+    summary = {
+      totalOrders: orders.length, totalRevenue, ownerOperatorOrders,
+      ownerOperatorSettlement, ownerOperatorProfit, companyDriverOrders,
+      companyDriverRevenue, totalProfit
+    };
+  }
+
+  // HTML helpers
+  const safe = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const fmt = (n) => `$${(Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
+
+  const companyName = req.tenant?.settings?.customizations?.branding?.companyName || req.tenant?.name || 'Company';
+  const logo = req.tenant?.settings?.customizations?.theme?.logo || '';
+  const address = req.tenant?.contactInfo?.address || '';
+  const email = req.tenant?.contactInfo?.adminEmail || '';
+  const phone = req.tenant?.contactInfo?.phone || '';
+  const generatedDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  const periodLabel = period === '30d' ? 'Last 30 Days' : period === '60d' ? 'Last 60 Days' : period === '90d' ? 'Last 90 Days' : period === '6m' ? 'Last 6 Months' : period === '1y' ? 'Last 1 Year' : period;
+  const typeLabel = type === 'outsourcing' ? 'Outsourcing' : 'Regular (Fleet)';
+
+  // Summary stat boxes HTML
+  let summaryBoxesHtml = '';
+  if (type === 'outsourcing') {
+    const boxes = [
+      { label: 'Total Revenue', value: fmt(summary.totalRevenue), bg: '#dbeafe', border: '#3b82f6', text: '#1e40af' },
+      { label: 'Carrier Cost', value: fmt(summary.totalCarrierCost), bg: '#fee2e2', border: '#ef4444', text: '#991b1b' },
+      { label: 'Gross Profit', value: fmt(summary.grossProfit), bg: '#dcfce7', border: '#22c55e', text: '#15803d' },
+      { label: 'Profit Margin', value: `${summary.profitMargin}%`, bg: '#f3e8ff', border: '#a855f7', text: '#7e22ce' },
+      { label: 'Pending (Customer)', value: fmt(summary.pendingCustomerAmt), bg: '#ffedd5', border: '#f97316', text: '#9a3412' },
+      { label: 'Pending (Carrier)', value: fmt(summary.pendingCarrierAmt), bg: '#fef3c7', border: '#f59e0b', text: '#92400e' }
+    ];
+    summaryBoxesHtml = boxes.map(b => `
+      <div style="background:${b.bg};border:1.5px solid ${b.border};border-radius:8px;padding:14px 16px;min-width:130px;flex:1;">
+        <div style="font-size:10px;color:${b.text};font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">${b.label}</div>
+        <div style="font-size:18px;font-weight:700;color:${b.text};">${b.value}</div>
+      </div>`).join('');
+  } else {
+    const boxes = [
+      { label: 'Total Revenue', value: fmt(summary.totalRevenue), bg: '#dbeafe', border: '#3b82f6', text: '#1e40af' },
+      { label: 'Total Profit', value: fmt(summary.totalProfit), bg: '#dcfce7', border: '#22c55e', text: '#15803d' },
+      { label: 'OO Orders', value: String(summary.ownerOperatorOrders), bg: '#f3e8ff', border: '#a855f7', text: '#7e22ce' },
+      { label: 'OO Settlement', value: fmt(summary.ownerOperatorSettlement), bg: '#ffedd5', border: '#f97316', text: '#9a3412' },
+      { label: 'Driver Orders', value: String(summary.companyDriverOrders), bg: '#fef3c7', border: '#f59e0b', text: '#92400e' },
+      { label: 'Driver Revenue', value: fmt(summary.companyDriverRevenue), bg: '#e0f2fe', border: '#0ea5e9', text: '#075985' }
+    ];
+    summaryBoxesHtml = boxes.map(b => `
+      <div style="background:${b.bg};border:1.5px solid ${b.border};border-radius:8px;padding:14px 16px;min-width:130px;flex:1;">
+        <div style="font-size:10px;color:${b.text};font-weight:600;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">${b.label}</div>
+        <div style="font-size:18px;font-weight:700;color:${b.text};">${b.value}</div>
+      </div>`).join('');
+  }
+
+  // Table rows HTML
+  let tableHeaderHtml = '';
+  let tableRowsHtml = '';
+  let tableFooterHtml = '';
+
+  if (type === 'outsourcing') {
+    tableHeaderHtml = `
+      <tr>
+        <th>Order #</th>
+        <th>Date</th>
+        <th>Customer</th>
+        <th>Carrier</th>
+        <th>Route</th>
+        <th>Revenue</th>
+        <th>Carrier Cost</th>
+        <th>Profit</th>
+        <th>Cust. Payment</th>
+        <th>Carrier Payment</th>
+      </tr>`;
+
+    tableRowsHtml = orders.map((o, i) => {
+      const bg = i % 2 === 0 ? '#ffffff' : '#f0f4ff';
+      const custPayBadge = o.customer_payment_status === 'paid'
+        ? `<span style="background:#dcfce7;color:#15803d;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">Paid</span>`
+        : `<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">${safe(o.customer_payment_status || 'Pending')}</span>`;
+      const carrPayBadge = o.carrier_payment_status === 'paid'
+        ? `<span style="background:#dcfce7;color:#15803d;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">Paid</span>`
+        : `<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">${safe(o.carrier_payment_status || 'Pending')}</span>`;
+      return `<tr style="background:${bg};">
+        <td>${safe(o.serial_no || o.customer_order_no || '—')}</td>
+        <td>${fmtDate(o.createdAt)}</td>
+        <td>${safe(o.customer?.name || '—')}</td>
+        <td>${safe(o.carrier?.name || '—')}</td>
+        <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safe(routeFromShipping(o.shipping_details))}</td>
+        <td>${fmt(o.total_amount)}</td>
+        <td>${fmt(o.carrier_amount)}</td>
+        <td>${fmt(o.owner_profit)}</td>
+        <td>${custPayBadge}</td>
+        <td>${carrPayBadge}</td>
+      </tr>`;
+    }).join('');
+
+    tableFooterHtml = `
+      <tr style="background:#1e3a5f;color:#fff;font-weight:700;">
+        <td colspan="5" style="color:#fff;">TOTALS (${orders.length} orders)</td>
+        <td style="color:#fff;">${fmt(summary.totalRevenue)}</td>
+        <td style="color:#fff;">${fmt(summary.totalCarrierCost)}</td>
+        <td style="color:#fff;">${fmt(summary.grossProfit)}</td>
+        <td colspan="2" style="color:#fff;"></td>
+      </tr>`;
+  } else {
+    tableHeaderHtml = `
+      <tr>
+        <th>Order #</th>
+        <th>Date</th>
+        <th>Customer</th>
+        <th>Type</th>
+        <th>Truck</th>
+        <th>Route</th>
+        <th>Revenue</th>
+        <th>Settlement</th>
+        <th>Profit</th>
+        <th>Payment</th>
+      </tr>`;
+
+    tableRowsHtml = orders.map((o, i) => {
+      const bg = i % 2 === 0 ? '#ffffff' : '#f0f4ff';
+      const orderType = o.isOwnerOperatedTruck
+        ? `<span style="background:#f3e8ff;color:#7e22ce;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">OO</span>`
+        : `<span style="background:#e0f2fe;color:#075985;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">Driver</span>`;
+      const payBadge = o.customer_payment_status === 'paid'
+        ? `<span style="background:#dcfce7;color:#15803d;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">Paid</span>`
+        : `<span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:600;">${safe(o.customer_payment_status || 'Pending')}</span>`;
+      const truckInfo = o.truck ? safe(`${o.truck.unitNumber || ''} ${o.truck.plateNumber ? '(' + o.truck.plateNumber + ')' : ''}`.trim()) : '—';
+      return `<tr style="background:${bg};">
+        <td>${safe(o.serial_no || o.customer_order_no || '—')}</td>
+        <td>${fmtDate(o.createdAt)}</td>
+        <td>${safe(o.customer?.name || '—')}</td>
+        <td>${orderType}</td>
+        <td>${truckInfo}</td>
+        <td style="max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safe(routeFromShipping(o.shipping_details))}</td>
+        <td>${fmt(o.total_amount)}</td>
+        <td>${fmt(o.settle_amount)}</td>
+        <td>${fmt(o.owner_profit)}</td>
+        <td>${payBadge}</td>
+      </tr>`;
+    }).join('');
+
+    tableFooterHtml = `
+      <tr style="background:#1e3a5f;color:#fff;font-weight:700;">
+        <td colspan="6" style="color:#fff;">TOTALS (${orders.length} orders)</td>
+        <td style="color:#fff;">${fmt(summary.totalRevenue)}</td>
+        <td style="color:#fff;">${fmt(summary.ownerOperatorSettlement)}</td>
+        <td style="color:#fff;">${fmt(summary.totalProfit)}</td>
+        <td style="color:#fff;"></td>
+      </tr>`;
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Finance Report</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; color: #1f2937; background: #f9fafb; }
+    .page { padding: 32px 36px; max-width: 1100px; margin: 0 auto; background: #fff; }
+
+    /* Header */
+    .header {
+      background: linear-gradient(135deg, #1e3a5f 0%, #1e40af 100%);
+      border-radius: 10px;
+      padding: 28px 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 28px;
+      color: #fff;
+    }
+    .header-left { display: flex; align-items: center; gap: 16px; }
+    .header-logo { width: 56px; height: 56px; object-fit: contain; border-radius: 6px; background: rgba(255,255,255,0.15); padding: 6px; }
+    .header-company-name { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
+    .header-company-sub { font-size: 11px; opacity: 0.75; margin-top: 3px; }
+    .header-right { text-align: right; }
+    .report-title-box {
+      background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 8px;
+      padding: 14px 20px;
+      text-align: right;
+    }
+    .report-title { font-size: 18px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+    .report-meta { font-size: 10.5px; opacity: 0.85; margin-top: 6px; line-height: 1.7; }
+
+    /* Section title */
+    .section-title { font-size: 12px; font-weight: 700; color: #1e3a5f; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px; margin-top: 24px; border-left: 3px solid #1e40af; padding-left: 10px; }
+
+    /* Summary boxes */
+    .summary-grid { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+
+    /* Table */
+    .table-wrap { overflow-x: auto; border-radius: 8px; border: 1px solid #e5e7eb; margin-bottom: 28px; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    thead tr { background: #1e3a5f; }
+    thead th {
+      color: #fff;
+      font-weight: 600;
+      padding: 11px 12px;
+      text-align: left;
+      font-size: 10.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    tbody td { padding: 9px 12px; border-bottom: 1px solid #e5e7eb; vertical-align: middle; }
+    tfoot td { padding: 10px 12px; font-size: 11px; }
+
+    /* Footer */
+    .footer {
+      border-top: 1px solid #e5e7eb;
+      padding-top: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: #6b7280;
+      font-size: 10px;
+    }
+    .footer-left { line-height: 1.6; }
+    .footer-right { text-align: right; line-height: 1.6; }
+  </style>
+</head>
+<body>
+<div class="page">
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      ${logo ? `<img src="${safe(logo)}" class="header-logo" alt="logo">` : ''}
+      <div>
+        <div class="header-company-name">${safe(companyName)}</div>
+        ${address ? `<div class="header-company-sub">${safe(address)}</div>` : ''}
+        ${phone || email ? `<div class="header-company-sub">${[phone, email].filter(Boolean).map(v => safe(v)).join(' &nbsp;|&nbsp; ')}</div>` : ''}
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="report-title-box">
+        <div class="report-title">Finance Report</div>
+        <div class="report-meta">
+          Type: ${safe(typeLabel)}<br>
+          Period: ${safe(periodLabel)}<br>
+          ${safe(fmtDate(dateRange.from))} &ndash; ${safe(fmtDate(dateRange.to))}<br>
+          Generated: ${safe(generatedDate)}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Summary -->
+  <div class="section-title">Summary</div>
+  <div class="summary-grid">
+    ${summaryBoxesHtml}
+  </div>
+
+  <!-- Orders Table -->
+  <div class="section-title">Order Details</div>
+  <div class="table-wrap">
+    <table>
+      <thead>${tableHeaderHtml}</thead>
+      <tbody>${tableRowsHtml || '<tr><td colspan="10" style="text-align:center;padding:20px;color:#6b7280;">No orders found for this period.</td></tr>'}</tbody>
+      <tfoot>${tableFooterHtml}</tfoot>
+    </table>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <div class="footer-left">
+      <strong>${safe(companyName)}</strong><br>
+      Finance Report &bull; ${safe(typeLabel)} &bull; ${safe(periodLabel)}
+    </div>
+    <div class="footer-right">
+      Generated on ${safe(generatedDate)}<br>
+      Total Orders: ${summary.totalOrders}
+    </div>
+  </div>
+</div>
+</body>
+</html>`;
+
+  let browser = null;
+  try {
+    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    const pdfBuffer = await page.pdf({ format: 'A3', landscape: true, printBackground: true, margin: { top: '16px', bottom: '16px', left: '16px', right: '16px' } });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Finance_Report_${type}_${period}.pdf"`);
+    return res.status(200).send(Buffer.from(pdfBuffer));
+  } finally {
+    if (browser) await browser.close();
+  }
+});
+
 module.exports = {
   getTenantInfo,
   getSubscriptionDetails,
@@ -959,5 +1503,7 @@ module.exports = {
   getCustomersReport,
   getCarriersReport,
   getFinancialReport,
-  exportData
+  exportData,
+  getFinanceReport,
+  getFinanceReportPdf
 };

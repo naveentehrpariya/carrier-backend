@@ -12,6 +12,7 @@ const Order = require('../db/Order');
 const Truck = require('../db/Truck');
 const Trip = require('../db/Trip');
 const DriverProfile = require('../db/DriverProfile');
+const Users = require('../db/Users');
 const { logActivity } = require('../utils/activityLogger');
 const SUPPORTED_CURRENCIES = new Set(['CAD', 'USD', 'INR']);
 
@@ -853,7 +854,7 @@ exports.salaryListings = catchAsync(async (req, res, next) => {
     if (ownerOperatorId) filter.ownerOperator = ownerOperatorId;
     if (paymentStatus && ['pending', 'partial', 'paid'].includes(paymentStatus)) filter.paymentStatus = paymentStatus;
     const lists = await OwnerOperatorSalary.find(filter)
-      .populate('ownerOperator', 'fullName ownerOperatorId status')
+      .populate('ownerOperator', 'fullName companyName ownerOperatorId status')
       .sort({ year: -1, month: -1, createdAt: -1 })
       .lean();
 
@@ -914,7 +915,7 @@ exports.salaryDetail = catchAsync(async (req, res, next) => {
     const filter = { tenantId, _id: req.params.id };
     if (companyId) filter.company = companyId;
     const salary = await OwnerOperatorSalary.findOne(filter)
-      .populate('ownerOperator', 'fullName ownerOperatorId status phone email address')
+      .populate('ownerOperator', 'fullName companyName ownerOperatorId status phone email address')
       .lean();
     if (!salary) return res.status(404).json({ status: false, message: 'Payslip not found' });
 
@@ -970,7 +971,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     const filter = { tenantId, _id: req.params.id };
     if (companyId) filter.company = companyId;
     const salary = await OwnerOperatorSalary.findOne(filter)
-      .populate('ownerOperator', 'fullName ownerOperatorId status phone email address')
+      .populate('ownerOperator', 'fullName companyName ownerOperatorId status phone email address')
       .lean();
     if (!salary) return res.status(404).json({ status: false, message: 'Payslip not found' });
 
@@ -1018,6 +1019,13 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     const orderIds = orders.map((o) => o._id);
     const { byOrder } = await buildOrderDriverDeductions(tenantId, orderIds);
 
+    const allDriverIds = new Set();
+    byOrder.forEach((v) => v.drivers.forEach((id) => allDriverIds.add(String(id))));
+    const driverDocs = allDriverIds.size > 0
+      ? await Users.find({ _id: { $in: Array.from(allDriverIds) } }, { _id: 1, name: 1 }).lean()
+      : [];
+    const driverNameMap = new Map(driverDocs.map((u) => [String(u._id), u.name || '']));
+
     const orderBreakdown = orders.map((o) => {
       const ded = byOrder.get(String(o._id));
       const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
@@ -1026,6 +1034,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
       const originalOwnerProfit = Number(o.owner_profit || originalOrderPrice - originalSettleAmount || 0);
       const originalDriverDeduction = Number(ded?.deduction || 0);
       const originalPayable = originalSettleAmount - originalDriverDeduction;
+      const driverNames = Array.from(ded?.drivers || []).map((id) => driverNameMap.get(String(id)) || '').filter(Boolean);
       return {
         order: o._id,
         serial_no: o.serial_no || null,
@@ -1033,6 +1042,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
         shipping_details: Array.isArray(o.shipping_details) ? o.shipping_details : [],
         truck: o.truck || null,
         orderCreatedAt: o.createdAt || null,
+        driverNames,
         orderPrice: Number(convertAmount(originalOrderPrice, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
         settleAmount: Number(convertAmount(originalSettleAmount, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
         ownerProfit: Number(convertAmount(originalOwnerProfit, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
@@ -1127,17 +1137,22 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     const orderRowsHtml = orderBreakdown
       .map((r) => {
         const route = routeLabel(r?.shipping_details);
-        const truckNo = r?.truck?.unitNumber || r?.truck?.plateNumber || '';
+        const truckUnit = r?.truck?.unitNumber || '';
+        const truckPlate = r?.truck?.plateNumber || '';
+        const truckCell = truckUnit
+          ? `<span style="font-weight:700">${safe(truckUnit)}</span>${truckPlate ? `<br/><span style="font-size:8px;color:#64748b">${safe(truckPlate)}</span>` : ''}`
+          : (truckPlate ? safe(truckPlate) : '&mdash;');
+        const driverDed = Number(r?.driverDeduction || 0);
         return `
           <tr>
-            <td>${safe(r?.serial_no || '')}</td>
-            <td>${safe(r?.customer_order_no || '')}</td>
-            <td>${safe(truckNo)}</td>
+            <td style="font-family:'Courier New',monospace;font-weight:700;color:#1e40af">${safe(r?.serial_no || '&mdash;')}</td>
+            <td style="font-family:'Courier New',monospace">${safe(r?.customer_order_no || '&mdash;')}</td>
+            <td>${truckCell}</td>
             <td>${safe(route.pickupText)}</td>
             <td>${safe(route.deliveryText)}</td>
-            <td class="num">${safe(fmtMoney(r?.settleAmount || 0))}</td>
-            <td class="num">${safe(fmtMoney(r?.driverDeduction || 0))}</td>
-            <td class="num strong">${safe(fmtMoney((Number(r?.settleAmount || 0) - Number(r?.driverDeduction || 0))))}</td>
+            <td class="num" style="font-family:'Courier New',monospace">&mdash;</td>
+            <td class="num" style="color:#1e40af;font-weight:700;font-family:'Courier New',monospace">${safe(fmtMoney(r?.settleAmount || 0))}</td>
+            <td class="num" style="color:${driverDed > 0 ? '#dc2626' : '#94a3b8'};font-family:'Courier New',monospace">${driverDed > 0 ? `-${safe(fmtMoney(driverDed))}` : '&mdash;'}${r?.driverNames?.length ? `<br/><span style="font-size:8px;color:#64748b;font-weight:400">${safe(r.driverNames.join(', '))}</span>` : ''}</td>
           </tr>
         `;
       })
@@ -1147,19 +1162,21 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
       const expenseType = String(r?.meta?.expenseType || '').toLowerCase();
       const typeLabel = r.type === 'SALARY_PAYMENT'
         ? 'Payment'
-        : (expenseType === 'deduction' ? 'Deduction' : 'Addition');
-      const signed = r.type === 'SALARY_PAYMENT'
-        ? Math.abs(Number(r?.amount || 0))
-        : (expenseType === 'deduction' ? -Math.abs(Number(r?.amount || 0)) : Math.abs(Number(r?.amount || 0)));
-      const prefix = signed < 0 ? '-' : '+';
+        : r.type === 'DRIVER_DEDUCTION'
+          ? 'Driver Ded.'
+          : (expenseType === 'deduction' ? 'Deduction' : 'Addition');
+      const isDeduction = r.type === 'DRIVER_DEDUCTION' || (r.type === 'ADJUSTMENT' && expenseType === 'deduction');
+      const isPayment = r.type === 'SALARY_PAYMENT';
+      const signed = isDeduction
+        ? -Math.abs(Number(r?.amount || 0))
+        : (isPayment ? Math.abs(Number(r?.amount || 0)) : Number(r?.amount || 0));
+      const isNeg = signed < 0;
       return `
         <tr>
-          <td>${safe(fmtDate(r?.createdAt))}</td>
-          <td>${safe(`${range.month}/${range.year}`)}</td>
+          <td style="font-family:'Courier New',monospace;font-size:9px">${safe(fmtDate(r?.createdAt))}</td>
           <td>${safe(typeLabel)}</td>
-          <td class="num">${safe(`${prefix}${fmtMoney(Math.abs(signed))}`)}</td>
-          <td>${safe(String(r?.paymentStatus || salary?.paymentStatus || 'pending'))}</td>
-          <td>${safe(String(r?.notes || ''))}</td>
+          <td class="num" style="color:${isNeg ? '#dc2626' : '#065f46'};font-weight:700;font-family:'Courier New',monospace">${isNeg ? `-${safe(fmtMoney(Math.abs(signed)))}` : `+${safe(fmtMoney(Math.abs(signed)))}`}</td>
+          <td style="font-size:9px;color:#64748b">${safe(String(r?.notes || '').slice(0, 30))}</td>
         </tr>
       `;
     }).join('');
@@ -1167,6 +1184,12 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     const payPeriodFrom = new Date(range.year, range.month - 1, 1);
     const payPeriodTo = new Date(range.year, range.month, 0);
     const paymentNo = salary?._id ? String(salary._id).slice(-6) : '';
+    const lastPaymentRecord = (records || []).find((r) => r.type === 'SALARY_PAYMENT');
+    const paymentDate = lastPaymentRecord?.createdAt || null;
+    const stmtNo = `OOS-${String(salary._id).slice(-8).toUpperCase()}`;
+    const payStatus = String(salary?.paymentStatus || 'pending');
+    const statusLabel = payStatus === 'paid' ? 'PAID' : payStatus === 'partial' ? 'PARTIAL' : 'PENDING';
+    const statusColor = payStatus === 'paid' ? '#4ade80' : payStatus === 'partial' ? '#fbbf24' : '#f87171';
 
     const html = `
       <!doctype html>
@@ -1174,160 +1197,219 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
         <head>
           <meta charset="utf-8" />
           <style>
-            @page { size: A4; margin: 12mm; }
-            html, body { padding: 0; margin: 0; }
-            body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #0f172a; }
-            .row { display: flex; justify-content: space-between; gap: 16px; }
-            .col { flex: 1; min-width: 0; }
-            h1 { font-size: 22px; margin: 0; }
-            h2 { font-size: 14px; margin: 0 0 6px 0; }
-            .muted { color: #334155; }
-            .box { border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px; }
-            .mt { margin-top: 14px; }
-            .kv { margin: 2px 0; }
-            table { width: 100%; border-collapse: collapse; }
-            th, td { border: 1px solid #e5e7eb; padding: 6px 8px; vertical-align: top; }
-            th { background: #e6fbff; text-align: left; font-weight: 700; }
+            @page { size: A4; margin: 0; }
+            html, body { padding: 0; margin: 0; background: #fff; }
+            body { font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #0f172a; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            * { box-sizing: border-box; }
+
+            .header { background: linear-gradient(135deg, #1e3a5f 0%, #1e40af 100%); padding: 22px 28px 20px; display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+            .header-left { flex: 1; }
+            .header-right { flex-shrink: 0; text-align: right; }
+            .company-name { font-size: 20px; font-weight: 900; color: #fff; letter-spacing: 1.5px; line-height: 1; margin-bottom: 4px; }
+            .accent-bar { width: 36px; height: 3px; background: #f59e0b; border-radius: 2px; margin-bottom: 8px; }
+            .company-info { color: #93c5fd; font-size: 10px; line-height: 1.7; }
+            .stmt-title-1 { font-size: 24px; font-weight: 900; color: #fff; letter-spacing: 1px; line-height: 1; }
+            .stmt-title-2 { font-size: 24px; font-weight: 900; color: #f59e0b; letter-spacing: 1px; line-height: 1; margin-bottom: 12px; }
+            .stmt-box { background: rgba(255,255,255,0.12); border-radius: 8px; padding: 8px 12px; min-width: 200px; }
+            .stmt-row { display: flex; justify-content: space-between; margin-bottom: 4px; align-items: center; }
+            .stmt-row:last-child { margin-bottom: 0; }
+            .stmt-label { font-size: 9px; color: #93c5fd; font-weight: 600; }
+            .stmt-val { font-size: 10px; color: #fff; font-family: "Courier New", monospace; font-weight: 700; }
+
+            .from-to { display: flex; border-bottom: 1px solid #e2e8f0; }
+            .from-box { flex: 1; padding: 16px 22px; border-right: 1px solid #e2e8f0; }
+            .to-box { flex: 1; padding: 16px 22px; background: #f0f7ff; }
+            .box-label { font-size: 8px; font-weight: 800; color: #64748b; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px; }
+            .to-box .box-label { color: #1e3a5f; }
+            .company-title { font-size: 13px; font-weight: 800; color: #0f172a; margin-bottom: 3px; }
+            .owner-name { font-size: 16px; font-weight: 900; color: #0f172a; margin-bottom: 2px; }
+            .owner-id { display: inline-block; font-size: 9px; font-weight: 700; color: #1e40af; background: #dbeafe; padding: 2px 8px; border-radius: 12px; margin-bottom: 6px; font-family: "Courier New", monospace; }
+            .info-line { font-size: 10px; color: #475569; margin-top: 2px; }
+            .period-pill { margin-top: 10px; padding: 6px 10px; background: #f8fafc; border-radius: 5px; border-left: 3px solid #1e3a5f; }
+            .period-lbl { font-size: 9px; color: #64748b; }
+            .period-val { font-size: 10px; font-weight: 700; color: #1e3a5f; font-family: "Courier New", monospace; }
+
+            .section { padding: 14px 22px 0; }
+            .section-title { font-size: 9px; font-weight: 800; color: #1e3a5f; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px; display: flex; align-items: center; gap: 7px; }
+            .section-bar { display: inline-block; width: 4px; height: 13px; background: #1e3a5f; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+
+            table.orders { width: 100%; border-collapse: collapse; }
+            table.orders th { background: #1e3a5f; color: #fff; font-size: 9px; font-weight: 700; padding: 7px 8px; border: 1px solid #1e3a5f; text-align: left; white-space: nowrap; }
+            table.orders td { font-size: 9px; padding: 6px 8px; border: 1px solid #e2e8f0; vertical-align: top; color: #0f172a; }
+            table.orders tbody tr:nth-child(even) td { background: #f8fafc; }
+            table.orders tfoot td { background: #eef2ff; font-weight: 800; border-top: 2px solid #1e3a5f; color: #1e3a5f; font-size: 10px; }
+            table.orders .num { text-align: right; white-space: nowrap; font-family: "Courier New", monospace; }
             thead { display: table-header-group; }
             tr { break-inside: avoid; page-break-inside: avoid; }
-            .num { text-align: right; white-space: nowrap; }
-            .strong { font-weight: 700; }
-            .section-title { font-size: 16px; font-weight: 700; margin: 0 0 8px 0; }
+
+            .lower { display: flex; padding: 14px 22px; gap: 0; border-top: 1px solid #f1f5f9; margin-top: 12px; }
+            .lower-left { flex: 1; padding-right: 18px; }
+            .lower-right { flex: 1; padding-left: 18px; border-left: 1px solid #e2e8f0; }
+
+            table.records { width: 100%; border-collapse: collapse; }
+            table.records th { background: #374151; color: #fff; font-size: 9px; font-weight: 700; padding: 6px 8px; border: 1px solid #374151; text-align: left; }
+            table.records td { font-size: 9px; padding: 6px 8px; border: 1px solid #e2e8f0; vertical-align: top; color: #0f172a; }
+            table.records tbody tr:nth-child(even) td { background: #f9fafb; }
+            table.records .num { text-align: right; white-space: nowrap; font-family: "Courier New", monospace; }
+
+            table.summary { width: 100%; border-collapse: collapse; }
+            table.summary td { padding: 6px 9px; font-size: 10px; border-bottom: 1px solid #f1f5f9; }
+            table.summary .lbl { color: #475569; }
+            table.summary .amt { text-align: right; font-family: "Courier New", monospace; font-weight: 700; white-space: nowrap; }
+            .net-row td { background: #f0f7ff !important; font-weight: 800 !important; font-size: 12px !important; color: #1e3a5f !important; border-top: 2px solid #1e3a5f !important; border-bottom: 2px solid #1e3a5f !important; padding: 8px 9px !important; }
+
+            .balance-due { margin-top: 10px; background: linear-gradient(135deg, #1e3a5f 0%, #1e40af 100%); border-radius: 8px; padding: 13px 15px; display: flex; justify-content: space-between; align-items: center; }
+            .balance-lbl { color: #93c5fd; font-size: 8px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; }
+            .balance-sub { color: #93c5fd; font-size: 8px; margin-top: 2px; opacity: 0.7; }
+            .balance-amt { color: #f59e0b; font-size: 20px; font-weight: 900; font-family: "Courier New", monospace; }
+
+            .footer { background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 10px 28px; display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+            .footer-txt { font-size: 8px; color: #94a3b8; }
+            .mono { font-family: "Courier New", monospace; }
+            .blue { color: #1e40af; font-weight: 700; }
+            .red { color: #dc2626; font-weight: 700; }
+            .green { color: #065f46; font-weight: 700; }
           </style>
         </head>
         <body>
-          <div class="row">
-            <div class="col">
-              ${companyLogo ? `<img src="${safe(companyLogo)}" alt="Logo" style="max-height: 60px; max-width: 200px; margin-bottom: 12px; display: block;" />` : ''}
-              <div class="kv strong">PRO # CMC${safe(orderBreakdown[0]?.serial_no || '')}</div>
-              <div class="kv muted">Date: ${safe(fmtDate(new Date()))}</div>
-              <div class="kv muted">Pay Period: ${safe(fmtDate(payPeriodFrom))} to ${safe(fmtDate(payPeriodTo))}</div>
-              <div class="kv muted">Statement: ${safe(new Date(range.year, range.month - 1, 1).toLocaleString('en-US', { month: 'short', year: 'numeric' }))}</div>
+
+          <!-- Header -->
+          <div class="header">
+            <div class="header-left">
+              ${companyLogo ? `<img src="${safe(companyLogo)}" alt="Logo" style="max-height:48px;max-width:180px;display:block;margin-bottom:12px;object-fit:contain;filter:brightness(0) invert(1);" />` : `<div class="company-name">${safe(companyName)}</div>`}
+              <div class="accent-bar"></div>
+              <div class="company-info">
+                ${companyAddress ? `<div>${safe(companyAddress)}</div>` : ''}
+                ${companyPhone ? `<div>Tel: ${safe(companyPhone)}</div>` : ''}
+                ${companyEmail ? `<div>${safe(companyEmail)}</div>` : ''}
+              </div>
             </div>
-            <div class="col" style="text-align:right">
-              <h1>Payment Statement</h1>
-              <div class="strong">${safe(companyName)}</div>
-              ${companyAddress ? `<div class="muted">${safe(companyAddress)}</div>` : ''}
-              ${companyEmail ? `<div class="muted">${safe(companyEmail)}</div>` : ''}
-              ${companyPhone ? `<div class="muted">PH: ${safe(companyPhone)}</div>` : ''}
+            <div class="header-right">
+              <div style="font-size:9px;color:#93c5fd;letter-spacing:3px;font-weight:700;text-transform:uppercase;margin-bottom:3px;">Owner Operator</div>
+              <div class="stmt-title-1">PAYMENT</div>
+              <div class="stmt-title-2">STATEMENT</div>
+              <div class="stmt-box">
+                <div class="stmt-row"><span class="stmt-label">STATEMENT #</span><span class="stmt-val">${safe(stmtNo)}</span></div>
+                <div class="stmt-row"><span class="stmt-label">DATE</span><span class="stmt-val">${safe(fmtDate(new Date()))}</span></div>
+                <div class="stmt-row"><span class="stmt-label">PERIOD</span><span class="stmt-val">${safe(new Date(range.year, range.month - 1, 1).toLocaleString('en-US', { month: 'short', year: 'numeric' }))}</span></div>
+                <div class="stmt-row"><span class="stmt-label">STATUS</span><span class="stmt-val" style="color:${statusColor}">${safe(statusLabel)}</span></div>
+              </div>
             </div>
           </div>
 
-          <div class="row mt">
-            <div class="col box">
-              <h2>Payment Details</h2>
-              <div class="kv muted">Payment #: <span class="strong">${safe(paymentNo || '-')}</span></div>
-              <div class="kv muted">Cheque #: <span class="strong">-</span></div>
-              <div class="kv muted">Date: <span class="strong">${safe('-')}</span></div>
-              <div class="kv muted">Employee Code: <span class="strong">${safe(owner?.ownerOperatorId || '-')}</span></div>
-              <div class="kv muted">Amount: <span class="strong">${safe(fmtMoney(finalPayable))}</span></div>
+          <!-- FROM / PAY TO -->
+          <div class="from-to">
+            <div class="from-box">
+              <div class="box-label">From</div>
+              <div class="company-title">${safe(companyName)}</div>
+              ${companyAddress ? `<div class="info-line">${safe(companyAddress)}</div>` : ''}
+              ${companyPhone ? `<div class="info-line">Tel: ${safe(companyPhone)}</div>` : ''}
+              ${companyEmail ? `<div class="info-line">${safe(companyEmail)}</div>` : ''}
+              <div class="period-pill">
+                <div class="period-lbl">Pay Period</div>
+                <div class="period-val">${safe(fmtDate(payPeriodFrom))} &mdash; ${safe(fmtDate(payPeriodTo))}</div>
+              </div>
             </div>
-            <div class="col box">
-              <h2>Pay To</h2>
-              <div class="kv strong" style="font-size: 16px;">${safe(owner?.fullName || '')}</div>
-              ${owner?.address ? `<div class="kv muted">${safe(owner.address)}</div>` : ''}
-              ${owner?.email ? `<div class="kv muted">Email: <span class="strong">${safe(owner.email)}</span></div>` : ''}
-              ${owner?.phone ? `<div class="kv muted">Phone: <span class="strong">${safe(owner.phone)}</span></div>` : ''}
+            <div class="to-box">
+              <div class="box-label">Pay To</div>
+              <div class="owner-name">${safe(owner?.fullName || '')}</div>
+              ${owner?.companyName ? `<div style="font-size:11px;font-weight:600;color:#334155;margin-bottom:4px;">${safe(owner.companyName)}</div>` : ''}
+              <div class="owner-id">ID: ${safe(owner?.ownerOperatorId || '-')}</div>
+              ${owner?.address ? `<div class="info-line">${safe(owner.address)}</div>` : ''}
+              ${owner?.email ? `<div class="info-line">${safe(owner.email)}</div>` : ''}
+              ${owner?.phone ? `<div class="info-line">${safe(owner.phone)}</div>` : ''}
             </div>
           </div>
 
-          <div class="mt">
-            <table>
+          <!-- Order Breakdown -->
+          <div class="section">
+            <div class="section-title">
+              <span class="section-bar"></span>
+              Order Breakdown &mdash; ${safe(new Date(range.year, range.month - 1, 1).toLocaleString('en-US', { month: 'short', year: 'numeric' }))}
+              &nbsp;<span style="font-size:9px;font-weight:600;color:#64748b;">(${orderBreakdown.length} orders)</span>
+            </div>
+            <table class="orders">
               <thead>
                 <tr>
-                  <th style="width: 7%;">Trip#</th>
-                  <th style="width: 12%;">Sett. Inv.#</th>
-                  <th style="width: 8%;">Truck#</th>
-                  <th style="width: 26%;">Pickup</th>
-                  <th style="width: 26%;">Delivery</th>
-                  <th class="num" style="width: 7%;">Settle</th>
-                  <th class="num" style="width: 7%;">Driver</th>
-                  <th class="num" style="width: 7%;">Final</th>
+                  <th style="width:6%">Trip #</th>
+                  <th style="width:10%">Invoice #</th>
+                  <th style="width:8%">Truck</th>
+                  <th style="width:22%">Pickup</th>
+                  <th style="width:22%">Delivery</th>
+                  <th class="num" style="width:7%">Miles</th>
+                  <th class="num" style="width:12%">Settlement</th>
+                  <th class="num" style="width:13%">Driver Cost</th>
                 </tr>
               </thead>
               <tbody>
-                ${orderRowsHtml || '<tr><td colspan="8" class="num">—</td></tr>'}
+                ${orderRowsHtml || '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:14px;font-style:italic;">No orders found for this period</td></tr>'}
               </tbody>
               <tfoot>
                 <tr>
-                  <td colspan="5" class="strong">Total</td>
-                  <td class="num strong">${safe(fmtMoney(basePayable))}</td>
-                  <td class="num strong">${safe(fmtMoney(totalDriverDeduction))}</td>
-                  <td class="num strong">${safe(fmtMoney(basePayable - totalDriverDeduction))}</td>
+                  <td colspan="5">TOTAL</td>
+                  <td class="num mono">${safe(String(orderBreakdown.reduce((s, r) => s + Number(r?.driverMiles || 0), 0).toFixed(0)))}</td>
+                  <td class="num mono blue">${safe(fmtMoney(basePayable))}</td>
+                  <td class="num mono red">${totalDriverDeduction > 0 ? `-${safe(fmtMoney(totalDriverDeduction))}` : '&mdash;'}</td>
                 </tr>
               </tfoot>
             </table>
           </div>
 
-          <div class="mt">
-            <div class="section-title">Records (Deductions / Additions / Payments)</div>
-            <table>
-              <thead>
-                <tr>
-                  <th style="width: 14%;">Date</th>
-                  <th style="width: 10%;">Month</th>
-                  <th style="width: 16%;">Type</th>
-                  <th class="num" style="width: 14%;">Amount</th>
-                  <th style="width: 12%;">Status</th>
-                  <th style="width: 34%;">Notes</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${recordsHtml || '<tr><td colspan="6" class="num">—</td></tr>'}
-              </tbody>
-            </table>
+          <!-- Lower: Records + Summary -->
+          <div class="lower">
+            <div class="lower-left">
+              <div class="section-title" style="color:#374151;">
+                <span class="section-bar" style="background:#374151;"></span>
+                Transaction Records
+              </div>
+              <table class="records">
+                <thead>
+                  <tr>
+                    <th style="width:25%">Date</th>
+                    <th style="width:28%">Type</th>
+                    <th class="num" style="width:28%">Amount</th>
+                    <th style="width:19%">Notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${recordsHtml || '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:12px;font-style:italic;">No records</td></tr>'}
+                </tbody>
+              </table>
+            </div>
+
+            <div class="lower-right">
+              <div class="section-title">
+                <span class="section-bar"></span>
+                Earnings Summary
+              </div>
+              <table class="summary">
+                <tbody>
+                  <tr><td class="lbl">Gross Settlement</td><td class="amt">${safe(fmtMoney(basePayable))}</td></tr>
+                  <tr><td class="lbl">Driver Salary Deduction</td><td class="amt red">&#8722; ${safe(fmtMoney(totalDriverDeduction))}</td></tr>
+                  ${previousDueAdded > 0 ? `<tr><td class="lbl">Previous Month Due</td><td class="amt green">+ ${safe(fmtMoney(previousDueAdded))}</td></tr>` : ''}
+                  ${manualAddition > 0 ? `<tr><td class="lbl">Manual Addition</td><td class="amt green">+ ${safe(fmtMoney(manualAddition))}</td></tr>` : ''}
+                  ${manualDeduction > 0 ? `<tr><td class="lbl">Manual Deduction</td><td class="amt red">&#8722; ${safe(fmtMoney(manualDeduction))}</td></tr>` : ''}
+                  <tr class="net-row"><td class="lbl">Net Payable</td><td class="amt">${safe(fmtMoney(finalPayable))}</td></tr>
+                  <tr><td class="lbl">Amount Paid</td><td class="amt green">&#8722; ${safe(fmtMoney(paidAmount))}</td></tr>
+                </tbody>
+              </table>
+              <div class="balance-due">
+                <div>
+                  <div class="balance-lbl">Balance Due</div>
+                  ${paymentDate ? `<div class="balance-sub">Last payment: ${safe(fmtDate(paymentDate))}</div>` : ''}
+                </div>
+                <div class="balance-amt">${safe(fmtMoney(dueAmount))}</div>
+              </div>
+              ${paymentNo ? `<div style="margin-top:6px;font-size:8px;color:#94a3b8;text-align:right;font-family:'Courier New',monospace;">Receipt: ${safe(paymentNo)}</div>` : ''}
+            </div>
           </div>
 
-          <div class="mt">
-            <table>
-              <thead>
-                <tr>
-                  <th style="width: 60%;">Summary</th>
-                  <th class="num" style="width: 40%;">Amount</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>Settlement Total</td>
-                  <td class="num">${safe(fmtMoney(basePayable))}</td>
-                </tr>
-                <tr>
-                  <td>Driver Salary Deduction</td>
-                  <td class="num">-${safe(fmtMoney(totalDriverDeduction))}</td>
-                </tr>
-                ${previousDueAdded > 0 ? `
-                  <tr>
-                    <td>Previous Month Due (Carry Forward)</td>
-                    <td class="num">${safe(fmtMoney(previousDueAdded))}</td>
-                  </tr>
-                ` : ''}
-                ${manualAddition > 0 ? `
-                  <tr>
-                    <td>Manual Addition</td>
-                    <td class="num">${safe(fmtMoney(manualAddition))}</td>
-                  </tr>
-                ` : ''}
-                ${manualDeduction > 0 ? `
-                  <tr>
-                    <td>Manual Deduction</td>
-                    <td class="num">-${safe(fmtMoney(manualDeduction))}</td>
-                  </tr>
-                ` : ''}
-                <tr>
-                  <td class="strong">Net Pay</td>
-                  <td class="num strong">${safe(fmtMoney(finalPayable))}</td>
-                </tr>
-                <tr>
-                  <td class="muted">Paid</td>
-                  <td class="num muted">${safe(fmtMoney(paidAmount))}</td>
-                </tr>
-                <tr>
-                  <td class="muted">Due</td>
-                  <td class="num muted">${safe(fmtMoney(dueAmount))}</td>
-                </tr>
-              </tbody>
-            </table>
+          <!-- Footer -->
+          <div class="footer">
+            <div class="footer-txt">${safe(stmtNo)} &bull; ${safe(new Date(range.year, range.month - 1, 1).toLocaleString('en-US', { month: 'long', year: 'numeric' }))} &bull; Generated ${safe(fmtDate(new Date()))}</div>
+            <div class="footer-txt">Computer-generated statement &mdash; No signature required</div>
           </div>
+
         </body>
       </html>
     `;
@@ -1341,7 +1423,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     const pdfBuffer = await page.pdf({
       format: 'A4',
       printBackground: true,
-      preferCSSPageSize: true,
+      margin: { top: '10mm', bottom: '10mm', left: '12mm', right: '12mm' },
     });
 
     const safeOwner = String(owner?.fullName || 'owner').replace(/[^a-z0-9-_]+/gi, '_');
@@ -1786,7 +1868,7 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
     }, 0);
 
     const ownerDocs = await OwnerOperator.find({ tenantId, ...normalizeDeletedFilter() })
-      .select('fullName ownerOperatorId status')
+      .select('fullName companyName ownerOperatorId status')
       .lean();
     const ownerPerfMap = new Map(
       ownerDocs.map((o) => [
@@ -1960,7 +2042,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
     const targetCurrency = normalizeCurrency(payoutCurrency, salaryDoc?.currency || req.tenant?.billing?.currency || 'CAD');
 
     const owner = await OwnerOperator.findOne({ _id: ownerOperatorId, tenantId, ...normalizeDeletedFilter() })
-      .select('fullName ownerOperatorId status phone email address')
+      .select('fullName companyName ownerOperatorId status phone email address')
       .lean();
     if (!owner) return res.status(404).json({ status: false, message: 'Owner operator not found' });
 
@@ -1978,6 +2060,13 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
     const fxRatesMap = await getFxRatesMap(tenantId, range.month, range.year, targetCurrency);
     const orderIds = orders.map((o) => o._id);
     const { byOrder } = await buildOrderDriverDeductions(tenantId, orderIds);
+
+    const allDriverIds2 = new Set();
+    byOrder.forEach((v) => v.drivers.forEach((id) => allDriverIds2.add(String(id))));
+    const driverDocs2 = allDriverIds2.size > 0
+      ? await Users.find({ _id: { $in: Array.from(allDriverIds2) } }, { _id: 1, name: 1 }).lean()
+      : [];
+    const driverNameMap2 = new Map(driverDocs2.map((u) => [String(u._id), u.name || '']));
 
     const orderBreakdown = orders.map((o) => {
       const ded = byOrder.get(String(o._id));
@@ -1998,6 +2087,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
       else if ((ded?.soloSegments || 0) > 0) driverRateType = 'solo';
       const originalDriverAvgRate = Number(ded?.miles || 0) > 0 ? Number((ded?.weightedRateMiles || 0) / (ded?.miles || 1)) : 0;
       const driverAvgRate = Number(convertAmount(originalDriverAvgRate, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      const driverNames = Array.from(ded?.drivers || []).map((id) => driverNameMap2.get(String(id)) || '').filter(Boolean);
       return {
         order: o._id,
         serial_no: o.serial_no || null,
@@ -2007,6 +2097,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
         orderCreatedAt: o.createdAt || null,
         input_total_amount: Number(o.input_total_amount || 0),
         input_currency: normalizeCurrency(o.input_currency, sourceCurrency),
+        driverNames,
         orderPrice,
         settleAmount,
         ownerProfit,
