@@ -14,7 +14,7 @@ const ownerOperatorFinancialRecordSchema = new mongoose.Schema(
       index: true,
     },
     amount: { type: Number, required: true, default: 0 },
-    currency: { type: String, default: 'CAD' },
+    currency: { type: String, default: 'USD' },
     month: { type: Number, min: 1, max: 12, index: true },
     year: { type: Number, min: 2000, max: 9999, index: true },
     paymentStatus: { type: String, enum: ['pending', 'partial', 'paid'], default: 'pending' },

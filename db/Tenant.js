@@ -174,7 +174,7 @@ const tenantSchema = new mongoose.Schema({
     },
     currency: {
       type: String,
-      default: 'CAD'
+      default: 'USD'
     },
     nextBillingDate: Date,
     paymentMethod: {

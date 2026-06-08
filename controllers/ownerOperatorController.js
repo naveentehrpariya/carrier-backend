@@ -60,16 +60,16 @@ function buildDateRange(month, year) {
   return { from, to, month: m, year: y };
 }
 
-function normalizeCurrency(value, fallback = 'CAD') {
+function normalizeCurrency(value, fallback = 'USD') {
   const code = String(value || fallback).trim().toUpperCase();
-  const normalizedFallback = String(fallback || 'CAD').toUpperCase();
+  const normalizedFallback = String(fallback || 'USD').toUpperCase();
   if (!/^[A-Z]{3}$/.test(code)) return normalizedFallback;
   if (!SUPPORTED_CURRENCIES.has(code)) return normalizedFallback;
   return code;
 }
 
 async function getFxRatesMap(tenantId, month, year, targetCurrency) {
-  const target = normalizeCurrency(targetCurrency, 'CAD');
+  const target = normalizeCurrency(targetCurrency, 'USD');
   const rows = await ConversionRate.find({
     tenantId,
     month: Number(month),
@@ -89,7 +89,7 @@ async function getFxRatesMap(tenantId, month, year, targetCurrency) {
 
 function convertAmount(amount, sourceCurrency, targetCurrency, fxMap) {
   const source = normalizeCurrency(sourceCurrency, targetCurrency);
-  const target = normalizeCurrency(targetCurrency, 'CAD');
+  const target = normalizeCurrency(targetCurrency, 'USD');
   const numeric = Number(amount || 0);
   if (source === target) return { value: numeric, rate: 1 };
   const directRate = Number(fxMap?.get(source) || 0);
@@ -529,7 +529,7 @@ exports.getMonthlyFxRates = catchAsync(async (req, res, next) => {
     const { month, year, targetCurrency } = req.query || {};
     const range = buildDateRange(month, year);
     if (!range) return res.status(400).json({ status: false, message: 'Valid month and year are required' });
-    const target = normalizeCurrency(targetCurrency, req.tenant?.billing?.currency || 'CAD');
+    const target = normalizeCurrency(targetCurrency, req.tenant?.billing?.currency || 'USD');
     const fxMap = await getFxRatesMap(tenantId, range.month, range.year, target);
     return res.json({
       status: true,
@@ -557,7 +557,7 @@ exports.saveMonthlyFxRates = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'rates object is required' });
     }
 
-    const target = normalizeCurrency(targetCurrency, req.tenant?.billing?.currency || 'CAD');
+    const target = normalizeCurrency(targetCurrency, req.tenant?.billing?.currency || 'USD');
     const ops = Object.entries(rates).map(async ([sourceCurrency, rawRate]) => {
       const source = normalizeCurrency(sourceCurrency, target);
       if (source === target) return null;
@@ -604,7 +604,7 @@ exports.autoSyncMonthlyFxRates = catchAsync(async (req, res, next) => {
     const { month, year, targetCurrency, sourceCurrencies = [] } = req.body || {};
     const range = buildDateRange(month, year);
     if (!range) return res.status(400).json({ status: false, message: 'Valid month and year are required' });
-    const target = normalizeCurrency(targetCurrency, req.tenant?.billing?.currency || 'CAD');
+    const target = normalizeCurrency(targetCurrency, req.tenant?.billing?.currency || 'USD');
     const desiredSources = Array.isArray(sourceCurrencies) && sourceCurrencies.length > 0
       ? sourceCurrencies
       : ['USD', 'CAD', 'INR'];
@@ -642,7 +642,7 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
     const { month, year, ownerOperatorId, adjustments = {}, includePreviousDue = true, payoutCurrency } = req.body || {};
     const range = buildDateRange(month, year);
     if (!range) return res.status(400).json({ status: false, message: 'Valid month and year are required' });
-    const targetCurrency = normalizeCurrency(payoutCurrency, req.tenant?.billing?.currency || 'CAD');
+    const targetCurrency = normalizeCurrency(payoutCurrency, req.tenant?.billing?.currency || 'USD');
 
     const ownerFilter = { tenantId, ...normalizeDeletedFilter() };
     if (companyId) ownerFilter.company = companyId;
@@ -804,7 +804,7 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
         salary: salary._id,
         type: 'SALARY_GENERATED',
         amount: finalPayable,
-        currency: salary.currency || req.tenant?.billing?.currency || 'CAD',
+        currency: salary.currency || req.tenant?.billing?.currency || 'USD',
         month: range.month,
         year: range.year,
         paymentStatus: salary.paymentStatus,
@@ -981,8 +981,8 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
       includePreviousDueParam === true ||
       (includePreviousDueParam === undefined && Number(salary?.previousDueAdded || 0) > 0);
 
-    const payoutCurrency = req.query?.payoutCurrency || salary?.currency || req.tenant?.billing?.currency || 'CAD';
-    const targetCurrency = normalizeCurrency(payoutCurrency, salary?.currency || req.tenant?.billing?.currency || 'CAD');
+    const payoutCurrency = req.query?.payoutCurrency || salary?.currency || req.tenant?.billing?.currency || 'USD';
+    const targetCurrency = normalizeCurrency(payoutCurrency, salary?.currency || req.tenant?.billing?.currency || 'USD');
     const range = buildDateRange(salary.month, salary.year);
     if (!range) return res.status(400).json({ status: false, message: 'Invalid month/year on salary record' });
 
@@ -1493,7 +1493,7 @@ exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
     const amount = Number(req.body?.amount || 0);
     const notes = String(req.body?.notes || '').trim();
     if (amount <= 0) return res.status(400).json({ status: false, message: 'Payment amount should be greater than 0' });
-    const salaryCurrency = normalizeCurrency(salary?.currency, req.tenant?.billing?.currency || 'CAD');
+    const salaryCurrency = normalizeCurrency(salary?.currency, req.tenant?.billing?.currency || 'USD');
     const inputCurrency = normalizeCurrency(req.body?.currency, salaryCurrency);
     const fxRatesMap = await getFxRatesMap(tenantId, salary.month, salary.year, salaryCurrency);
     const convertedAmount = Number(convertAmount(amount, inputCurrency, salaryCurrency, fxRatesMap).value || 0);
@@ -1609,7 +1609,7 @@ exports.addSalaryExpense = catchAsync(async (req, res, next) => {
     if (!notes) {
       return res.status(400).json({ status: false, message: 'Notes are required' });
     }
-    const salaryCurrency = normalizeCurrency(salary?.currency, req.tenant?.billing?.currency || 'CAD');
+    const salaryCurrency = normalizeCurrency(salary?.currency, req.tenant?.billing?.currency || 'USD');
     const inputCurrency = normalizeCurrency(req.body?.currency, salaryCurrency);
     const fxRatesMap = await getFxRatesMap(tenantId, salary.month, salary.year, salaryCurrency);
     const convertedAmount = Number(convertAmount(amount, inputCurrency, salaryCurrency, fxRatesMap).value || 0);
@@ -1848,7 +1848,7 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
     const { month, year, payoutCurrency } = req.query;
     const range = month && year ? buildDateRange(month, year) : null;
     const dateFilter = range ? { createdAt: { $gte: range.from, $lte: range.to } } : {};
-    const targetCurrency = normalizeCurrency(payoutCurrency, req.tenant?.billing?.currency || 'CAD');
+    const targetCurrency = normalizeCurrency(payoutCurrency, req.tenant?.billing?.currency || 'USD');
 
     const ownerCountPromise = OwnerOperator.countDocuments({ tenantId, ...normalizeDeletedFilter() });
     const activeOwnerCountPromise = OwnerOperator.countDocuments({ tenantId, status: 'active', ...normalizeDeletedFilter() });
@@ -2049,7 +2049,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
     const salaryDoc = await OwnerOperatorSalary.findOne({ tenantId, ownerOperator: ownerOperatorId, month: range.month, year: range.year })
       .select('currency basePayable totalDriverDeduction previousDueAdded manualDeduction manualAddition paidAmount paymentStatus')
       .lean();
-    const targetCurrency = normalizeCurrency(payoutCurrency, salaryDoc?.currency || req.tenant?.billing?.currency || 'CAD');
+    const targetCurrency = normalizeCurrency(payoutCurrency, salaryDoc?.currency || req.tenant?.billing?.currency || 'USD');
 
     const owner = await OwnerOperator.findOne({ _id: ownerOperatorId, tenantId, ...normalizeDeletedFilter() })
       .select('fullName companyName ownerOperatorId status phone email address')

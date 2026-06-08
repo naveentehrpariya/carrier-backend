@@ -15,7 +15,7 @@ const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity } = require("../utils/activityLogger");
 
 const SUPPORTED_CURRENCIES = new Set(['CAD', 'USD', 'INR']);
-const BASE_ORDER_CURRENCY = 'CAD';
+const BASE_ORDER_CURRENCY = 'USD';
 const FX_FALLBACK = {
    CAD_USD: 0.74,
    USD_CAD: 1.35,
@@ -105,7 +105,7 @@ async function resolveMonthlyRate({ tenantId, sourceCurrency, targetCurrency = B
    return Number(FX_FALLBACK[`${src}_${dst}`] || 1);
 }
 
-async function resolveMonthlyRateToCad({ tenantId, sourceCurrency, referenceDate = new Date() }) {
+async function resolveMonthlyRateToBase({ tenantId, sourceCurrency, referenceDate = new Date() }) {
    return resolveMonthlyRate({
       tenantId,
       sourceCurrency,
@@ -114,20 +114,20 @@ async function resolveMonthlyRateToCad({ tenantId, sourceCurrency, referenceDate
    });
 }
 
-function convertToCad(amount, rateToCad) {
+function convertToBase(amount, rateToBase) {
    const val = Number(amount || 0);
-   const rate = Number(rateToCad || 1);
+   const rate = Number(rateToBase || 1);
    const converted = val * (Number.isFinite(rate) && rate > 0 ? rate : 1);
    return Number(converted.toFixed(2));
 }
 
-function normalizeRevenueItemsToCad(items = [], rateToCad = 1) {
+function normalizeRevenueItemsToBase(items = [], rateToBase = 1) {
    if (!Array.isArray(items)) return [];
    return items.map((item) => {
       const next = { ...(item || {}) };
       if (typeof next.rate !== 'undefined' && next.rate !== null && next.rate !== '') {
          const numericRate = Number(next.rate);
-         if (Number.isFinite(numericRate)) next.rate = convertToCad(numericRate, rateToCad);
+         if (Number.isFinite(numericRate)) next.rate = convertToBase(numericRate, rateToBase);
       }
       return next;
    });
@@ -363,16 +363,16 @@ exports.create_order = catchAsync(async (req, res, next) => {
        } = req.body;
 
       const inputCurrency = normalizeCurrency(revenue_currency, BASE_ORDER_CURRENCY);
-      const fxToCad = await resolveMonthlyRateToCad({
+      const fxToBase = await resolveMonthlyRateToBase({
          tenantId,
          sourceCurrency: inputCurrency,
          referenceDate: new Date(),
       });
-      const totalAmountCad = convertToCad(total_amount, fxToCad);
-      const carrierAmountCad = convertToCad(carrier_amount, fxToCad);
-      const settleAmountCad = convertToCad(settle_amount, fxToCad);
-      const revenueItemsCad = normalizeRevenueItemsToCad(revenue_items, fxToCad);
-      const carrierRevenueItemsCad = normalizeRevenueItemsToCad(carrier_revenue_items, fxToCad);
+      const totalAmountBase = convertToBase(total_amount, fxToBase);
+      const carrierAmountBase = convertToBase(carrier_amount, fxToBase);
+      const settleAmountBase = convertToBase(settle_amount, fxToBase);
+      const revenueItemsBase = normalizeRevenueItemsToBase(revenue_items, fxToBase);
+      const carrierRevenueItemsBase = normalizeRevenueItemsToBase(carrier_revenue_items, fxToBase);
  
       const newOrderId = await generateUniqueSerialNumber(tenantId);
       
@@ -447,8 +447,8 @@ exports.create_order = catchAsync(async (req, res, next) => {
          ? await resolveRegularOrderOwnerContext({
               tenantId,
               truckId: truck,
-              totalAmount: totalAmountCad,
-              settleAmount: settleAmountCad,
+              totalAmount: totalAmountBase,
+              settleAmount: settleAmountBase,
               driverAssignmentMode: driver_assignment_mode
            })
          : {
@@ -475,10 +475,10 @@ exports.create_order = catchAsync(async (req, res, next) => {
          customer : customer,
          customer_payment_date,
          customer_payment_method,
-         total_amount: totalAmountCad,
+         total_amount: totalAmountBase,
 
          carrier,
-         carrier_amount: isRegular ? Number(ownerContext.carrier_amount || 0) : carrierAmountCad, 
+         carrier_amount: isRegular ? Number(ownerContext.carrier_amount || 0) : carrierAmountBase,
          carrier_payment_date,
          carrier_payment_method,
 
@@ -497,12 +497,12 @@ exports.create_order = catchAsync(async (req, res, next) => {
                ? 'owner_operator_driver'
                : (normalizedDrivers.length > 0 ? 'company_driver_assigned' : 'company_driver_unassigned'),
 
-         revenue_items: revenueItemsCad,
-         carrier_revenue_items: carrierRevenueItemsCad,
+         revenue_items: revenueItemsBase,
+         carrier_revenue_items: carrierRevenueItemsBase,
          revenue_currency: BASE_ORDER_CURRENCY.toLowerCase(),
          amount_currency: BASE_ORDER_CURRENCY.toLowerCase(),
          input_currency: inputCurrency.toLowerCase(),
-         fx_to_cad: Number(fxToCad || 1),
+         fx_to_usd: Number(fxToBase || 1),
          input_total_amount: Number(total_amount || 0),
          input_carrier_amount: Number(carrier_amount || 0),
          input_settle_amount: Number(settle_amount || 0),
@@ -630,7 +630,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
             updateData.revenue_currency || existingOrder.input_currency || existingOrder.revenue_currency || BASE_ORDER_CURRENCY,
             BASE_ORDER_CURRENCY
          );
-         const fxToCad = await resolveMonthlyRateToCad({
+         const fxToBase = await resolveMonthlyRateToBase({
             tenantId,
             sourceCurrency: inputCurrency,
             referenceDate: existingOrder.createdAt || new Date(),
@@ -638,27 +638,27 @@ exports.update_order = catchAsync(async (req, res, next) => {
 
          if ('total_amount' in updateData) {
             updateData.input_total_amount = Number(updateData.total_amount || 0);
-            updateData.total_amount = convertToCad(updateData.total_amount, fxToCad);
+            updateData.total_amount = convertToBase(updateData.total_amount, fxToBase);
          }
          if ('carrier_amount' in updateData) {
             updateData.input_carrier_amount = Number(updateData.carrier_amount || 0);
-            updateData.carrier_amount = convertToCad(updateData.carrier_amount, fxToCad);
+            updateData.carrier_amount = convertToBase(updateData.carrier_amount, fxToBase);
          }
          if ('settle_amount' in updateData) {
             updateData.input_settle_amount = Number(updateData.settle_amount || 0);
-            updateData.settle_amount = convertToCad(updateData.settle_amount, fxToCad);
+            updateData.settle_amount = convertToBase(updateData.settle_amount, fxToBase);
          }
          if ('revenue_items' in updateData) {
-            updateData.revenue_items = normalizeRevenueItemsToCad(updateData.revenue_items, fxToCad);
+            updateData.revenue_items = normalizeRevenueItemsToBase(updateData.revenue_items, fxToBase);
          }
          if ('carrier_revenue_items' in updateData) {
-            updateData.carrier_revenue_items = normalizeRevenueItemsToCad(updateData.carrier_revenue_items, fxToCad);
+            updateData.carrier_revenue_items = normalizeRevenueItemsToBase(updateData.carrier_revenue_items, fxToBase);
          }
 
          updateData.revenue_currency = BASE_ORDER_CURRENCY.toLowerCase();
          updateData.amount_currency = BASE_ORDER_CURRENCY.toLowerCase();
          updateData.input_currency = inputCurrency.toLowerCase();
-         updateData.fx_to_cad = Number(fxToCad || 1);
+         updateData.fx_to_usd = Number(fxToBase || 1);
       }
 
       const nextOrderType = existingOrder.order_type;
@@ -989,33 +989,41 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       <html>
       <head>
          <meta charset="utf-8" />
+         <link rel="preconnect" href="https://fonts.googleapis.com" />
+         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+         <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
          <script src="https://cdn.tailwindcss.com"></script>
          <style>
-            @page { size: A4; margin: 12mm; }
-            html, body { 
-               background: white; 
-               -webkit-print-color-adjust: exact; 
-               print-color-adjust: exact; 
-               font-family: Arial, Helvetica, sans-serif;
+            @page { size: A4; margin: 10mm 0 12mm 0; }
+            html, body {
+               background: white;
+               -webkit-print-color-adjust: exact;
+               print-color-adjust: exact;
+               font-family: 'IBM Plex Sans', Arial, Helvetica, sans-serif;
+               margin: 0; padding: 0;
             }
-            .pdf-section, .table-section, .remittance-section, .shipping-detail-item, .bill-to-section, .location-block, tr {
+            /* Strong page-break rules — keep every block together */
+            * {
+               box-sizing: border-box;
+            }
+            div, table, tr, thead, tbody, section, article {
                page-break-inside: avoid !important;
                break-inside: avoid !important;
+               orphans: 4;
+               widows: 4;
             }
-            img { max-width: 100%; height: auto; }
-            
+            img { max-width: 100%; height: auto; display: block; }
+
             /* Ensure layout behaves consistently in PDF */
-            .flex { display: flex; }
-            .grid { display: grid; }
-            .justify-between { justify-content: space-between; }
-            .items-center { align-items: center; }
-            .items-start { align-items: flex-start; }
-            .text-right { text-align: right; }
-            
-            /* Fix for overlapping issues */
-            .border-b { border-bottom: 1px solid #e5e7eb; }
-            .pb-4 { padding-bottom: 1rem; }
-            .mb-4 { margin-bottom: 1rem; }
+            .flex { display: flex !important; }
+            .grid { display: grid !important; }
+            .justify-between { justify-content: space-between !important; }
+            .items-center { align-items: center !important; }
+            .items-start { align-items: flex-start !important; }
+            .text-right { text-align: right !important; }
+            .border-b { border-bottom: 1px solid #e5e7eb !important; }
+            .pb-4 { padding-bottom: 1rem !important; }
+            .mb-4 { margin-bottom: 1rem !important; }
          </style>
       </head>
       <body>
@@ -1030,8 +1038,8 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       });
       const page = await browser.newPage();
       
-      // Better rendering configuration for external assets like logos
-      await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 2 });
+      // 1× scale keeps file size small; quality is still crisp at A4 print resolution
+      await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 1 });
       await page.setContent(fullHtml, { waitUntil: ['networkidle0', 'load', 'domcontentloaded'] });
       
       // Small delay to ensure any dynamic images (like logos) are fully rendered

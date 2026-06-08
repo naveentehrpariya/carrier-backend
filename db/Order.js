@@ -122,17 +122,17 @@ const schema = new mongo.Schema({
     carrier_revenue_items: [],
     revenue_currency:{
        type: String,
-       default:"cad",
+       default:"usd",
     },
     amount_currency: {
         type: String,
-        default: "cad",
+        default: "usd",
     },
     input_currency: {
         type: String,
-        default: "cad",
+        default: "usd",
     },
-    fx_to_cad: {
+    fx_to_usd: {
         type: Number,
         default: 1,
     },
