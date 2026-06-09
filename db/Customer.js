@@ -71,7 +71,7 @@ const schema = new mongoose.Schema({
    },
    deletedAt: {type: Date},
    created_by: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
-   assigned_to: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
+   assigned_to: [{ type: mongoose.Schema.Types.ObjectId, ref: 'users' }],
 },{
     toJSON: { virtuals: true },
     toObject: { virtuals: true }

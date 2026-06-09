@@ -84,3 +84,25 @@ exports.staffListing = catchAsync(async (req, res) => {
       message: data.length ? undefined : "No files found"
     });
 });
+
+// Returns all users assignable to a customer: admins + any staff with non-accounting/non-driver permissions.
+// Excludes pure accounting users and pure driver users.
+exports.assignableListing = catchAsync(async (req, res) => {
+    const tenantId = req.tenantId || req.user?.tenantId;
+    if (!tenantId) {
+      return res.status(400).json({ status: false, message: "Tenant context is required.", users: [] });
+    }
+    const staffPerms = ['regular', 'outsourcing', 'subadmin', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees'];
+    const baseFilter = {
+      tenantId,
+      $or: [
+        { is_admin: 1 },
+        { permissions: { $in: staffPerms } },
+        // legacy: role-based users created before permissions system
+        { role: 1 },
+        { role: 3 },
+      ],
+    };
+    const data = await User.find(baseFilter).select('_id name email phone country position role is_admin permissions').sort({ name: 1 });
+    res.json({ status: true, users: data });
+});

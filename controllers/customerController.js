@@ -72,7 +72,13 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
     }
   }
 
- const normalizedAssignedTo = assigned_to ? assigned_to : null;
+ // Normalize assigned_to to a clean array of ObjectIds, require at least one
+ const assignedToArray = Array.isArray(assigned_to)
+   ? assigned_to.filter(Boolean)
+   : assigned_to ? [assigned_to] : [];
+ if (assignedToArray.length === 0) {
+   return res.status(400).json({ status: false, message: "Please assign at least one staff member to this customer." });
+ }
  const result = await Customer.create({
    name: name,
    email: email,
@@ -88,7 +94,7 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
    tenantId,
    company: companyId,
    zipcode: zipcode,
-   assigned_to: normalizedAssignedTo,
+   assigned_to: assignedToArray,
    created_by:req.user._id,
  });
  logActivity(req, {
@@ -118,19 +124,11 @@ exports.customers_listing = catchAsync(async (req, res) => {
   const perms    = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
   const isAdmin  = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || perms.includes('subadmin');
   const hasAccounting = perms.includes('accounting');
-  const hasRegular    = perms.includes('regular');
 
   if (isAdmin || hasAccounting) {
-    // Admin / Sub-admin / Accounting → see ALL customers in the tenant
-  } else if (hasRegular) {
-    // regular permission → assigned + all unassigned customers
-    queryObj.$or = [
-      { assigned_to: req.user._id },
-      { assigned_to: null },
-      { assigned_to: { $exists: false } },
-    ];
+    // Admin / Subadmin / Accounting → see ALL customers in the tenant
   } else {
-    // no regular permission → only assigned customers
+    // Everyone else → only customers they are assigned to
     queryObj.assigned_to = req.user._id;
   }
 
@@ -145,7 +143,7 @@ exports.customers_listing = catchAsync(async (req, res) => {
   }
 
   let Query = new APIFeatures(
-    Customer.find(queryObj).populate('assigned_to'),
+    Customer.find(queryObj).populate('assigned_to', '_id name email phone role is_admin'),
     req.query
   ).sort();
      
@@ -169,15 +167,13 @@ exports.customerDetails = catchAsync(async (req, res, next) => {
   
   const permsD = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
   const isAdminDet = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || permsD.includes('subadmin');
-  if (!isAdminDet && !permsD.includes('accounting')) {
-    criteria.$or = [
-      { assigned_to: req.user._id },
-      { assigned_to: null },
-      { assigned_to: { $exists: false } },
-    ];
+  const hasAccountingDet = permsD.includes('accounting');
+  if (!isAdminDet && !hasAccountingDet) {
+    // Non-admin/accounting users can only see customers they are assigned to
+    criteria.assigned_to = req.user._id;
   }
-  
-  const customer = await Customer.findOne(criteria).populate('assigned_to');
+
+  const customer = await Customer.findOne(criteria).populate('assigned_to', '_id name email phone role is_admin');
   if(!customer){
     return res.send({
       status: false,
@@ -232,7 +228,12 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
   if (req.user && !isAdminUpd && !canWriteUpd) {
     return res.status(403).json({ status: false, message: "You are not authorized to update customers." });
   }
-  const normalizedAssignedTo = assigned_to ? assigned_to : null;
+  const assignedToArrayUpd = Array.isArray(assigned_to)
+    ? assigned_to.filter(Boolean)
+    : assigned_to ? [assigned_to] : [];
+  if (assignedToArrayUpd.length === 0) {
+    return res.status(400).json({ status: false, message: "Please assign at least one staff member to this customer." });
+  }
   const updatedUser = await Customer.findOneAndUpdate(updateQuery, {
     name: name,
     email: email,
@@ -245,7 +246,7 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
     country: country,
     state: state,
     city: city,
-    assigned_to: normalizedAssignedTo,
+    assigned_to: assignedToArrayUpd,
     zipcode: zipcode,
     created_by:req.user._id,
   }, {
