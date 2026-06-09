@@ -10,10 +10,17 @@ const schema = new mongoose.Schema({
       unique: true,
       index: true,
    },
-   company_slug: { 
+   company_slug: {
       type:String,
-   },                                                                                                                                                                                                            
-   logo: { 
+   },
+   order_prefix: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      maxlength: 6,
+      default: null,
+   },
+   logo: {
       type:String,
    },
    pdf_logo: {
