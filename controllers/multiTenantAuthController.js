@@ -485,9 +485,28 @@ const validateToken = catchAsync(async (req, res, next) => {
       return next();
     }
 
+    // Handle employee emulation token (tenant admin emulating an employee)
+    if (decoded.isEmulatingEmployee) {
+      const employee = await User.findById(decoded.id).populate('company');
+      if (!employee) {
+        return next(new AppError('Employee no longer exists', 401));
+      }
+      req.user = employee;
+      req.isEmulatingEmployee = true;
+      req.originalAdminId = decoded.originalAdminId;
+      req.tenantId = decoded.tenantId || employee.tenantId;
+      if (req.tenantId && !req.tenant) {
+        try {
+          const tenant = await Tenant.findOne({ tenantId: req.tenantId });
+          if (tenant) req.tenant = tenant;
+        } catch (err) {}
+      }
+      return next();
+    }
+
     // Handle tenant user token
     const currentUser = await User.findById(decoded.id).populate('company');
-    
+
     if (!currentUser) {
       return next(new AppError('User no longer exists', 401));
     }
@@ -770,7 +789,11 @@ const getProfile = catchAsync(async (req, res, next) => {
     profile.corporateId = req.user.corporateID || 'N/A';
     
   } else {
-    // Regular tenant user
+    // Regular tenant user (or admin emulating an employee)
+    if (req.isEmulatingEmployee) {
+      profile.isEmulatingEmployee = true;
+      profile.originalAdminId = req.originalAdminId;
+    }
     profile.role = req.user.role;
     profile.is_admin = req.user.is_admin;
     profile.isTenantAdmin = req.user.role === 3 || req.user.is_admin === 1;
@@ -829,6 +852,128 @@ const logout = (req, res) => {
 };
 
 /**
+ * Tenant admin emulates an employee account
+ */
+const emulateEmployee = catchAsync(async (req, res, next) => {
+  if (!req.user || (req.user.role !== 3 && req.user.is_admin !== 1)) {
+    return next(new AppError('Tenant admin access required', 403));
+  }
+
+  const { employeeId } = req.body;
+  if (!employeeId) {
+    return next(new AppError('Employee ID is required', 400));
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(employeeId)) {
+    return next(new AppError('Invalid employee ID', 400));
+  }
+
+  if (req.user._id.toString() === employeeId.toString()) {
+    return next(new AppError('Cannot emulate yourself', 400));
+  }
+
+  const employee = await User.findOne({
+    _id: employeeId,
+    tenantId: req.user.tenantId,
+    deletedAt: null
+  });
+
+  if (!employee) {
+    return next(new AppError('Employee not found', 404));
+  }
+
+  if (employee.status === 'inactive') {
+    return next(new AppError('Cannot emulate a suspended account', 400));
+  }
+
+  const emulationToken = signEmulationToken({
+    id: employee._id,
+    isEmulatingEmployee: true,
+    originalAdminId: req.user._id,
+    tenantId: req.user.tenantId,
+    role: employee.role
+  });
+
+  const cookieOptions = {
+    expires: new Date(Date.now() + 60 * 60 * 1000),
+    httpOnly: true,
+    sameSite: 'lax'
+  };
+  if (process.env.NODE_ENV === 'production') cookieOptions.secure = true;
+  res.cookie('jwt', emulationToken, cookieOptions);
+
+  res.json({
+    status: true,
+    message: `Now emulating: ${employee.name}`,
+    token: emulationToken,
+    employee: {
+      _id: employee._id,
+      name: employee.name,
+      email: employee.email,
+      role: employee.role,
+      tenantId: employee.tenantId
+    }
+  });
+});
+
+/**
+ * Stop employee emulation, restore original tenant admin session
+ */
+const stopEmployeeEmulation = catchAsync(async (req, res, next) => {
+  let token = null;
+  const authHeader = req.headers.Authorization || req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer')) {
+    token = authHeader.split(' ')[1];
+  }
+  if (!token) token = req.cookies?.jwt;
+
+  let decoded;
+  try {
+    decoded = await promisify(jwt.verify)(token, SECRET_ACCESS);
+  } catch (e) {
+    return next(new AppError('Invalid or expired token', 401));
+  }
+
+  if (!decoded.isEmulatingEmployee || !decoded.originalAdminId) {
+    return next(new AppError('Not currently emulating an employee', 400));
+  }
+
+  const admin = await User.findById(decoded.originalAdminId).populate('company');
+  if (!admin) {
+    return next(new AppError('Original admin account not found', 404));
+  }
+
+  const adminToken = signToken({
+    id: admin._id,
+    role: admin.role,
+    tenantId: admin.tenantId
+  });
+
+  const cookieOptions = {
+    expires: new Date(
+      Date.now() + (process.env.JWT_COOKIE_EXPIRES_IN || 7) * 24 * 60 * 60 * 1000
+    ),
+    httpOnly: true,
+    sameSite: 'lax'
+  };
+  if (process.env.NODE_ENV === 'production') cookieOptions.secure = true;
+  res.cookie('jwt', adminToken, cookieOptions);
+
+  res.json({
+    status: true,
+    message: 'Returned to admin account',
+    token: adminToken,
+    admin: {
+      _id: admin._id,
+      name: admin.name,
+      email: admin.email,
+      role: admin.role,
+      tenantId: admin.tenantId
+    }
+  });
+});
+
+/**
  * Role-based authorization middleware
  */
 const restrictTo = (...roles) => {
@@ -852,6 +997,8 @@ module.exports = {
   validateToken,
   emulateTenant,
   stopEmulation,
+  emulateEmployee,
+  stopEmployeeEmulation,
   getProfile,
   logout,
   restrictTo,

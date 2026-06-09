@@ -1,6 +1,8 @@
 const ActivityLog = require('../db/ActivityLog');
 const catchAsync = require('../utils/catchAsync');
 
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /**
  * GET /api/tenant-admin/activity-logs
  * Query params:
@@ -40,11 +42,12 @@ exports.getActivityLogs = catchAsync(async (req, res) => {
   }
 
   if (search) {
+    const safeSearch = escapeRegex(search);
     filter.$or = [
-      { description: { $regex: search, $options: 'i' } },
-      { userName: { $regex: search, $options: 'i' } },
-      { resourceName: { $regex: search, $options: 'i' } },
-      { userEmail: { $regex: search, $options: 'i' } },
+      { description: { $regex: safeSearch, $options: 'i' } },
+      { userName: { $regex: safeSearch, $options: 'i' } },
+      { resourceName: { $regex: safeSearch, $options: 'i' } },
+      { userEmail: { $regex: safeSearch, $options: 'i' } },
     ];
   }
 

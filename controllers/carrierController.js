@@ -8,9 +8,9 @@ const { checkCarrierLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity } = require("../utils/activityLogger");
 
 exports.addCarrier = catchAsync(async (req, res, next) => {
-  const hasCarriersPermission = req.user?.permissions?.includes('carriers') || req.user?.permissions?.includes('subadmin');
-  const isAdmin = req.user?.is_admin === 1;
-  if (req.user && !isAdmin && !hasCarriersPermission) {
+  const isAdmin = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
+  const canWrite = req.user?.permissions?.includes('carriers_write') || req.user?.permissions?.includes('subadmin');
+  if (req.user && !isAdmin && !canWrite) {
     return res.status(403).json({ status: false, message: "You are not authorized to add carriers." });
   }
 
@@ -58,7 +58,6 @@ exports.addCarrier = catchAsync(async (req, res, next) => {
     }
   }
 
-  await Carrier.syncIndexes();
   const result = await Carrier.create({
     name: name,
     email: email,
@@ -102,7 +101,11 @@ exports.carriers_listing = catchAsync(async (req, res) => {
       return res.status(400).json({ status: false, message: "Tenant context is required.", carriers: [], totalDocuments: 0 });
     }
     queryObj.tenantId = tenantId;
-    if (req.user?.company) queryObj.company = req.user.company._id;
+    // Admin and users with outsourcing/carriers permission see all carriers in the tenant
+    const isAdmin = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
+    const hasCarriersAccess = Array.isArray(req.user?.permissions) &&
+      (req.user.permissions.includes('carriers') || req.user.permissions.includes('outsourcing') || req.user.permissions.includes('subadmin'));
+    if (!isAdmin && !hasCarriersAccess && req.user?.company) queryObj.company = req.user.company._id;
 
     if (search && search.length >1) {
       const safeSearch = search.trim().replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
@@ -129,9 +132,9 @@ exports.carriers_listing = catchAsync(async (req, res) => {
 });
 
 exports.deleteCarrier = catchAsync(async (req, res) => {
-    const hasCarriersPermission = req.user?.permissions?.includes('carriers') || req.user?.permissions?.includes('subadmin');
-    const isAdmin = req.user?.is_admin === 1;
-    if (req.user && !isAdmin && !hasCarriersPermission) {
+    const isAdminDel = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
+    const canWriteDel = req.user?.permissions?.includes('carriers_write') || req.user?.permissions?.includes('subadmin');
+    if (req.user && !isAdminDel && !canWriteDel) {
       return res.status(403).json({ status: false, message: "You are not authorized to delete carriers." });
     }
 
@@ -178,9 +181,9 @@ exports.deleteCarrier = catchAsync(async (req, res) => {
 });
 
 exports.updateCarrier = catchAsync(async (req, res, next) => {
-  const hasCarriersPermission = req.user?.permissions?.includes('carriers') || req.user?.permissions?.includes('subadmin');
-  const isAdmin = req.user?.is_admin === 1;
-  if (req.user && !isAdmin && !hasCarriersPermission) {
+  const isAdminUpd = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
+  const canWriteUpd = req.user?.permissions?.includes('carriers_write') || req.user?.permissions?.includes('subadmin');
+  if (req.user && !isAdminUpd && !canWriteUpd) {
     return res.status(403).json({ status: false, message: "You are not authorized to update carriers." });
   }
 

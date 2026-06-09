@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 const https = require('https');
 const puppeteer = require('puppeteer');
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
@@ -321,7 +323,7 @@ exports.ownerOperatorListings = catchAsync(async (req, res, next) => {
     if (companyId) filter.company = companyId;
     if (status === 'active' || status === 'inactive') filter.status = status;
     if (search && String(search).trim().length > 0) {
-      const q = String(search).trim();
+      const q = escapeRegex(String(search).trim());
       filter.$and = filter.$and || [];
       filter.$and.push({
         $or: [

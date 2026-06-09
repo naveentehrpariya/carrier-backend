@@ -50,27 +50,24 @@ const authenticateJWT = catchAsync(async (req, res, next) => {
     
     // Handle emulation tokens differently
     if (decoded.isEmulating || decoded.isSuperAdmin) {
-      console.log('🔄 Handling emulation/super admin token');
-      
-      // Get the actual user record for the super admin
-      const actualUser = await User.findById(decoded.id);
-      if (!actualUser) {
-        return next(new AppError('Super admin user record not found', 401));
+      // Verify super admin record exists and is active
+      const superAdmin = await SuperAdmin.findOne({ userId: decoded.id, status: 'active' });
+      if (!superAdmin) {
+        return next(new AppError('Super admin account not found or inactive', 401));
       }
-      
-      req.user = actualUser;
+
+      // Get the linked user record (best-effort; some endpoints need req.user fields)
+      const actualUser = await User.findById(decoded.id);
+      req.user = actualUser || { _id: decoded.id, name: superAdmin.name, email: superAdmin.email };
+      req.superAdmin = superAdmin;
       req.isSuperAdminUser = true;
-      
+
       // Set emulation context if token is for emulation
       if (decoded.isEmulating) {
         req.isEmulating = true;
         req.tenantId = decoded.emulatedTenantId;
-        console.log('✅ Emulation context set:', {
-          isEmulating: req.isEmulating,
-          tenantId: req.tenantId
-        });
       }
-      
+
       return next();
     }
     

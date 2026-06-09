@@ -93,6 +93,12 @@ const requireModuleAccess = (moduleKey) => {
     const requested = String(moduleKey || '').toLowerCase();
     if (!valid.includes(requested)) return next(new AppError('Invalid module access configuration.', 500));
 
+    // Admin always has full access
+    if (req.user?.is_admin === 1 || Number(req.user?.role) === 3) return next();
+
+    // User has the module in their permissions array
+    if (Array.isArray(req.user?.permissions) && req.user.permissions.includes(requested)) return next();
+
     const effective = await computeEffectiveModules(req);
 
     if (!effective.includes(requested)) {

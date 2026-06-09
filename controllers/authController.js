@@ -58,7 +58,6 @@ const validateToken = catchAsync ( async (req, res, next) => {
           message: 'User not found',
         });
       }
-      console.log("result", result);
       req.user = result;
       next();
     } else {
@@ -109,7 +108,17 @@ const editUser = catchAsync(async (req, res, next) => {
       message : "User not found or access denied."
     });
   }
-  
+
+  // Sub-admins (not the main tenant admin) cannot modify the main tenant admin account
+  const isFullAdmin = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
+  const targetIsMainAdmin = existedUser.is_admin === 1 || Number(existedUser.role) === 3;
+  if (!isFullAdmin && targetIsMainAdmin) {
+    return res.status(403).json({
+      status: false,
+      message: "You are not authorized to modify the administrator account."
+    });
+  }
+
   if(req.body.email !== existedUser?.email){
     // Check if new email is already in use within tenant
     const emailExists = await User.findOne({ 
@@ -307,8 +316,6 @@ const signup = catchAsync(async (req, res, next) => {
     }
   }
 
-  await User.syncIndexes();
-  
   try {
     const result = await User.create({
       name: name,
@@ -523,6 +530,9 @@ const profile = catchAsync ( async (req, res) => {
   } else {
     userProfile.userType = 'tenant_user';
     userProfile.tenantId = req.user.tenantId;
+    if (req.isEmulatingEmployee) {
+      userProfile.isEmulatingEmployee = true;
+    }
   }
 
   // Find company for the current tenant context
@@ -771,11 +781,11 @@ const employeesDocs = catchAsync ( async (req, res) => {
 const forgotPassword = catchAsync ( async (req, res, next) => {
   const user = await User.findOne({email:req.body.email}, null, { includeInactive: true });
   if(!user){
-    res.json({
+    return res.json({
       status:false,
       message:"No user found associated with this email.",
-    }); 
-  } 
+    });
+  }
   const resetToken = await user.createPasswordResetToken();
   await user.save({validateBeforeSave:false});
   const resetTokenUrl = `${process.env.DOMAIN_URL}/user/resetpassword/${resetToken}`;
@@ -910,22 +920,22 @@ img{border:0;line-height:100%;outline:none;text-decoration:none;-ms-interpolatio
 });
 
 const resetpassword = catchAsync ( async (req, res, next) => {
-  if(req.body.password !== req.body.confirmPassword){ 
-    res.json({
+  if(req.body.password !== req.body.confirmPassword){
+    return res.json({
       status:false,
       message:"Confirm password is incorrect. Please try again later.",
-    }); 
+    });
   }
   const hashToken = crypto.createHash('sha256').update(req.params.token).digest('hex');
   const user = await User.findOne({
     passwordResetToken:hashToken,
     resetTokenExpire : { $gt: Date.now()}
   });
-  if(!user){ 
-    res.json({
+  if(!user){
+    return res.json({
       status:false,
       message:"Link expired or invalid token.",
-    }); 
+    });
   }
   user.password = req.body.password;
   user.confirmPassword = req.body.confirmPassword;
@@ -939,13 +949,14 @@ const resetpassword = catchAsync ( async (req, res, next) => {
 });
 
 const addCompanyInfo = catchAsync ( async (req, res, next) => {
+  const tenantIdForCompany = req.tenantId || req.user?.tenantId;
+  if (!tenantIdForCompany) {
+    return res.status(400).json({ status: false, message: "Tenant context is required." });
+  }
   const {name, email, phone, address, companyID, bank_name, account_name, account_number, routing_number, remittance_primary_email, remittance_secondary_email, rate_confirmation_terms} = req.body;
   if(companyID){
     // Find company by ID and ensure it belongs to the current tenant
-    const filter = { _id: companyID };
-    if (req.tenantId) {
-      filter.tenantId = req.tenantId;
-    }
+    const filter = { _id: companyID, tenantId: tenantIdForCompany };
     const existing = await Company.findOne(filter);
     if(existing){
       existing.name = name !== '' && name !== undefined ? name : existing.name;
@@ -974,7 +985,6 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
       });
     }
   }
-  await Company.syncIndexes();
   Company.create({
     name: name,
     email: email,
@@ -987,7 +997,7 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
     remittance_primary_email: remittance_primary_email,
     remittance_secondary_email: remittance_secondary_email,
     rate_confirmation_terms: rate_confirmation_terms,
-    tenantId: req.tenantId || 'default-tenant',
+    tenantId: tenantIdForCompany,
   }).then(result => {
     logActivity(req, {
       action: 'CREATE',
@@ -1359,41 +1369,15 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
     
     console.log('🔍 Looking up tenant with tenantId:', finalTenantId);
     
-    // First, let's see what tenants exist in the database
-    const allTenants = await Tenant.find({});
-    console.log('📊 All tenants in database:');
-    allTenants.forEach((t, index) => {
-      console.log(`  ${index + 1}. tenantId: "${t.tenantId}" (${typeof t.tenantId}), status: "${t.status}", name: "${t.name}", subdomain: "${t.subdomain}"`);
-    });
-    
     // Check if we can find the tenant without status filter first
     let tenantAny = await Tenant.findOne({ tenantId: finalTenantId });
-    console.log('🔎 Tenant lookup by tenantId without status filter:', tenantAny ? 'FOUND' : 'NOT FOUND');
-    
+
     // If not found by tenantId, try by subdomain (for backward compatibility)
     if (!tenantAny) {
-      console.log('🔎 Tenant not found by tenantId, trying subdomain lookup...');
       tenantAny = await Tenant.findOne({ subdomain: finalTenantId });
-      console.log('🔎 Tenant lookup by subdomain:', tenantAny ? 'FOUND' : 'NOT FOUND');
-      
-      if (tenantAny) {
-        console.log('ℹ️ Found tenant by subdomain - this means frontend is using subdomain as tenantId');
-        console.log('   Using actual tenantId for further processing:', tenantAny.tenantId);
-      }
     }
-    
-    if (tenantAny) {
-      console.log('   Found tenant details:', {
-        tenantId: tenantAny.tenantId,
-        name: tenantAny.name,
-        status: tenantAny.status,
-        subdomain: tenantAny.subdomain
-      });
-    }
-    
-    // Now try with the status filter using the resolved tenant
-    console.log('🔎 Attempting tenant lookup with status filter: { $in: ["active", "trial"] }');
-    const actualTenantId = tenantAny ? tenantAny.tenantId : tenantId;
+
+    const actualTenantId = tenantAny ? tenantAny.tenantId : finalTenantId;
     console.log('🔍 Using actualTenantId for status lookup:', actualTenantId);
     
     const tenant = await Tenant.findOne({ 
@@ -1412,18 +1396,6 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
     }
     
     if (!tenant) {
-      console.log('❌ Tenant not found or inactive - returning error');
-      console.log('🔍 Debug: Looking for exact tenantId match...');
-      
-      // Try different search variations
-      const exactMatch = await Tenant.findOne({ tenantId: tenantId });
-      const trimmedMatch = await Tenant.findOne({ tenantId: tenantId?.trim() });
-      const regexMatch = await Tenant.findOne({ tenantId: { $regex: new RegExp(tenantId, 'i') } });
-      
-      console.log('🔍 Exact match result:', exactMatch ? 'FOUND' : 'NOT FOUND');
-      console.log('🔍 Trimmed match result:', trimmedMatch ? 'FOUND' : 'NOT FOUND');
-      console.log('🔍 Regex match result:', regexMatch ? 'FOUND' : 'NOT FOUND');
-      
       return res.status(200).json({
         status: false,
         message: "Company not found or inactive"
@@ -1431,31 +1403,10 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
     }
     
     // Find user within the tenant
-    console.log('👤 Looking up user with email:', email, 'and actualTenantId:', actualTenantId);
-    
-    // First check all users with this email
-    const allUsersWithEmail = await User.find({ email });
-    console.log('📋 All users with this email:', allUsersWithEmail.length);
-    allUsersWithEmail.forEach((u, index) => {
-      console.log(`  ${index + 1}. email: "${u.email}", tenantId: "${u.tenantId}", corporateId: "${u.corporateId}", status: "${u.status}"`);
-    });
-    
-    const user = await User.findOne({ 
-      email: normalizedEmail, 
-      tenantId: actualTenantId 
+    const user = await User.findOne({
+      email: normalizedEmail,
+      tenantId: actualTenantId
     }).select('+password').populate('company');
-    
-    console.log('👤 User lookup result:', user ? 'FOUND' : 'NOT FOUND');
-    if (user) {
-      console.log('✅ User found:', {
-        email: user.email,
-        tenantId: user.tenantId,
-        corporateId: user.corporateId,
-        status: user.status,
-        role: user.role,
-        is_admin: user.is_admin
-      });
-    }
     
     if (!user) {
       console.log('❌ User not found - returning invalid credentials');

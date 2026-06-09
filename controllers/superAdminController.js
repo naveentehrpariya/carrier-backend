@@ -1,5 +1,7 @@
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const Tenant = require('../db/Tenant');
 const SuperAdmin = require('../db/SuperAdmin');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
@@ -86,11 +88,12 @@ const getAllTenants = catchAsync(async (req, res, next) => {
   const filter = {};
   const and = [];
   if (search) {
+    const safeSearch = escapeRegex(search);
     and.push({
       $or: [
-        { name: { $regex: search, $options: 'i' } },
-        { subdomain: { $regex: search, $options: 'i' } },
-        { tenantId: { $regex: search, $options: 'i' } }
+        { name: { $regex: safeSearch, $options: 'i' } },
+        { subdomain: { $regex: safeSearch, $options: 'i' } },
+        { tenantId: { $regex: safeSearch, $options: 'i' } }
       ]
     });
   }

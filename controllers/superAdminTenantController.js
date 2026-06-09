@@ -1,6 +1,8 @@
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
 const Tenant = require('../db/Tenant');
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const SuperAdmin = require('../db/SuperAdmin');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
 const User = require('../db/Users');
@@ -22,10 +24,11 @@ const getTenants = catchAsync(async (req, res, next) => {
   // Build filter query
   const filter = {};
   if (search) {
+    const safeSearch = escapeRegex(search);
     filter.$or = [
-      { name: { $regex: search, $options: 'i' } },
-      { subdomain: { $regex: search, $options: 'i' } },
-      { 'contactInfo.adminEmail': { $regex: search, $options: 'i' } }
+      { name: { $regex: safeSearch, $options: 'i' } },
+      { subdomain: { $regex: safeSearch, $options: 'i' } },
+      { 'contactInfo.adminEmail': { $regex: safeSearch, $options: 'i' } }
     ];
   }
   if (status && status !== 'all') {
@@ -317,7 +320,7 @@ Cross-border shipments require custom stamps or deductions may apply.`
       country: 'USA',
       address: contactInfo.address || 'N/A',
       is_admin: 1,
-      permissions: ['admin', 'regular', 'outsourcing', 'accounting', 'customers', 'employees', 'payments', 'orders'],
+      permissions: ['regular', 'outsourcing', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin'],
       position: 'Administrator',
       corporateID: `ADMIN_${Date.now()}`
     });
@@ -579,6 +582,7 @@ const inviteTenantAdmin = catchAsync(async (req, res, next) => {
     isTenantAdmin: true,
     corporateID: `ADMIN_${Date.now()}`,
     position: 'Tenant Administrator',
+    permissions: ['regular', 'outsourcing', 'accounting', 'customers', 'employees', 'carriers', 'subadmin'],
     tenantPermissions: [
       'users.manage',
       'company.configure',

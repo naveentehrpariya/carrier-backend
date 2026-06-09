@@ -2,6 +2,8 @@ const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
 const Tenant = require('../db/Tenant');
 const User = require('../db/Users');
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const Company = require('../db/Company');
 const Order = require('../db/Order');
 const Customer = require('../db/Customer');
@@ -537,10 +539,11 @@ const getTenantUsers = catchAsync(async (req, res, next) => {
   // Start with active users filter
   const filter = User.activeFilter(req.tenantId);
   if (searchText) {
+    const safeSearchText = escapeRegex(searchText);
     filter.$or = [
-      { name: { $regex: searchText, $options: 'i' } },
-      { email: { $regex: searchText, $options: 'i' } },
-      { corporateID: { $regex: searchText, $options: 'i' } }
+      { name: { $regex: safeSearchText, $options: 'i' } },
+      { email: { $regex: safeSearchText, $options: 'i' } },
+      { corporateID: { $regex: safeSearchText, $options: 'i' } }
     ];
   }
   if (role && role !== 'all') {
@@ -583,7 +586,7 @@ const updateUserModules = catchAsync(async (req, res, next) => {
   }
 
   // All assignable permissions — order modules + feature areas
-  const VALID_PERMISSIONS = ['outsourcing', 'regular', 'accounting', 'customers', 'carriers', 'employees'];
+  const VALID_PERMISSIONS = ['outsourcing', 'regular', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin'];
   const requested = raw
     .map((m) => String(m).toLowerCase().trim())
     .filter((m) => VALID_PERMISSIONS.includes(m));
@@ -694,6 +697,15 @@ const inviteUser = catchAsync(async (req, res, next) => {
     return next(new AppError('Selected modules are not enabled for this company', 400));
   }
 
+  // Default permissions by role — read-only by default, admin manually grants write
+  const DEFAULT_PERMISSIONS_BY_ROLE = {
+    0: ['driver'],
+    1: ['regular', 'outsourcing', 'customers', 'carriers'],
+    2: ['accounting', 'customers', 'carriers'],
+    3: ['regular', 'outsourcing', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin'],
+  };
+  const defaultPermissions = DEFAULT_PERMISSIONS_BY_ROLE[parseInt(role)] || [];
+
   const user = await User.create({
     tenantId: req.tenantId,
     company: company._id,
@@ -707,6 +719,7 @@ const inviteUser = catchAsync(async (req, res, next) => {
     position,
     corporateID: `USER_${Date.now()}`,
     created_by: req.user._id,
+    permissions: defaultPermissions,
     allowedModules: effectiveModules,
     modulesCustomized: requestedModules.length > 0 && effectiveModules.length !== planModules.length
   });

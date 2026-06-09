@@ -515,12 +515,12 @@ exports.create_order = catchAsync(async (req, res, next) => {
       });
    
       if(!order){
-         res.json({
+         return res.json({
             status:false,
             message: "Failed to create order."
          });
       }
-      
+
       // Create a default trip covering the entire route
       try {
          const locations = Array.isArray(order.shipping_details) && order.shipping_details[0]
@@ -854,7 +854,7 @@ exports.order_listing = catchAsync(async (req, res, next) => {
 
    // Scope listings for non-admin users to their own records/assignments
    const isEmulating = req.isEmulating || req.isSuperAdminUser;
-   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || isEmulating;
+   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || req.user?.permissions?.includes('subadmin') || isEmulating;
    if (req.user && !isAdminUser) {
       if (Number(req.user.role) === 0 || req.user?.permissions?.includes('driver')) {
          queryObj.$and = queryObj.$and || [];
@@ -871,9 +871,10 @@ exports.order_listing = catchAsync(async (req, res, next) => {
          queryObj.serial_no = parseInt(searchValue);
       } else {
          // Non-numeric: search customer order number or company name
+         const safeSearch = searchValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
          queryObj.$or = [
-            { customer_order_no: { $regex: searchValue, $options: 'i' } },
-            { company_name: { $regex: searchValue, $options: 'i' } },
+            { customer_order_no: { $regex: safeSearch, $options: 'i' } },
+            { company_name: { $regex: safeSearch, $options: 'i' } },
          ];
       }
    }
@@ -1555,14 +1556,6 @@ exports.order_docs = catchAsync(async (req, res) => {
    }).populate('added_by');
     let paymentLogs = await PaymentLogs.find({ tenantId, order: id }).populate('updated_by');
     paymentLogs = paymentLogs ? paymentLogs.reverse() : [];
-    if(!files){ 
-      res.json({
-         status: false,
-         files: null,
-         paymentLogs: paymentLogs ?? [],
-         message: "files not found."
-       });
-    }
    res.json({
       status: true,
       paymentLogs: paymentLogs ?? [],
@@ -1572,7 +1565,7 @@ exports.order_docs = catchAsync(async (req, res) => {
 
 exports.lockOrder = catchAsync(async (req, res) => {
 
-   if(req.user && req.user.is_admin !== 1){
+   if(req.user && req.user.is_admin !== 1 && Number(req.user.role) !== 3){
       return res.json({
          status : false,
          message : "You are not authorized to lock order."
@@ -1612,7 +1605,7 @@ exports.lockOrder = catchAsync(async (req, res) => {
 
 
 exports.deleteOrder = catchAsync(async (req, res) => {
-   if(req.user && req.user.is_admin !== 1){
+   if(req.user && req.user.is_admin !== 1 && Number(req.user.role) !== 3){
       return res.json({
          status : false,
          message : "You are not authorized to delete this order."

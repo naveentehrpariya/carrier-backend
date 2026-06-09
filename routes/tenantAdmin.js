@@ -31,12 +31,16 @@ const {
   getLogUsers,
 } = require('../controllers/activityLogController');
 
-const { validateToken } = require('../controllers/multiTenantAuthController');
+const { validateToken, emulateEmployee, stopEmployeeEmulation } = require('../controllers/multiTenantAuthController');
 const { resolveTenant } = require('../middleware/tenant');
 
 // Apply middleware to all tenant admin routes (emulation-aware)
 router.use(validateToken);
 router.use(resolveTenant);
+
+// Employee emulation routes
+router.post('/emulate-employee', emulateEmployee);
+router.post('/stop-employee-emulation', stopEmployeeEmulation);
 
 // Tenant Information Routes
 router.get('/info', getTenantInfo);

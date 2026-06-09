@@ -71,24 +71,26 @@ async function checkLimit(req, resourceType, limits, additionalCount, next) {
   let resourceName = resourceType;
 
   try {
+    const activeFilter = { tenantId: req.tenantId, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
+
     switch (resourceType) {
       case 'users':
-        currentCount = await User.countDocuments({ tenantId: req.tenantId });
+        currentCount = await User.countDocuments({ ...activeFilter, status: { $ne: 'inactive' } });
         maxCount = limits.maxUsers;
         resourceName = 'users';
         break;
       case 'orders':
-        currentCount = await Order.countDocuments({ tenantId: req.tenantId });
+        currentCount = await Order.countDocuments(activeFilter);
         maxCount = limits.maxOrders;
         resourceName = 'orders';
         break;
       case 'customers':
-        currentCount = await Customer.countDocuments({ tenantId: req.tenantId });
+        currentCount = await Customer.countDocuments(activeFilter);
         maxCount = limits.maxCustomers;
         resourceName = 'customers';
         break;
       case 'carriers':
-        currentCount = await Carrier.countDocuments({ tenantId: req.tenantId });
+        currentCount = await Carrier.countDocuments(activeFilter);
         maxCount = limits.maxCarriers;
         resourceName = 'carriers';
         break;
@@ -96,7 +98,7 @@ async function checkLimit(req, resourceType, limits, additionalCount, next) {
         return next(new AppError('Unknown resource type', 400));
     }
 
-    // Check if adding new resources would exceed limit
+    // maxCount === 0 means "no limit configured" (unlimited), not "zero allowed"
     if (maxCount > 0 && (currentCount + additionalCount) > maxCount) {
       return next(new AppError(
         `${resourceName.charAt(0).toUpperCase() + resourceName.slice(1)} limit reached (${currentCount}/${maxCount}). Please upgrade your subscription plan to add more ${resourceName}.`, 
