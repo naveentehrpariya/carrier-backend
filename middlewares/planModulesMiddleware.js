@@ -87,17 +87,25 @@ const checkOrderModuleAccess = () => {
 /**
  * Middleware factory: blocks access to a specific module key (e.g. 'outsourcing').
  * Used on carrier/driver/fleet routes.
+ *
+ * @param {string} moduleKey  the order module required (regular/outsourcing)
+ * @param {string[]} extraPerms  feature permissions that ALSO grant access
+ *                               (e.g. ['carriers','accounting'] so an accountant
+ *                                can read the carrier list without the module)
  */
-const requireModuleAccess = (moduleKey) => {
+const requireModuleAccess = (moduleKey, extraPerms = []) => {
   return catchAsync(async (req, res, next) => {
     const requested = String(moduleKey || '').toLowerCase();
     if (!valid.includes(requested)) return next(new AppError('Invalid module access configuration.', 500));
 
-    // Admin always has full access
-    if (req.user?.is_admin === 1 || Number(req.user?.role) === 3) return next();
+    const perms = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
 
-    // User has the module in their permissions array
-    if (Array.isArray(req.user?.permissions) && req.user.permissions.includes(requested)) return next();
+    // Admin / sub-admin always has full access
+    if (req.user?.is_admin === 1 || Number(req.user?.role) === 3 || perms.includes('subadmin')) return next();
+
+    // User has the module itself, or an explicitly-allowed feature permission
+    if (perms.includes(requested)) return next();
+    if (extraPerms.some(p => perms.includes(p))) return next();
 
     const effective = await computeEffectiveModules(req);
 

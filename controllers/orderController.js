@@ -1605,7 +1605,9 @@ exports.lockOrder = catchAsync(async (req, res) => {
 
 
 exports.deleteOrder = catchAsync(async (req, res) => {
-   if(req.user && req.user.is_admin !== 1 && Number(req.user.role) !== 3){
+   // Only admin and sub-admin can delete orders
+   const canDelete = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || req.user?.permissions?.includes('subadmin');
+   if(req.user && !canDelete){
       return res.json({
          status : false,
          message : "You are not authorized to delete this order."

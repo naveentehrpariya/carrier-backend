@@ -101,10 +101,11 @@ exports.carriers_listing = catchAsync(async (req, res) => {
       return res.status(400).json({ status: false, message: "Tenant context is required.", carriers: [], totalDocuments: 0 });
     }
     queryObj.tenantId = tenantId;
-    // Admin and users with outsourcing/carriers permission see all carriers in the tenant
+    // Admin, accountant, and users with outsourcing/carriers permission see all carriers in the tenant
     const isAdmin = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
+    const carrierPerms = ['carriers', 'carriers_write', 'outsourcing', 'accounting', 'subadmin'];
     const hasCarriersAccess = Array.isArray(req.user?.permissions) &&
-      (req.user.permissions.includes('carriers') || req.user.permissions.includes('outsourcing') || req.user.permissions.includes('subadmin'));
+      carrierPerms.some(p => req.user.permissions.includes(p));
     if (!isAdmin && !hasCarriersAccess && req.user?.company) queryObj.company = req.user.company._id;
 
     if (search && search.length >1) {
