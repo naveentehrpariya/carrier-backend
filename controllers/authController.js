@@ -699,7 +699,7 @@ const employeeDetail = catchAsync ( async (req, res) => {
     });
   }
   const criteria = { _id: employeeId, tenantId };
-  if (companyId) criteria.company = companyId;
+
   const employee = await User.findOne(criteria, null, { includeInactive: true }).populate('company').lean();
   
   if (!employee) {
@@ -764,7 +764,6 @@ const employeesDocs = catchAsync ( async (req, res) => {
   }
   
   const employeeCriteria = { _id: employeeId, tenantId };
-  if (companyId) employeeCriteria.company = companyId;
   const employee = await User.findOne(employeeCriteria).select('_id').lean();
   if (!employee) {
     return res.status(404).json({ status: false, message: "Employee not found.", documents: [] });
@@ -1132,8 +1131,7 @@ const changePassword = async (req, res) => {
 
         // 1. Find the user with password field included
         const criteria = { _id: targetId, tenantId };
-        const companyId = req.user?.company?._id || req.user?.company || null;
-        if (companyId) criteria.company = companyId;
+
 
         const user = await User.findOne(criteria).select('+password');
         if (!user) return res.status(200).json({ 

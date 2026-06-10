@@ -100,7 +100,7 @@ app.post("/cloud/upload/:id", validateToken, multerParse.fields([{name: "attachm
       }
       const companyId = req.user?.company?._id || req.user?.company || null;
       const orderCriteria = { _id: orderid, tenantId };
-      if (companyId) orderCriteria.company = companyId;
+
       const order = await Order.findOne(orderCriteria).select('_id').lean();
       if (!order) {
         return res.status(404).json({ status: false, message: "Order not found" });

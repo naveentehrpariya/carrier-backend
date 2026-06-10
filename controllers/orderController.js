@@ -584,9 +584,6 @@ exports.update_order = catchAsync(async (req, res, next) => {
       if (!tenantId) {
          return res.status(400).json({ status: false, message: "Tenant context is required." });
       }
-      const companyId = normalizeCompanyId(req);
-
-      // Whitelist allowed update fields — never let client override tenantId, order_type, serial_no, or created_by
       const ALLOWED_UPDATE_FIELDS = [
          'customer', 'carrier', 'driver', 'truck', 'trailer', 'drivers',
          'customer_order_no', 'company_name', 'reference_no',
@@ -605,7 +602,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
       }
 
       const criteria = { _id: req.params.id, tenantId };
-      if (companyId) criteria.company = companyId;
+
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
@@ -1163,10 +1160,9 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
       if (!tenantId) {
          return res.status(400).json({ status: false, message: "Tenant context is required." });
       }
-      const companyId = normalizeCompanyId(req);
       let order;
       const criteria = { _id: req.params.id, tenantId };
-      if (companyId) criteria.company = companyId;
+
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
@@ -1237,9 +1233,8 @@ exports.updateOrderStatus = catchAsync(async (req, res) => {
       if (!tenantId) {
          return res.status(400).json({ status: false, message: "Tenant context is required." });
       }
-      const companyId = normalizeCompanyId(req);
       const criteria = { _id: req.params.id, tenantId };
-      if (companyId) criteria.company = companyId;
+
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
@@ -1284,9 +1279,8 @@ exports.addnote = catchAsync(async (req, res) => {
       if (!tenantId) {
          return res.status(400).json({ status: false, message: "Tenant context is required." });
       }
-      const companyId = normalizeCompanyId(req);
       const criteria = { _id: req.params.id, tenantId };
-      if (companyId) criteria.company = companyId;
+
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
@@ -1553,9 +1547,8 @@ exports.order_docs = catchAsync(async (req, res) => {
    if (!tenantId) {
       return res.status(400).json({ status: false, message: "Tenant context is required.", files: [], paymentLogs: [] });
    }
-   const companyId = normalizeCompanyId(req);
-   const orderCriteria = { _id: id, tenantId };
-   if (companyId) orderCriteria.company = companyId;
+      const orderCriteria = { _id: id, tenantId };
+
    const order = await Order.findOne(orderCriteria).select('_id').lean();
    if (!order) {
       return res.status(404).json({ status: false, message: "Order not found.", files: [], paymentLogs: [] });
@@ -1588,9 +1581,8 @@ exports.lockOrder = catchAsync(async (req, res) => {
    if (!tenantId) {
       return res.status(400).json({ status: false, message: "Tenant context is required." });
    }
-   const companyId = normalizeCompanyId(req);
    const criteria = { _id: id, tenantId };
-   if (companyId) criteria.company = companyId;
+
    const order = await Order.findOne(criteria);
    if(!order){
       return res.json({
@@ -1631,9 +1623,8 @@ exports.deleteOrder = catchAsync(async (req, res) => {
    if (!tenantId) {
       return res.status(400).json({ status: false, message: "Tenant context is required." });
    }
-   const companyId = normalizeCompanyId(req);
    const criteria = { _id: id, tenantId };
-   if (companyId) criteria.company = companyId;
+
    const order = await Order.findOne(criteria);
    if(!order){
       return res.json({
