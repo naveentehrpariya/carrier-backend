@@ -1051,6 +1051,16 @@ const uploadCompanyLogo = catchAsync(async (req, res) => {
     });
   }
 
+  // Read file buffer before upload (fileupload deletes the temp file in finally)
+  let logoBase64 = null;
+  try {
+    const fileBuffer = await require('fs').promises.readFile(attachment.path);
+    const mimeType = attachment.mimetype || 'image/png';
+    logoBase64 = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+  } catch (e) {
+    console.error('Failed to read logo file for base64 caching:', e.message);
+  }
+
   const uploadResponse = await fileupload(attachment);
   if (!uploadResponse || !uploadResponse.url) {
     return res.status(500).json({
@@ -1062,6 +1072,7 @@ const uploadCompanyLogo = catchAsync(async (req, res) => {
 
   company.pdf_logo = uploadResponse.url;
   company.logo = uploadResponse.url;
+  if (logoBase64) company.logo_base64 = logoBase64;
 
   await company.save();
   logActivity(req, {

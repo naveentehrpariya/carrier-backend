@@ -26,6 +26,9 @@ const schema = new mongoose.Schema({
    pdf_logo: {
       type: String,
    },
+   logo_base64: {
+      type: String,
+   },
    name: { 
       type:String,
       required:[true, 'Please enter company name.']

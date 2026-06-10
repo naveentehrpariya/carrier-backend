@@ -931,56 +931,67 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
    const puppeteer = require('puppeteer');
    const fs = require('fs');
    const path = require('path');
+   const axios = require('axios');
    const Company = require('../db/Company');
 
    let browser = null;
    try {
-      let { html, filename } = req.body;
+      let { html, filename, logoBase64: clientLogoBase64 } = req.body;
       if (!html) {
          return res.status(400).json({ status: false, message: 'HTML content is required' });
       }
 
-      // 1. Resolve company logo URL
-      let companyLogoUrl = req.tenant?.settings?.customizations?.theme?.logo || '';
-      const companyId = req.user?.company?._id || req.user?.company;
-      if (companyId) {
-         const companyDoc = await Company.findById(companyId).lean();
-         if (companyDoc && (companyDoc.pdf_logo || companyDoc.logo)) {
-            companyLogoUrl = companyDoc.pdf_logo || companyDoc.logo;
+      // 1. Use client-provided base64 logo if available (most reliable — already loaded in browser)
+      let base64Logo = clientLogoBase64 || '';
+
+      // 2. If not provided by client, read logo_base64 cached in DB (no HTTP request needed)
+      if (!base64Logo) {
+         const companyId = req.user?.company?._id || req.user?.company;
+         if (companyId) {
+            const companyDoc = await Company.findById(companyId).select('logo_base64 pdf_logo logo').lean();
+            if (companyDoc?.logo_base64) {
+               base64Logo = companyDoc.logo_base64;
+            } else if (companyDoc?.pdf_logo || companyDoc?.logo) {
+               // Fallback: fetch from CDN (works when server has outbound internet)
+               const logoUrl = companyDoc.pdf_logo || companyDoc.logo;
+               try {
+                  const response = await axios.get(logoUrl, {
+                     responseType: 'arraybuffer',
+                     timeout: 8000,
+                  });
+                  const buffer = Buffer.from(response.data);
+                  const contentType = response.headers['content-type'] || 'image/png';
+                  base64Logo = `data:${contentType};base64,${buffer.toString('base64')}`;
+                  // Cache it for next time
+                  await Company.findByIdAndUpdate(companyId, { logo_base64: base64Logo });
+               } catch (e) {
+                  console.error('Failed to fetch remote logo for PDF:', e.message);
+               }
+            }
          }
       }
 
-      // 2. Fetch or load the logo as Base64 to ensure it renders in the PDF offline
-      let base64Logo = '';
-      if (companyLogoUrl) {
-         try {
-            const response = await fetch(companyLogoUrl);
-            if (response.ok) {
-               const arrayBuffer = await response.arrayBuffer();
-               const buffer = Buffer.from(arrayBuffer);
-               const contentType = response.headers.get('content-type') || 'image/png';
-               base64Logo = `data:${contentType};base64,${buffer.toString('base64')}`;
-            }
-         } catch (e) {
-            console.error('Failed to fetch remote logo for PDF', e);
-         }
-      }
-      
+      // 3. Local fallback — backend/assets/logo.png (works on AWS and local both)
       if (!base64Logo) {
          try {
-            const localLogoPath = path.join(__dirname, '../../frontend/public/logo.png');
-            if (fs.existsSync(localLogoPath)) {
-               const buffer = fs.readFileSync(localLogoPath);
-               base64Logo = `data:image/png;base64,${buffer.toString('base64')}`;
+            const candidates = [
+               path.join(__dirname, '../assets/logo.png'),
+               path.join(__dirname, '../../frontend/public/logo.png'),
+            ];
+            for (const p of candidates) {
+               if (fs.existsSync(p)) {
+                  base64Logo = `data:image/png;base64,${fs.readFileSync(p).toString('base64')}`;
+                  break;
+               }
             }
          } catch (e) {
-            console.error('Failed to read local logo', e);
+            console.error('Failed to read local logo:', e.message);
          }
       }
 
-      // 3. Replace all logo images in HTML with the Base64 string
+      // 4. Replace all logo <img> src with the base64 string
       if (base64Logo) {
-         html = html.replace(/(<img[^>]*alt=['"]logo['"][^>]*>)/gi, (match) => {
+         html = html.replace(/(<img[^>]*alt=['"](?:logo|Logo)['"][^>]*>)/gi, (match) => {
             return match.replace(/src=['"][^'"]*['"]/i, `src="${base64Logo}"`);
          });
       }
@@ -995,7 +1006,7 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
          <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
          <script src="https://cdn.tailwindcss.com"></script>
          <style>
-            @page { size: A4; margin: 10mm 0 12mm 0; }
+            @page { margin: 0; }
             html, body {
                background: white;
                -webkit-print-color-adjust: exact;
@@ -1028,6 +1039,7 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
          </style>
       </head>
       <body>
+         ${base64Logo ? `<div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:320px;pointer-events:none;z-index:9999"><img src="${base64Logo}" style="width:100%;height:auto;opacity:0.06;object-fit:contain;display:block" /></div>` : ''}
          ${html}
       </body>
       </html>
@@ -1049,7 +1061,7 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       const pdfBuffer = await page.pdf({
          format: 'A4',
          printBackground: true,
-         preferCSSPageSize: true,
+         margin: { top: '10mm', bottom: '12mm', left: '0', right: '0' },
       });
 
       const safeFilename = filename ? filename.replace(/[^a-z0-9-_.]+/gi, '_') : 'document.pdf';
