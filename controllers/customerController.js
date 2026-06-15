@@ -161,10 +161,12 @@ exports.customers_listing = catchAsync(async (req, res) => {
 });
 
 exports.customerDetails = catchAsync(async (req, res, next) => {
+  // Scope by tenant + assignment only (mirror customers_listing).
+  // Do NOT filter by company — listing doesn't, and many customers have no
+  // company set, which wrongly denied access to legitimately-assigned ones.
   const criteria = { _id: req.params.id };
   if (req.tenantId) criteria.tenantId = req.tenantId;
-  if (req.user && req.user.company) criteria.company = req.user.company._id;
-  
+
   const permsD = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
   const isAdminDet = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || permsD.includes('subadmin');
   const hasAccountingDet = permsD.includes('accounting');
@@ -223,10 +225,14 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
 
   const updateQuery = { _id: req.params.id };
   if (req.tenantId) updateQuery.tenantId = req.tenantId;
-  const isAdminUpd = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
-  const canWriteUpd = req.user?.permissions?.includes('customers_write') || req.user?.permissions?.includes('subadmin');
+  const isAdminUpd = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || req.user?.permissions?.includes('subadmin');
+  const canWriteUpd = req.user?.permissions?.includes('customers_write');
   if (req.user && !isAdminUpd && !canWriteUpd) {
     return res.status(403).json({ status: false, message: "You are not authorized to update customers." });
+  }
+  // Non-admin writers may only update customers assigned to them.
+  if (req.user && !isAdminUpd) {
+    updateQuery.assigned_to = req.user._id;
   }
   const assignedToArrayUpd = Array.isArray(assigned_to)
     ? assigned_to.filter(Boolean)
@@ -279,11 +285,14 @@ exports.deleteCustomer = catchAsync(async (req, res) => {
     try {
       const criteria = { _id: req.params.id };
       if (req.tenantId) criteria.tenantId = req.tenantId;
-      if (req.user && req.user.company) criteria.company = req.user.company._id;
-      const isAdminDel = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
-      const canWriteDel = req.user?.permissions?.includes('customers_write') || req.user?.permissions?.includes('subadmin');
+      const isAdminDel = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || req.user?.permissions?.includes('subadmin');
+      const canWriteDel = req.user?.permissions?.includes('customers_write');
       if (req.user && !isAdminDel && !canWriteDel) {
         return res.status(403).json({ status: false, message: "You are not authorized to delete customers." });
+      }
+      // Non-admin writers may only delete customers assigned to them.
+      if (req.user && !isAdminDel) {
+        criteria.assigned_to = req.user._id;
       }
       const customer = await Customer.findOne(criteria);
       if (!customer) {

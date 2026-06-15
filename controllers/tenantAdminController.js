@@ -1012,11 +1012,12 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
       .populate('customer', 'name')
       .populate('carrier', 'name mc_code')
       .populate('truck', 'unitNumber plateNumber')
-      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck')
+      .populate('created_by', 'name staff_commision')
+      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by')
       .sort({ createdAt: -1 })
       .lean();
 
-    let totalRevenue = 0, totalCarrierCost = 0;
+    let totalRevenue = 0, totalCarrierCost = 0, totalCommission = 0;
     let pendingCustomerAmt = 0, pendingCustomerCount = 0;
     let pendingCarrierAmt = 0, pendingCarrierCount = 0;
     let paidCustomerAmt = 0, paidCarrierAmt = 0;
@@ -1024,8 +1025,15 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     for (const o of orders) {
       const rev = Number(o.total_amount) || 0;
       const cost = Number(o.carrier_amount) || 0;
+      // Net profit = revenue - carrier cost. Commission comes out of that net profit.
+      const netProfit = rev - cost;
+      const rate = Number(o.created_by?.staff_commision) || 0;
+      const commission = netProfit * (rate / 100);
+      o.commission = commission;
+      o.profit = netProfit - commission;
       totalRevenue += rev;
       totalCarrierCost += cost;
+      totalCommission += commission;
       if (o.customer_payment_status !== 'paid') {
         pendingCustomerAmt += rev;
         pendingCustomerCount++;
@@ -1041,7 +1049,8 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     }
 
     const grossProfit = totalRevenue - totalCarrierCost;
-    const profitMargin = totalRevenue > 0 ? ((grossProfit / totalRevenue) * 100).toFixed(2) : '0.00';
+    const netProfit = grossProfit - totalCommission;
+    const profitMargin = totalRevenue > 0 ? ((netProfit / totalRevenue) * 100).toFixed(2) : '0.00';
 
     return res.json({
       status: true,
@@ -1053,7 +1062,9 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
           totalOrders: orders.length,
           totalRevenue,
           totalCarrierCost,
+          totalCommission,
           grossProfit,
+          netProfit,
           profitMargin: parseFloat(profitMargin),
           pendingCustomerAmt,
           pendingCustomerCount,
@@ -1146,11 +1157,12 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
       .populate('customer', 'name')
       .populate('carrier', 'name mc_code')
       .populate('truck', 'unitNumber plateNumber')
-      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck')
+      .populate('created_by', 'name staff_commision')
+      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by')
       .sort({ createdAt: -1 })
       .lean();
 
-    let totalRevenue = 0, totalCarrierCost = 0;
+    let totalRevenue = 0, totalCarrierCost = 0, totalCommission = 0;
     let pendingCustomerAmt = 0, pendingCustomerCount = 0;
     let pendingCarrierAmt = 0, pendingCarrierCount = 0;
     let paidCustomerAmt = 0, paidCarrierAmt = 0;
@@ -1158,8 +1170,15 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
     for (const o of orders) {
       const rev = Number(o.total_amount) || 0;
       const cost = Number(o.carrier_amount) || 0;
+      // Net profit = revenue - carrier cost. Commission comes out of that net profit.
+      const netProfit = rev - cost;
+      const rate = Number(o.created_by?.staff_commision) || 0;
+      const commission = netProfit * (rate / 100);
+      o.commission = commission;
+      o.profit = netProfit - commission;
       totalRevenue += rev;
       totalCarrierCost += cost;
+      totalCommission += commission;
       if (o.customer_payment_status !== 'paid') { pendingCustomerAmt += rev; pendingCustomerCount++; }
       else { paidCustomerAmt += rev; }
       if (o.carrier_payment_status !== 'paid') { pendingCarrierAmt += cost; pendingCarrierCount++; }
@@ -1167,11 +1186,12 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
     }
 
     const grossProfit = totalRevenue - totalCarrierCost;
-    const profitMargin = totalRevenue > 0 ? ((grossProfit / totalRevenue) * 100).toFixed(2) : '0.00';
+    const netProfit = grossProfit - totalCommission;
+    const profitMargin = totalRevenue > 0 ? ((netProfit / totalRevenue) * 100).toFixed(2) : '0.00';
 
     summary = {
-      totalOrders: orders.length, totalRevenue, totalCarrierCost,
-      grossProfit, profitMargin: parseFloat(profitMargin),
+      totalOrders: orders.length, totalRevenue, totalCarrierCost, totalCommission,
+      grossProfit, netProfit, profitMargin: parseFloat(profitMargin),
       pendingCustomerAmt, pendingCustomerCount, pendingCarrierAmt, pendingCarrierCount,
       paidCustomerAmt, paidCarrierAmt
     };
@@ -1228,7 +1248,8 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
     const boxes = [
       { label: 'Total Revenue', value: fmt(summary.totalRevenue), bg: '#dbeafe', border: '#3b82f6', text: '#1e40af' },
       { label: 'Carrier Cost', value: fmt(summary.totalCarrierCost), bg: '#fee2e2', border: '#ef4444', text: '#991b1b' },
-      { label: 'Gross Profit', value: fmt(summary.grossProfit), bg: '#dcfce7', border: '#22c55e', text: '#15803d' },
+      { label: 'Commission', value: fmt(summary.totalCommission), bg: '#fef3c7', border: '#f59e0b', text: '#92400e' },
+      { label: 'Net Profit', value: fmt(summary.netProfit), bg: '#dcfce7', border: '#22c55e', text: '#15803d' },
       { label: 'Profit Margin', value: `${summary.profitMargin}%`, bg: '#f3e8ff', border: '#a855f7', text: '#7e22ce' },
       { label: 'Pending (Customer)', value: fmt(summary.pendingCustomerAmt), bg: '#ffedd5', border: '#f97316', text: '#9a3412' },
       { label: 'Pending (Carrier)', value: fmt(summary.pendingCarrierAmt), bg: '#fef3c7', border: '#f59e0b', text: '#92400e' }
@@ -1269,6 +1290,7 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
         <th>Route</th>
         <th>Revenue</th>
         <th>Carrier Cost</th>
+        <th>Commission</th>
         <th>Profit</th>
         <th>Cust. Payment</th>
         <th>Carrier Payment</th>
@@ -1290,7 +1312,8 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
         <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safe(routeFromShipping(o.shipping_details))}</td>
         <td>${fmt(o.total_amount)}</td>
         <td>${fmt(o.carrier_amount)}</td>
-        <td>${fmt(o.owner_profit)}</td>
+        <td>${fmt(o.commission)}</td>
+        <td>${fmt(o.profit)}</td>
         <td>${custPayBadge}</td>
         <td>${carrPayBadge}</td>
       </tr>`;
@@ -1301,7 +1324,8 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
         <td colspan="5" style="color:#fff;">TOTALS (${orders.length} orders)</td>
         <td style="color:#fff;">${fmt(summary.totalRevenue)}</td>
         <td style="color:#fff;">${fmt(summary.totalCarrierCost)}</td>
-        <td style="color:#fff;">${fmt(summary.grossProfit)}</td>
+        <td style="color:#fff;">${fmt(summary.totalCommission)}</td>
+        <td style="color:#fff;">${fmt(summary.netProfit)}</td>
         <td colspan="2" style="color:#fff;"></td>
       </tr>`;
   } else {

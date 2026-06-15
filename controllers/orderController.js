@@ -137,6 +137,25 @@ function getTenantId(req) {
    return req.tenantId || req.user?.tenantId || null;
 }
 
+// Admin-level order access: sees/acts on every order in the tenant.
+// Never rely on `role` alone — not set on signup users.
+function isPrivilegedOrderUser(req) {
+   const isEmulating = req.isEmulating || req.isSuperAdminUser;
+   return req.user?.role === 3 || req.user?.is_admin === 1 || req.user?.permissions?.includes('subadmin') || isEmulating;
+}
+
+// Mutates a Mongoose criteria object so non-admin users only match their own
+// records (created orders, or assigned orders for drivers). Returns criteria.
+function applyOrderOwnershipScope(req, criteria) {
+   if (!req.user || isPrivilegedOrderUser(req)) return criteria;
+   if (Number(req.user.role) === 0 || req.user?.permissions?.includes('driver')) {
+      criteria.$and = (criteria.$and || []).concat([{ $or: [{ driver: req.user._id }, { drivers: req.user._id }] }]);
+   } else {
+      criteria.created_by = req.user._id;
+   }
+   return criteria;
+}
+
 function normalizeCompanyId(req) {
    const raw = req.user?.company?._id || req.user?.company;
    return raw ? String(raw) : null;
@@ -606,6 +625,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
+      applyOrderOwnershipScope(req, criteria);
       const existingOrder = await Order.findOne(criteria);
       if(!existingOrder) {
          return res.status(404).json({
@@ -1103,11 +1123,14 @@ exports.order_listing_account = catchAsync(async (req, res) => {
          queryObj.order_type = { $in: req.allowedOrderTypes };
       }
 
+      // Non-admin users only see their own orders (mirror order_listing)
+      applyOrderOwnershipScope(req, queryObj);
+
    // Set default sort to serial_no descending if not provided
    if (!req.query.sort) {
       req.query.sort = '-serial_no';
    }
-   
+
    let Query = new APIFeatures(
       Order.find(queryObj)
          .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
@@ -1166,7 +1189,8 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
-      if(req.params.type === 'customer'){ 
+      applyOrderOwnershipScope(req, criteria);
+      if(req.params.type === 'customer'){
             const update = {
                customer_payment_status : status,
                customer_payment_date  : Date.now(),
@@ -1238,6 +1262,7 @@ exports.updateOrderStatus = catchAsync(async (req, res) => {
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
+      applyOrderOwnershipScope(req, criteria);
       const order  = await Order.findOneAndUpdate(criteria, {
          order_status : status,
          updatedAt : Date.now(),
@@ -1284,6 +1309,7 @@ exports.addnote = catchAsync(async (req, res) => {
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
+      applyOrderOwnershipScope(req, criteria);
       const order  = await Order.findOneAndUpdate(criteria, {
          notes : notes,
          updatedAt : Date.now(),
@@ -1524,8 +1550,10 @@ exports.order_detail = catchAsync(async (req, res) => {
    if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
       criteria.order_type = { $in: req.allowedOrderTypes };
    }
+
    const order = await Order.findOne(criteria)
-      .populate(['created_by', 'customer', 'carrier', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
+      .populate({ path: 'created_by', options: { includeInactive: true } })
+      .populate(['customer', 'carrier', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
       .populate('documents_count');
 
     if(!order){
@@ -1535,6 +1563,32 @@ exports.order_detail = catchAsync(async (req, res) => {
          message: "Order not found."
        });
     }
+
+   // Authorize: non-admin users may only view their own records (mirror order_listing).
+   // Never rely on `role` alone — not set on signup users.
+   const isEmulating = req.isEmulating || req.isSuperAdminUser;
+   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || req.user?.permissions?.includes('subadmin') || isEmulating;
+   if (req.user && !isAdminUser) {
+      const uid = String(req.user._id);
+      const isDriverUser = Number(req.user.role) === 0 || req.user?.permissions?.includes('driver');
+      let allowed;
+      if (isDriverUser) {
+         const driverIds = [order.driver, ...(Array.isArray(order.drivers) ? order.drivers : [])]
+            .filter(Boolean).map(d => String(d._id || d));
+         allowed = driverIds.includes(uid);
+      } else {
+         allowed = String(order.created_by?._id || order.created_by) === uid;
+      }
+      if (!allowed) {
+         return res.status(403).json({
+            status: false,
+            forbidden: true,
+            order: null,
+            message: "You don't have permission to view this order."
+         });
+      }
+   }
+
    res.json({
       status: true,
       order: order
@@ -1547,7 +1601,7 @@ exports.order_docs = catchAsync(async (req, res) => {
    if (!tenantId) {
       return res.status(400).json({ status: false, message: "Tenant context is required.", files: [], paymentLogs: [] });
    }
-      const orderCriteria = { _id: id, tenantId };
+      const orderCriteria = applyOrderOwnershipScope(req, { _id: id, tenantId });
 
    const order = await Order.findOne(orderCriteria).select('_id').lean();
    if (!order) {
@@ -2027,8 +2081,11 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
       }
    }
 
-   // Apply created_by filter only for staff users (role === 1) - use strict numeric check
-   if (req.user && Number(req.user.role) === 1) {
+   // Scope payments to own records for non-admin users.
+   // Mirror order_listing: never rely on `role` alone (not set on signup users).
+   const isEmulating = req.isEmulating || req.isSuperAdminUser;
+   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || req.user?.permissions?.includes('subadmin') || isEmulating;
+   if (req.user && !isAdminUser) {
       queryObj.created_by = req.user._id;
    }
 

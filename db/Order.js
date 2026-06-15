@@ -201,7 +201,10 @@ schema.virtual('commission').get(function () {
     const totalAmount = this.total_amount || 0;
     if (this.order_type !== 'outsourcing') return 0;
     const staffCommissionRate = this.created_by?.staff_commision || 0;
-    return totalAmount * (staffCommissionRate / 100);
+    // Commission is calculated on net profit (customer rate - carrier cost), not the total.
+    const carrierAmount = this.carrier_amount || 0;
+    const netProfit = totalAmount - carrierAmount;
+    return netProfit * (staffCommissionRate / 100);
 });
 
 schema.virtual('customer_final_payment_status').get(function () {
@@ -222,8 +225,10 @@ schema.virtual('profit').get(function () {
     }
     const carrierAmount = isOutsourcing ? (this.carrier_amount || 0) : 0;
     const staffCommissionRate = isOutsourcing ? (this.created_by?.staff_commision || 0) : 0;
-    const commission = totalAmount * (staffCommissionRate / 100);
-    const profit = totalAmount - commission - carrierAmount;
+    // Net profit = customer rate - carrier cost. Commission comes out of that net profit.
+    const netProfit = totalAmount - carrierAmount;
+    const commission = netProfit * (staffCommissionRate / 100);
+    const profit = netProfit - commission;
     return profit;
 });
 
