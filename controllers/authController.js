@@ -153,6 +153,9 @@ const editUser = catchAsync(async (req, res, next) => {
       phone: req.body.phone,
       position: req.body.position,
       address: req.body.address,
+      state: req.body.state,
+      city: req.body.city,
+      zipcode: req.body.zipcode,
       permissions: req.body.permissions || [],
       modulesCustomized: false
     };
@@ -240,7 +243,7 @@ const suspandUser = catchAsync(async (req, res, next) => {
 
 const signup = catchAsync(async (req, res, next) => {
   // Extract fields and explicitly exclude privileged fields from body
-  const { permissions, name, email, avatar, password, generateAutoPassword, staff_commision, position, country, phone, address } = req.body;
+  const { permissions, name, email, avatar, password, generateAutoPassword, staff_commision, position, country, phone, address, state, city, zipcode } = req.body;
 
   // Prevent client from injecting privileged fields
   if ('tenantId' in req.body) delete req.body.tenantId;
@@ -328,6 +331,9 @@ const signup = catchAsync(async (req, res, next) => {
       country: country,
       phone: phone,
       address: address,
+      state: state,
+      city: city,
+      zipcode: zipcode,
       company: companyId,
       position: position,
       confirmPassword: generatedPassword,

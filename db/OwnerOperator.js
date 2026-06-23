@@ -39,6 +39,26 @@ const ownerOperatorSchema = new mongoose.Schema(
       default: '',
       trim: true,
     },
+    country: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    state: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    city: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    zipcode: {
+      type: String,
+      default: '',
+      trim: true,
+    },
     status: {
       type: String,
       enum: ['active', 'inactive'],

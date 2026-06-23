@@ -368,7 +368,7 @@ exports.addOwnerOperator = catchAsync(async (req, res, next) => {
     }
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
-    const { fullName, companyName, phone, email, address, notes, status } = req.body;
+    const { fullName, companyName, phone, email, address, country, state, city, zipcode, notes, status } = req.body;
     if (!fullName || !phone || !email) {
       return res.status(400).json({ status: false, message: 'Full name, phone and email are required' });
     }
@@ -390,6 +390,10 @@ exports.addOwnerOperator = catchAsync(async (req, res, next) => {
       phone: String(phone).trim(),
       email: String(email).trim().toLowerCase(),
       address: String(address || '').trim(),
+      country: String(country || '').trim(),
+      state: String(state || '').trim(),
+      city: String(city || '').trim(),
+      zipcode: String(zipcode || '').trim(),
       notes: String(notes || '').trim(),
       status: status === 'inactive' ? 'inactive' : 'active',
       createdBy: req.user?._id,
@@ -435,7 +439,7 @@ exports.updateOwnerOperator = catchAsync(async (req, res, next) => {
     }
     const tenantId = getTenantId(req);
     if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
-    const { fullName, companyName, phone, email, address, notes, status } = req.body;
+    const { fullName, companyName, phone, email, address, country, state, city, zipcode, notes, status } = req.body;
     if (!fullName || !phone || !email) {
       return res.status(400).json({ status: false, message: 'Full name, phone and email are required' });
     }
@@ -456,6 +460,10 @@ exports.updateOwnerOperator = catchAsync(async (req, res, next) => {
         phone: String(phone).trim(),
         email: String(email).trim().toLowerCase(),
         address: String(address || '').trim(),
+        country: String(country || '').trim(),
+        state: String(state || '').trim(),
+        city: String(city || '').trim(),
+        zipcode: String(zipcode || '').trim(),
         notes: String(notes || '').trim(),
         status: status === 'inactive' ? 'inactive' : 'active',
         updatedBy: req.user?._id,

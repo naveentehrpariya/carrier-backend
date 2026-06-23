@@ -80,6 +80,18 @@ const schema = new mongoose.Schema({
         type:String,
         required:[true, 'Please enter your address.'],
     },
+    state: {
+        type:String,
+        default: '',
+    },
+    city: {
+        type:String,
+        default: '',
+    },
+    zipcode: {
+        type:String,
+        default: '',
+    },
 
     permissions: {
         type: [String],

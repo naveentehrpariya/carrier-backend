@@ -26,7 +26,7 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'Tenant context is required' });
     }
     const {
-      name, email, password, country, phone, address,
+      name, email, password, country, phone, address, state, city, zipcode,
       ratePerMile,
       ratePerMileSolo,
       ratePerMileTeam,
@@ -63,6 +63,9 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       country,
       phone,
       address,
+      state,
+      city,
+      zipcode,
       permissions: ['driver'],
       company: companyId,
       position: 'Driver',
@@ -123,7 +126,7 @@ exports.editDriver = catchAsync(async (req, res, next) => {
     const tenantId = req.tenantId || req.user?.tenantId;
     const { id } = req.params;
     const {
-      name, email, country, phone, address,
+      name, email, country, phone, address, state, city, zipcode,
       ratePerMile,
       ratePerMileSolo,
       ratePerMileTeam,
@@ -134,7 +137,7 @@ exports.editDriver = catchAsync(async (req, res, next) => {
 
     const user = await User.findOneAndUpdate(
       { _id: id, tenantId },
-      { name, email, country, phone, address },
+      { name, email, country, phone, address, state, city, zipcode },
       { new: true }
     );
 
