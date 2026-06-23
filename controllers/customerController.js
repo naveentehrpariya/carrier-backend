@@ -72,13 +72,11 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
     }
   }
 
- // Normalize assigned_to to a clean array of ObjectIds, require at least one
+ // Normalize assigned_to to a clean array of ObjectIds. Empty is allowed —
+ // unassigned customers are visible to company users with `regular` permission.
  const assignedToArray = Array.isArray(assigned_to)
    ? assigned_to.filter(Boolean)
    : assigned_to ? [assigned_to] : [];
- if (assignedToArray.length === 0) {
-   return res.status(400).json({ status: false, message: "Please assign at least one staff member to this customer." });
- }
  const result = await Customer.create({
    name: name,
    email: email,
@@ -128,8 +126,19 @@ exports.customers_listing = catchAsync(async (req, res) => {
   if (isAdmin || hasAccounting) {
     // Admin / Subadmin / Accounting → see ALL customers in the tenant
   } else {
-    // Everyone else → only customers they are assigned to
-    queryObj.assigned_to = req.user._id;
+    // Everyone else → customers assigned to them, PLUS unassigned customers in
+    // their own company if they have the `regular` orders permission.
+    const visibility = [{ assigned_to: req.user._id }];
+    if (perms.includes('regular')) {
+      const myCompany = req.user?.company?._id || req.user?.company || null;
+      if (myCompany) {
+        visibility.push({
+          company: myCompany,
+          $or: [{ assigned_to: { $size: 0 } }, { assigned_to: { $exists: false } }],
+        });
+      }
+    }
+    queryObj.$or = visibility;
   }
 
   if (search && search.length >1) {
@@ -171,8 +180,19 @@ exports.customerDetails = catchAsync(async (req, res, next) => {
   const isAdminDet = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || permsD.includes('subadmin');
   const hasAccountingDet = permsD.includes('accounting');
   if (!isAdminDet && !hasAccountingDet) {
-    // Non-admin/accounting users can only see customers they are assigned to
-    criteria.assigned_to = req.user._id;
+    // Assigned customers, plus unassigned ones in their company if they hold
+    // the `regular` orders permission (mirrors listing visibility).
+    const visibilityDet = [{ assigned_to: req.user._id }];
+    if (permsD.includes('regular')) {
+      const myCompanyDet = req.user?.company?._id || req.user?.company || null;
+      if (myCompanyDet) {
+        visibilityDet.push({
+          company: myCompanyDet,
+          $or: [{ assigned_to: { $size: 0 } }, { assigned_to: { $exists: false } }],
+        });
+      }
+    }
+    criteria.$or = visibilityDet;
   }
 
   const customer = await Customer.findOne(criteria).populate('assigned_to', '_id name email phone role is_admin');
@@ -237,9 +257,6 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
   const assignedToArrayUpd = Array.isArray(assigned_to)
     ? assigned_to.filter(Boolean)
     : assigned_to ? [assigned_to] : [];
-  if (assignedToArrayUpd.length === 0) {
-    return res.status(400).json({ status: false, message: "Please assign at least one staff member to this customer." });
-  }
   const updatedUser = await Customer.findOneAndUpdate(updateQuery, {
     name: name,
     email: email,
