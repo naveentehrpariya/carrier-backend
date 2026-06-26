@@ -953,9 +953,25 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
 
    let browser = null;
    try {
-      let { html, filename, logoBase64: clientLogoBase64 } = req.body;
+      let { html, filename, logoBase64: clientLogoBase64, docType } = req.body;
       if (!html) {
          return res.status(400).json({ status: false, message: 'HTML content is required' });
+      }
+
+      // Invoice downloads are gated by the `invoices` permission. Admin/sub-admin/accounting
+      // are always allowed. Frontend hiding is not enough — enforce here too.
+      if (docType === 'invoice') {
+         const u = req.user || {};
+         const perms = Array.isArray(u.permissions) ? u.permissions : [];
+         const canDownloadInvoice =
+            u.is_admin === 1 ||
+            Number(u.role) === 3 ||
+            perms.includes('invoices') ||
+            perms.includes('subadmin') ||
+            perms.includes('accounting');
+         if (!canDownloadInvoice) {
+            return res.status(403).json({ status: false, message: 'You do not have permission to download invoices' });
+         }
       }
 
       // 1. Use client-provided base64 logo if available (most reliable — already loaded in browser)

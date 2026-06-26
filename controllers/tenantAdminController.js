@@ -586,7 +586,7 @@ const updateUserModules = catchAsync(async (req, res, next) => {
   }
 
   // All assignable permissions — order modules + feature areas
-  const VALID_PERMISSIONS = ['outsourcing', 'regular', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin'];
+  const VALID_PERMISSIONS = ['outsourcing', 'regular', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin', 'invoices'];
   const requested = raw
     .map((m) => String(m).toLowerCase().trim())
     .filter((m) => VALID_PERMISSIONS.includes(m));
@@ -700,9 +700,9 @@ const inviteUser = catchAsync(async (req, res, next) => {
   // Default permissions by role — read-only by default, admin manually grants write
   const DEFAULT_PERMISSIONS_BY_ROLE = {
     0: ['driver'],
-    1: ['regular', 'outsourcing', 'customers', 'carriers'],
-    2: ['accounting', 'customers', 'carriers'],
-    3: ['regular', 'outsourcing', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin'],
+    1: ['regular', 'outsourcing', 'customers', 'carriers', 'invoices'],
+    2: ['accounting', 'customers', 'carriers', 'invoices'],
+    3: ['regular', 'outsourcing', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin', 'invoices'],
   };
   const defaultPermissions = DEFAULT_PERMISSIONS_BY_ROLE[parseInt(role)] || [];
 
