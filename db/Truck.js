@@ -8,6 +8,7 @@ const truckSchema = new mongoose.Schema({
   },
   company: { type: mongoose.Schema.Types.ObjectId, ref: 'companies' },
   plateNumber: { type: String, required: true },
+  truckNumber: { type: String },
   unitNumber: { type: String },
   make: { type: String },
   model: { type: String },

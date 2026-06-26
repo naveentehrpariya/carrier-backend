@@ -150,10 +150,10 @@ exports.globalSearch = async (req, res) => {
         ...baseCompany,
         $and: [
           { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
-          ...tokenRegexes.map((r) => ({ $or: [{ plateNumber: r }, { unitNumber: r }, { vin: r }, { make: r }, { model: r }] }))
+          ...tokenRegexes.map((r) => ({ $or: [{ plateNumber: r }, { truckNumber: r }, { unitNumber: r }, { vin: r }, { make: r }, { model: r }] }))
         ]
       })
-        .select('_id plateNumber unitNumber vin make model year')
+        .select('_id plateNumber truckNumber unitNumber vin make model year')
         .sort({ createdAt: -1 })
         .limit(limit)
         .lean() : Promise.resolve([])),

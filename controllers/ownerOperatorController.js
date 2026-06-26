@@ -425,7 +425,43 @@ exports.ownerOperatorDetail = catchAsync(async (req, res, next) => {
     if (companyId) filter.company = companyId;
     const ownerOperator = await OwnerOperator.findOne(filter).lean();
     if (!ownerOperator) return res.status(404).json({ status: false, message: 'Owner operator not found' });
-    return res.json({ status: true, ownerOperator });
+
+    // Trucks linked to this owner operator
+    const trucks = await Truck.find({
+      tenantId,
+      ownerOperator: ownerOperator._id,
+      ...normalizeDeletedFilter(),
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Orders involving this owner operator: explicitly linked (owner-operated order flow),
+    // OR order-level truck is one of this owner's trucks, OR a trip segment uses the truck.
+    const truckIds = trucks.map((t) => t._id).filter(Boolean);
+    let tripOrderIds = [];
+    if (truckIds.length) {
+      tripOrderIds = await Trip.distinct('order', {
+        tenantId,
+        truck: { $in: truckIds },
+        deletedAt: null,
+      });
+    }
+    const orders = await Order.find({
+      tenantId,
+      ...normalizeDeletedFilter(),
+      $or: [
+        { ownerOperator: ownerOperator._id },
+        ...(truckIds.length ? [{ truck: { $in: truckIds } }] : []),
+        ...(tripOrderIds.length ? [{ _id: { $in: tripOrderIds } }] : []),
+      ],
+    })
+      .select('serial_no order_status order_type total_amount settle_amount owner_profit input_total_amount input_currency revenue_currency createdAt pickup_date delivery_date customer truck shipping_details')
+      .populate('customer', 'name company_name')
+      .populate('truck', 'make model truckNumber unitNumber plateNumber')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    return res.json({ status: true, ownerOperator, trucks, orders });
   } catch (err) {
     JSONerror(res, err, next);
     logger(err);

@@ -256,7 +256,7 @@ async function generateUniqueSerialNumber(tenantId) {
    }
 }
 
-async function resolveRegularOrderOwnerContext({ tenantId, truckId, totalAmount, settleAmount, driverAssignmentMode }) {
+async function resolveRegularOrderOwnerContext({ tenantId, truckId, totalAmount, settleAmount, driverAssignmentMode, allowMissingTruck = false }) {
    const ctx = {
       isOwnerOperatedTruck: false,
       ownerOperator: null,
@@ -274,6 +274,12 @@ async function resolveRegularOrderOwnerContext({ tenantId, truckId, totalAmount,
       $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }]
    }).populate('ownerOperator', 'status fullName');
    if (!truck) {
+      // On edit, a stored truck ref may be stale (truck deleted/cross-tenant). Don't block
+      // the whole order update — treat it as no truck so the order can still be saved.
+      if (allowMissingTruck) {
+         ctx.truckCleared = true;
+         return ctx;
+      }
       throw new Error('Selected truck not found');
    }
 
@@ -680,7 +686,9 @@ exports.update_order = catchAsync(async (req, res, next) => {
 
       const nextOrderType = existingOrder.order_type;
       if (nextOrderType === 'regular') {
-         const nextTruck = updateData.truck || existingOrder.truck;
+         // Respect explicit truck from the request (including an intentional clear to null).
+         // Only fall back to the stored value when the client didn't send the field at all.
+         const nextTruck = ('truck' in updateData) ? updateData.truck : existingOrder.truck;
          const nextTotalAmount = ('total_amount' in updateData) ? updateData.total_amount : existingOrder.total_amount;
          const nextSettle = ('settle_amount' in updateData) ? updateData.settle_amount : existingOrder.settle_amount;
          const nextDriverMode = updateData.driver_assignment_mode || existingOrder.driver_assignment_mode;
@@ -689,8 +697,12 @@ exports.update_order = catchAsync(async (req, res, next) => {
             truckId: nextTruck,
             totalAmount: nextTotalAmount,
             settleAmount: nextSettle,
-            driverAssignmentMode: nextDriverMode
+            driverAssignmentMode: nextDriverMode,
+            allowMissingTruck: true
          });
+         if (ownerContext.truckCleared) {
+            updateData.truck = null;
+         }
          updateData.isOwnerOperatedTruck = ownerContext.isOwnerOperatedTruck;
          updateData.ownerOperator = ownerContext.ownerOperator;
          updateData.settle_amount = Number(ownerContext.settle_amount || 0);

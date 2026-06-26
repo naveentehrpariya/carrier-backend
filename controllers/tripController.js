@@ -179,6 +179,19 @@ exports.splitOrder = async (req, res) => {
             createdTrips.push(trip);
         }
 
+        // Keep the order as source of truth for the edit form: sync the first trip's
+        // assets back onto the order (trip planning is where regular orders get assigned).
+        if (order.order_type === 'regular' && segments.length > 0) {
+            const base = segments[0];
+            const baseDrivers = Array.isArray(base.drivers) ? base.drivers.filter(Boolean) : [];
+            const baseDriver = base.driver || baseDrivers[0] || null;
+            order.truck = base.truck || null;
+            order.trailer = base.trailer || null;
+            order.drivers = baseDrivers;
+            order.driver = baseDriver;
+            await order.save();
+        }
+
         logActivity(req, {
             action: 'UPDATE',
             module: 'order',

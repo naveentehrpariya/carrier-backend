@@ -22,6 +22,7 @@ exports.addTruck = catchAsync(async (req, res, next) => {
     if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
     const {
       plateNumber,
+      truckNumber,
       unitNumber,
       make,
       model,
@@ -56,7 +57,7 @@ exports.addTruck = catchAsync(async (req, res, next) => {
     const truck = await Truck.create({
       tenantId,
       company: req.user?.company ? req.user.company._id : null,
-      plateNumber, unitNumber, make, model, year, vin, capacity, notes,
+      plateNumber, truckNumber, unitNumber, make, model, year, vin, capacity, notes,
       insuranceMonthly: Number(insuranceMonthly || 0),
       parkingMonthly: Number(parkingMonthly || 0),
       ownerOperated: isOwnerOperated,
