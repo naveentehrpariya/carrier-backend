@@ -1,8 +1,24 @@
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
+const { isSubscriptionActive } = require('../utils/subscription');
 
 const valid = ['outsourcing', 'regular'];
+
+/**
+ * Blocks the action unless the tenant has a live subscription (bought + not expired).
+ * Used on order creation. Super admin bypasses. Returns a stable error code the
+ * frontend uses to show the "billing expired / no plan" banner.
+ */
+const requireActiveSubscription = catchAsync(async (req, res, next) => {
+  if (req.isSuperAdminUser || req.user?.permissions?.includes('super_admin')) return next();
+  if (isSubscriptionActive(req.tenant)) return next();
+  return res.status(403).json({
+    status: false,
+    error: 'subscription_inactive',
+    message: 'Your company has no active subscription. Please contact your administrator to activate billing.'
+  });
+});
 
 const resolvePlanModules = async (req) => {
   const fromTenant = req.tenant?.subscription?.allowedModules;
@@ -98,9 +114,21 @@ const requireModuleAccess = (moduleKey, extraPerms = []) => {
     const requested = String(moduleKey || '').toLowerCase();
     if (!valid.includes(requested)) return next(new AppError('Invalid module access configuration.', 500));
 
+    // Platform super admin always bypasses.
+    if (req.isSuperAdminUser || req.user?.permissions?.includes('super_admin')) return next();
+
+    // Gate 1 (plan-level): the module must be part of the tenant's PLAN.
+    // Applies to everyone in the tenant — admin included — so a plan without a
+    // module fully disables it, not just order creation.
+    const planModulesRaw = await resolvePlanModules(req);
+    const planModules = planModulesRaw.length ? planModulesRaw : [...valid]; // backward-compat
+    if (!planModules.includes(requested)) {
+      return next(new AppError(`Module "${requested}" is not included in this company's plan.`, 403));
+    }
+
     const perms = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
 
-    // Admin / sub-admin always has full access
+    // Gate 2 (per-user): within an enabled module, admin / sub-admin has full access.
     if (req.user?.is_admin === 1 || Number(req.user?.role) === 3 || perms.includes('subadmin')) return next();
 
     // User has the module itself, or an explicitly-allowed feature permission
@@ -120,5 +148,6 @@ const requireModuleAccess = (moduleKey, extraPerms = []) => {
 module.exports = {
   resolveAllowedModulesMiddleware,
   checkOrderModuleAccess,
-  requireModuleAccess
+  requireModuleAccess,
+  requireActiveSubscription
 };

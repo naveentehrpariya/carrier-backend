@@ -1,5 +1,6 @@
 const Tenant = require('../db/Tenant');
 const catchAsync = require('../utils/catchAsync');
+const { isSubscriptionActive } = require('../utils/subscription');
 
 /**
  * Middleware to resolve tenant from subdomain or domain
@@ -93,21 +94,12 @@ const tenantResolver = catchAsync(async (req, res, next) => {
         });
       }
       
-      // Check if tenant subscription is active and not expired
-      if (
-        !tenant.subscription ||
-        tenant.subscription.status !== 'active'
-      ) {
-        console.log(`❌ Inactive subscription for tenant: ${subdomain}`);
-        return res.status(403).json({
-          status: false,
-          error: 'subscription_inactive',
-          message: 'Company subscription is inactive'
-        });
-      }
-      
+      // NOTE: subscription state no longer blocks tenant resolution — the admin must be
+      // able to log in and BUY/RENEW a plan when there is none/expired. Order creation is
+      // gated separately (see requireActiveSubscription). We just attach the live state.
       req.tenant = tenant;
       req.tenantId = tenant.tenantId;
+      req.subscriptionActive = isSubscriptionActive(tenant);
       
       // Update last activity
       Tenant.findByIdAndUpdate(tenant._id, { 

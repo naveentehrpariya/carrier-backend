@@ -46,6 +46,26 @@ const subscriptionPlanSchema = new mongoose.Schema({
     enum: ['outsourcing', 'regular'],
     default: ['outsourcing', 'regular']
   },
+
+  // Pricing. Base price is the monthly amount; quarterly/yearly are derived from it
+  // (months * monthlyPrice) then reduced by the matching cycle discount percentage.
+  monthlyPrice: {
+    type: Number,
+    default: 0,
+    min: [0, 'Price cannot be negative']
+  },
+  currency: {
+    type: String,
+    default: 'USD',
+    uppercase: true,
+    trim: true
+  },
+  // Percentage off per billing cycle (0-100). monthly usually 0.
+  discounts: {
+    monthly: { type: Number, default: 0, min: 0, max: 100 },
+    quarterly: { type: Number, default: 0, min: 0, max: 100 },
+    yearly: { type: Number, default: 0, min: 0, max: 100 }
+  },
   features: {
     type: [String],
     required: true,

@@ -10,6 +10,8 @@ const Company = require('../db/Company');
 const Order = require('../db/Order');
 const Customer = require('../db/Customer');
 const Carrier = require('../db/Carrier');
+const SubscriptionHistory = require('../db/SubscriptionHistory');
+const { effectiveStatus } = require('../utils/subscription');
 const { generateTenantUrl } = require('../middleware/tenantResolver');
 const bcrypt = require('bcrypt');
 const mongoose = require('mongoose');
@@ -61,6 +63,12 @@ const getTenants = catchAsync(async (req, res, next) => {
           orders: orderCount,
           customers: customerCount,
           carriers: carrierCount
+        },
+        billing: {
+          status: effectiveStatus(tenant), // none/active/expired (lazy)
+          planSlug: tenant.subscription?.planSlug || null,
+          billingCycle: tenant.subscription?.billingCycle || null,
+          endDate: tenant.subscription?.endDate || null
         },
         url: generateTenantUrl(tenant.subdomain)
       };
@@ -174,67 +182,34 @@ const createTenant = catchAsync(async (req, res, next) => {
   // Debug: Log the incoming request data
   console.log('🔍 DEBUG - Incoming request body:', JSON.stringify(req.body, null, 2));
   
-  // Handle subscription plan - support both old and new formats
-  let subscriptionPlan = null;
-  let subscriptionData = {};
-  
-  if (subscriptionPlanId) {
-    // New format - using subscription plan ID
-    subscriptionPlan = await SubscriptionPlan.findById(subscriptionPlanId);
-    if (!subscriptionPlan || !subscriptionPlan.isActive) {
-      return next(new AppError('Invalid or inactive subscription plan', 400));
-    }
-    
-    subscriptionData = {
-      plan: subscriptionPlan._id, // ObjectId
-      planSlug: subscriptionPlan.slug,
-      status: 'active',
-      startDate: new Date(),
-      billingCycle: billingCycle,
-      planLimits: {
-        maxUsers: subscriptionPlan.limits.maxUsers,
-        maxOrders: subscriptionPlan.limits.maxOrders,
-        maxCustomers: subscriptionPlan.limits.maxCustomers,
-        maxCarriers: subscriptionPlan.limits.maxCarriers
-      },
-      planFeatures: subscriptionPlan.features,
-      allowedModules: Array.isArray(subscriptionPlan.allowedModules) && subscriptionPlan.allowedModules.length > 0
-        ? subscriptionPlan.allowedModules
-        : []
-    };
-  } else if (subscription?.plan) {
-    // Old format - using string plan name (now supported by Mixed type)
-    subscriptionData = {
-      plan: subscription.plan, // String (now allowed by Mixed type)
-      legacyPlan: subscription.plan, // Also store in legacy field
-      status: subscription.status || 'active',
-      startDate: new Date(),
-      billingCycle: subscription.billingCycle || billingCycle,
-      planLimits: {
-        maxUsers: settings?.maxUsers || 10,
-        maxOrders: settings?.maxOrders || 1000,
-        maxCustomers: settings?.maxCustomers || 1000,
-        maxCarriers: settings?.maxCarriers || 500
-      },
-      planFeatures: settings?.features || ['orders', 'customers', 'carriers', 'basic_reporting']
-    };
-  } else {
-    // Default fallback
-    subscriptionData = {
-      plan: 'basic', // String default
-      legacyPlan: 'basic',
-      status: 'active',
-      startDate: new Date(),
-      billingCycle: billingCycle,
-      planLimits: {
-        maxUsers: 10,
-        maxOrders: 1000,
-        maxCustomers: 1000,
-        maxCarriers: 500
-      },
-      planFeatures: ['orders', 'customers', 'carriers', 'basic_reporting']
-    };
-  }
+  // New tenants start WITHOUT a subscription (status 'none'). The tenant admin buys a
+  // plan after logging in (mock checkout); order creation is blocked until then. Modules
+  // default to both so the admin can set up the company; once a plan is bought, modules
+  // lock to that plan (see the checkout flow / migration).
+  const subscriptionData = {
+    status: 'none',
+    startDate: new Date(),
+    billingCycle: 'monthly',
+    planLimits: { maxUsers: 10, maxOrders: 1000, maxCustomers: 1000, maxCarriers: 500 },
+    planFeatures: ['orders', 'customers', 'carriers', 'basic_reporting'],
+    allowedModules: ['outsourcing', 'regular']
+  };
+
+  // Resolve the modules this plan enables (trucking=regular, carriers=outsourcing).
+  // The tenant — including its admin — can only use modules its plan includes.
+  const validModules = ['outsourcing', 'regular'];
+  const planModules = (
+    Array.isArray(subscriptionData.allowedModules) && subscriptionData.allowedModules.length
+      ? subscriptionData.allowedModules
+      : validModules
+  ).map((m) => String(m).toLowerCase()).filter((m) => validModules.includes(m));
+  // Persist on the tenant subscription so plan gating resolves without a plan lookup.
+  subscriptionData.allowedModules = planModules;
+
+  // Admin permissions: feature perms always, module perms only if the plan includes them.
+  const adminPermissions = ['accounting', 'customers', 'customers_write', 'employees', 'subadmin'];
+  if (planModules.includes('regular')) adminPermissions.push('regular');
+  if (planModules.includes('outsourcing')) adminPermissions.push('outsourcing', 'carriers', 'carriers_write');
 
   // Generate tenant ID based on subdomain (domain-based naming)
   const tenantId = subdomain;
@@ -320,7 +295,13 @@ Cross-border shipments require custom stamps or deductions may apply.`
       country: 'USA',
       address: contactInfo.address || 'N/A',
       is_admin: 1,
-      permissions: ['regular', 'outsourcing', 'accounting', 'customers', 'customers_write', 'carriers', 'carriers_write', 'employees', 'subadmin'],
+      role: 3,                 // required by tenant-admin auth gate (auth.js: !isTenantAdmin && role!==3)
+      isTenantAdmin: true,     // grants access to /api/tenant-admin/* (manage company, employees, finance)
+      // NOTE: no 'invoices' perm — admin downloads invoices via role=3/is_admin gate already.
+      // Plain employees do NOT get 'invoices' by default; tenant admin grants it manually.
+      // Module perms (regular/outsourcing/carriers) follow the plan — see adminPermissions above.
+      permissions: adminPermissions,
+      allowedModules: planModules,
       position: 'Administrator',
       corporateID: `ADMIN_${Date.now()}`
     });
@@ -1070,6 +1051,8 @@ const getTenantSubscriptionDetails = catchAsync(async (req, res, next) => {
     }
   }
   
+  const history = await SubscriptionHistory.find({ tenantId }).sort({ createdAt: -1 }).limit(100).lean();
+
   res.json({
     status: true,
     data: {
@@ -1079,16 +1062,19 @@ const getTenantSubscriptionDetails = catchAsync(async (req, res, next) => {
         status: tenant.status
       },
       currentSubscription: {
-        planName: subscriptionPlan?.name || tenant.subscription.legacyPlan || 'Unknown',
+        planName: subscriptionPlan?.name || tenant.subscription.legacyPlan || (tenant.subscription.status === 'none' ? 'No plan' : 'Unknown'),
         planSlug: subscriptionPlan?.slug || tenant.subscription.planSlug,
-        status: tenant.subscription.status,
+        status: effectiveStatus(tenant),
         billingCycle: tenant.subscription.billingCycle,
+        startDate: tenant.subscription.startDate,
+        endDate: tenant.subscription.endDate,
         limits: subscriptionPlan?.limits || tenant.subscription.planLimits,
         features: subscriptionPlan?.features || tenant.subscription.planFeatures || [],
         allowedModules: subscriptionPlan?.allowedModules || tenant.subscription.allowedModules || ['outsourcing', 'regular']
       },
       usage,
-      availablePlans
+      availablePlans,
+      history
     }
   });
 });

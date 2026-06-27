@@ -9,9 +9,11 @@ const Order = require('../db/Order');
 const Customer = require('../db/Customer');
 const Carrier = require('../db/Carrier');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
+const SubscriptionHistory = require('../db/SubscriptionHistory');
 const bcrypt = require('bcrypt');
 const { getTenantUsageSummary } = require('../middlewares/planLimitsMiddleware');
 const { logActivity } = require('../utils/activityLogger');
+const { computeCyclePrice, priceMatrix, computeEndDate, effectiveStatus, isSubscriptionActive, currentOrderPeriod } = require('../utils/subscription');
 
 /**
  * Get tenant information
@@ -55,12 +57,13 @@ const getSubscriptionDetails = catchAsync(async (req, res, next) => {
     });
   }
 
-  // Get current usage for limit calculations
+  // Only ORDERS are metered per month. `users` is a total active-seat count.
+  const orderPeriod = currentOrderPeriod(tenant);
+  const notDeleted = { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
+
   const usage = {
     users: await User.countDocuments(User.activeFilter(req.tenantId)),
-    orders: await Order.countDocuments({ tenantId: req.tenantId }),
-    customers: await Customer.countDocuments({ tenantId: req.tenantId }),
-    carriers: await Carrier.countDocuments({ tenantId: req.tenantId })
+    orders: await Order.countDocuments({ tenantId: req.tenantId, ...notDeleted, createdAt: { $gte: orderPeriod.start, $lt: orderPeriod.end } })
   };
 
   // Determine plan limits and features from subscription plan or defaults
@@ -74,46 +77,37 @@ const getSubscriptionDetails = catchAsync(async (req, res, next) => {
   const planFeatures = subscriptionPlan?.features || tenant.subscription.planFeatures || 
     tenant.settings?.features || ['orders', 'customers', 'carriers', 'basic_reporting'];
 
+  // limit 0 == unlimited (per planLimitsMiddleware). pct null when unlimited or no plan.
+  const pct = (cur, lim) => (lim && lim > 0 ? Math.round((cur / lim) * 100) : null);
+  const status = effectiveStatus(tenant);       // lazy expiry
+  const active = isSubscriptionActive(tenant);
+  const hasPlan = !!(subscriptionPlan || tenant.subscription.planSlug || tenant.subscription.plan);
+
   const subscriptionInfo = {
-    status: tenant.subscription.status || 'active',
+    status,
+    hasPlan,
     startDate: tenant.subscription.startDate,
     endDate: tenant.subscription.endDate,
     billingCycle: tenant.subscription.billingCycle || 'monthly',
-    planName: subscriptionPlan?.name || tenant.subscription.legacyPlan || 
-               (typeof tenant.subscription.plan === 'string' ? tenant.subscription.plan : 'Basic'),
+    planName: subscriptionPlan?.name || tenant.subscription.legacyPlan ||
+               (typeof tenant.subscription.plan === 'string' ? tenant.subscription.plan : (hasPlan ? 'Plan' : 'No plan')),
     planSlug: subscriptionPlan?.slug || tenant.subscription.planSlug,
-    planDescription: subscriptionPlan?.description || 'Standard logistics management features',
+    planDescription: subscriptionPlan?.description || (hasPlan ? '' : 'No subscription yet — choose a plan to get started.'),
+    monthlyPrice: subscriptionPlan?.monthlyPrice ?? null,
+    currency: subscriptionPlan?.currency || 'USD',
+    allowedModules: tenant.subscription.allowedModules || [],
     planLimits,
     planFeatures,
-    isActive: tenant.subscription.status === 'active',
-    daysUntilRenewal: tenant.subscription.endDate ? 
+    isActive: active,
+    daysUntilRenewal: tenant.subscription.endDate ?
       Math.ceil((new Date(tenant.subscription.endDate) - new Date()) / (1000 * 60 * 60 * 24)) : null,
     usage: {
-      users: {
-        current: usage.users,
-        limit: planLimits.maxUsers,
-        percentage: Math.round((usage.users / planLimits.maxUsers) * 100)
-      },
-      orders: {
-        current: usage.orders,
-        limit: planLimits.maxOrders,
-        percentage: Math.round((usage.orders / planLimits.maxOrders) * 100)
-      },
-      customers: {
-        current: usage.customers,
-        limit: planLimits.maxCustomers,
-        percentage: Math.round((usage.customers / planLimits.maxCustomers) * 100)
-      },
-      carriers: {
-        current: usage.carriers,
-        limit: planLimits.maxCarriers,
-        percentage: Math.round((usage.carriers / planLimits.maxCarriers) * 100)
-      }
-    }
+      users: { current: usage.users, limit: planLimits.maxUsers, percentage: pct(usage.users, planLimits.maxUsers) },
+      orders: { current: usage.orders, limit: planLimits.maxOrders, percentage: pct(usage.orders, planLimits.maxOrders), monthly: true, resetDate: orderPeriod.end }
+    },
+    orderResetDate: orderPeriod.end
   };
 
-  console.log('📊 Returning subscription info:', JSON.stringify(subscriptionInfo, null, 2));
-  
   res.json({
     status: true,
     data: {
@@ -527,6 +521,165 @@ const upgradePlan = catchAsync(async (req, res, next) => {
     data: { tenant },
     message: `Successfully upgraded to ${newPlan.name} plan`
   });
+});
+
+const MODULE_VALID = ['outsourcing', 'regular'];
+const OUTSOURCING_PERMS = ['outsourcing', 'carriers', 'carriers_write'];
+
+// Re-sync an admin's module permissions + allowedModules to the plan's modules.
+// Feature perms (accounting/customers/employees/subadmin/invoices…) are preserved.
+function adminPermsForPlan(currentPerms, planModules) {
+  let next = (Array.isArray(currentPerms) ? currentPerms : []).slice();
+  if (planModules.includes('regular')) { if (!next.includes('regular')) next.push('regular'); }
+  else next = next.filter((p) => p !== 'regular');
+  if (planModules.includes('outsourcing')) OUTSOURCING_PERMS.forEach((p) => { if (!next.includes(p)) next.push(p); });
+  else next = next.filter((p) => !OUTSOURCING_PERMS.includes(p));
+  return next;
+}
+
+/**
+ * Public catalog of buyable plans, with the price for each billing cycle.
+ * GET /api/tenant-admin/subscription/plans
+ */
+const getPlansCatalog = catchAsync(async (req, res) => {
+  const plans = await SubscriptionPlan.find({ isActive: true }).sort({ monthlyPrice: 1 }).lean();
+  const data = plans.map((p) => ({
+    _id: p._id,
+    name: p.name,
+    slug: p.slug,
+    description: p.description,
+    monthlyPrice: p.monthlyPrice || 0,
+    currency: p.currency || 'USD',
+    discounts: p.discounts || { monthly: 0, quarterly: 0, yearly: 0 },
+    limits: p.limits,
+    allowedModules: p.allowedModules || [],
+    features: p.features || [],
+    pricing: priceMatrix(p) // [{cycle, months, base, discountPct, price, currency}]
+  }));
+  res.json({ status: true, data: { plans: data } });
+});
+
+/**
+ * Mock checkout: buy or renew a plan for the current tenant. No real payment.
+ * POST /api/tenant-admin/subscription/checkout  { planSlug, billingCycle }
+ */
+const checkoutSubscription = catchAsync(async (req, res, next) => {
+  const { planSlug, billingCycle = 'monthly' } = req.body;
+  const cycle = String(billingCycle).toLowerCase();
+  if (!['monthly', 'quarterly', 'yearly'].includes(cycle)) {
+    return next(new AppError('Invalid billing cycle', 400));
+  }
+
+  const plan = await SubscriptionPlan.findOne({ slug: planSlug, isActive: true });
+  if (!plan) return next(new AppError('Subscription plan not found', 404));
+
+  const tenant = await Tenant.findOne({ tenantId: req.tenantId });
+  if (!tenant) return next(new AppError('Tenant not found', 404));
+
+  const { price, discountPct, currency } = computeCyclePrice(plan, cycle);
+  const startDate = new Date();
+  const endDate = computeEndDate(startDate, cycle);
+  const planModules = (plan.allowedModules || MODULE_VALID)
+    .map((m) => String(m).toLowerCase()).filter((m) => MODULE_VALID.includes(m));
+
+  // Decide the action label for history.
+  const wasActive = isSubscriptionActive(tenant);
+  const prevSlug = tenant.subscription?.planSlug;
+  const action = !wasActive ? 'buy' : (prevSlug === plan.slug ? 'renew' : 'upgrade');
+
+  // Apply the subscription via a targeted update. We intentionally do NOT use
+  // tenant.save() — that would run full-document validation and fail on unrelated
+  // legacy fields (e.g. a missing/invalid contactInfo on older tenants).
+  await Tenant.updateOne(
+    { tenantId: req.tenantId },
+    {
+      $set: {
+        'subscription.plan': plan._id,
+        'subscription.planSlug': plan.slug,
+        'subscription.status': 'active',
+        'subscription.startDate': startDate,
+        'subscription.endDate': endDate,
+        'subscription.billingCycle': cycle,
+        'subscription.planLimits': {
+          maxUsers: plan.limits.maxUsers,
+          maxOrders: plan.limits.maxOrders,
+          maxCustomers: plan.limits.maxCustomers,
+          maxCarriers: plan.limits.maxCarriers
+        },
+        'subscription.planFeatures': plan.features,
+        'subscription.allowedModules': planModules,
+        'settings.maxUsers': plan.limits.maxUsers,
+        'settings.maxOrders': plan.limits.maxOrders,
+        'settings.features': plan.features
+      },
+      $unset: { 'subscription.legacyPlan': '' }
+    }
+  );
+
+  // Re-sync tenant admins so module access matches the new plan.
+  const admins = await User.find({ tenantId: req.tenantId, $or: [{ is_admin: 1 }, { role: 3 }] });
+  for (const admin of admins) {
+    admin.permissions = adminPermsForPlan(admin.permissions, planModules);
+    admin.allowedModules = planModules;
+    await admin.save();
+  }
+
+  // Record history (mock payment).
+  const paymentRef = `MOCK-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  await SubscriptionHistory.create({
+    tenantId: req.tenantId,
+    action,
+    plan: plan._id,
+    planSlug: plan.slug,
+    planName: plan.name,
+    billingCycle: cycle,
+    amount: price,
+    currency,
+    discountPct,
+    startDate,
+    endDate,
+    paymentStatus: price > 0 ? 'paid' : 'free',
+    paymentRef,
+    performedBy: req.user?._id,
+    performedByName: req.user?.name,
+    note: `${action} ${plan.name} (${cycle})`
+  });
+
+  logActivity(req, {
+    action: 'UPDATE',
+    module: 'settings',
+    description: `${action === 'buy' ? 'Purchased' : action === 'renew' ? 'Renewed' : 'Changed to'} "${plan.name}" plan (${cycle})`,
+    resourceId: tenant._id,
+    resourceName: plan.name,
+    details: { planSlug: plan.slug, billingCycle: cycle, amount: price },
+  });
+
+  res.json({
+    status: true,
+    message: `Subscription ${action === 'buy' ? 'activated' : action === 'renew' ? 'renewed' : 'updated'} — ${plan.name} (${cycle}).`,
+    data: {
+      planName: plan.name,
+      planSlug: plan.slug,
+      billingCycle: cycle,
+      amount: price,
+      currency,
+      startDate,
+      endDate,
+      paymentRef
+    }
+  });
+});
+
+/**
+ * Subscription purchase history for the current tenant.
+ * GET /api/tenant-admin/subscription/history
+ */
+const getSubscriptionHistory = catchAsync(async (req, res) => {
+  const history = await SubscriptionHistory.find({ tenantId: req.tenantId })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .lean();
+  res.json({ status: true, data: { history } });
 });
 
 /**
@@ -1528,6 +1681,9 @@ module.exports = {
   getTenantAnalytics,
   getBillingInfo,
   upgradePlan,
+  getPlansCatalog,
+  checkoutSubscription,
+  getSubscriptionHistory,
   getTenantUsers,
   inviteUser,
   updateUserModules,

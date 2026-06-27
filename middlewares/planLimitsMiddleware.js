@@ -6,6 +6,28 @@ const Customer = require('../db/Customer');
 const Carrier = require('../db/Carrier');
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
+const { currentOrderPeriod } = require('../utils/subscription');
+
+// Only ORDERS are metered per month. Everything else that has a plan number
+// (users = team seats) is a TOTAL limit. Customers/carriers/fleet are NOT capped
+// (master data — capping them has no product value).
+const MONTHLY_RESOURCES = new Set(['orders']);
+const RESOURCE_LABEL = { orders: 'order', users: 'user', customers: 'customer', carriers: 'carrier' };
+
+// Build the count query + model + plan-limit key for a resource type.
+function resolveResource(resourceType, req, period) {
+  const base = { tenantId: req.tenantId, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
+  if (MONTHLY_RESOURCES.has(resourceType) && period) {
+    base.createdAt = { $gte: period.start, $lt: period.end };
+  }
+  switch (resourceType) {
+    case 'users': return { model: User, query: { ...base, status: { $ne: 'inactive' } }, limitKey: 'maxUsers' };
+    case 'orders': return { model: Order, query: base, limitKey: 'maxOrders' };
+    case 'customers': return { model: Customer, query: base, limitKey: 'maxCustomers' };
+    case 'carriers': return { model: Carrier, query: base, limitKey: 'maxCarriers' };
+    default: return null;
+  }
+}
 
 /**
  * Check if tenant can create more resources based on their plan limits
@@ -53,8 +75,8 @@ const checkPlanLimits = (resourceType, additionalCount = 1) => {
         maxCarriers: tenant.settings?.maxCarriers || 500
       };
       
-      return checkLimit(req, resourceType, limits, additionalCount, next);
-      
+      return checkLimit(req, resourceType, limits, additionalCount, next, tenant);
+
     } catch (error) {
       console.error('Plan limits check error:', error);
       return next(new AppError('Error checking plan limits', 500));
@@ -65,43 +87,32 @@ const checkPlanLimits = (resourceType, additionalCount = 1) => {
 /**
  * Helper function to check specific resource limit
  */
-async function checkLimit(req, resourceType, limits, additionalCount, next) {
-  let currentCount = 0;
-  let maxCount = 0;
-  let resourceName = resourceType;
-
+async function checkLimit(req, resourceType, limits, additionalCount, next, tenant) {
   try {
-    const activeFilter = { tenantId: req.tenantId, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
+    const monthly = MONTHLY_RESOURCES.has(resourceType);
+    const period = monthly ? currentOrderPeriod(tenant) : null;
+    const resetDate = period ? period.end : null;
 
-    switch (resourceType) {
-      case 'users':
-        currentCount = await User.countDocuments({ ...activeFilter, status: { $ne: 'inactive' } });
-        maxCount = limits.maxUsers;
-        resourceName = 'users';
-        break;
-      case 'orders':
-        currentCount = await Order.countDocuments(activeFilter);
-        maxCount = limits.maxOrders;
-        resourceName = 'orders';
-        break;
-      case 'customers':
-        currentCount = await Customer.countDocuments(activeFilter);
-        maxCount = limits.maxCustomers;
-        resourceName = 'customers';
-        break;
-      case 'carriers':
-        currentCount = await Carrier.countDocuments(activeFilter);
-        maxCount = limits.maxCarriers;
-        resourceName = 'carriers';
-        break;
-      default:
-        return next(new AppError('Unknown resource type', 400));
-    }
+    const cfg = resolveResource(resourceType, req, period);
+    if (!cfg) return next(new AppError('Unknown resource type', 400));
+
+    const currentCount = await cfg.model.countDocuments(cfg.query);
+    const maxCount = Number(limits[cfg.limitKey]) || 0;
+    const label = RESOURCE_LABEL[resourceType] || resourceType;
 
     // maxCount === 0 means "no limit configured" (unlimited), not "zero allowed"
     if (maxCount > 0 && (currentCount + additionalCount) > maxCount) {
+      if (monthly) {
+        const resetStr = resetDate ? new Date(resetDate).toLocaleDateString() : 'next month';
+        const err = new AppError(
+          `Monthly ${label} limit reached (${currentCount}/${maxCount}). Resets on ${resetStr}. Upgrade your plan to add more this month.`,
+          403
+        );
+        err.code = 'limit_reached';
+        return next(err);
+      }
       return next(new AppError(
-        `${resourceName.charAt(0).toUpperCase() + resourceName.slice(1)} limit reached (${currentCount}/${maxCount}). Please upgrade your subscription plan to add more ${resourceName}.`, 
+        `${label.charAt(0).toUpperCase() + label.slice(1)} limit reached (${currentCount}/${maxCount}). Please upgrade your subscription plan to add more.`,
         403
       ));
     }
@@ -111,6 +122,7 @@ async function checkLimit(req, resourceType, limits, additionalCount, next) {
     req.currentUsage[resourceType] = currentCount;
     req.limits = req.limits || {};
     req.limits[resourceType] = maxCount;
+    if (monthly) req.orderResetDate = resetDate;
 
     next();
     
@@ -125,6 +137,7 @@ async function checkLimit(req, resourceType, limits, additionalCount, next) {
  */
 const checkUserLimit = (additionalCount = 1) => checkPlanLimits('users', additionalCount);
 const checkOrderLimit = (additionalCount = 1) => checkPlanLimits('orders', additionalCount);
+// Kept for backward-compat but no longer wired on routes (customers/carriers are not capped).
 const checkCustomerLimit = (additionalCount = 1) => checkPlanLimits('customers', additionalCount);
 const checkCarrierLimit = (additionalCount = 1) => checkPlanLimits('carriers', additionalCount);
 

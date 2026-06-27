@@ -39,7 +39,11 @@ const orderController = require('../controllers/orderController');
 const customerController = require('../controllers/customerController');
 const carrierController = require('../controllers/carrierController');
 const { checkOrderLimit } = require('../middlewares/planLimitsMiddleware');
-const { checkOrderModuleAccess, resolveAllowedModulesMiddleware } = require('../middlewares/planModulesMiddleware');
+const { checkOrderModuleAccess, resolveAllowedModulesMiddleware, requireActiveSubscription } = require('../middlewares/planModulesMiddleware');
+const { isSubscriptionActive, effectiveStatus, currentOrderPeriod } = require('../utils/subscription');
+const OrderModel = require('../db/Order');
+const SubscriptionPlanModel = require('../db/SubscriptionPlan');
+const catchAsyncStatus = require('../utils/catchAsync');
 
 // Import new tenant admin controller
 const tenantAdminController = require('../controllers/tenantAdminController');
@@ -176,8 +180,53 @@ router.patch('/user/update', validateToken, userController.updateCurrentUserData
 router.delete('/user/delete', validateToken, userController.deleteCurrentUser);
 router.get('/user/staff-listing', validateToken, userController.staffListing);
 
+// Lightweight subscription status for ANY tenant user (drives the in-app billing + order-limit banners).
+router.get('/subscription/status', validateToken, catchAsyncStatus(async (req, res) => {
+  const tenant = req.tenant;
+
+  // Resolve the monthly order limit from the plan (or the snapshot on the subscription).
+  let maxOrders = tenant?.subscription?.planLimits?.maxOrders;
+  const planRef = tenant?.subscription?.plan;
+  if (planRef) {
+    try {
+      const plan = typeof planRef === 'string'
+        ? await SubscriptionPlanModel.findOne({ slug: planRef }).lean()
+        : await SubscriptionPlanModel.findById(planRef).lean();
+      if (plan?.limits?.maxOrders != null) maxOrders = plan.limits.maxOrders;
+    } catch (_) { /* fall back to snapshot */ }
+  }
+  maxOrders = Number(maxOrders) || 0;
+
+  const { start, end } = currentOrderPeriod(tenant);
+  const used = await OrderModel.countDocuments({
+    tenantId: req.tenantId,
+    $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+    createdAt: { $gte: start, $lt: end }
+  });
+  const unlimited = maxOrders === 0;
+  const remaining = unlimited ? null : Math.max(0, maxOrders - used);
+
+  res.json({
+    status: true,
+    data: {
+      active: isSubscriptionActive(req.tenant),
+      subStatus: effectiveStatus(req.tenant),
+      endDate: req.tenant?.subscription?.endDate || null,
+      orders: {
+        used,
+        limit: maxOrders,        // 0 == unlimited
+        remaining,
+        unlimited,
+        exceeded: !unlimited && used >= maxOrders,
+        periodStart: start,
+        resetDate: end
+      }
+    }
+  });
+}));
+
 // Order routes with tenant filtering
-router.post('/order/add', validateToken, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
+router.post('/order/add', validateToken, requireActiveSubscription, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
 router.put('/order/update/:id', validateToken, resolveAllowedModulesMiddleware, orderController.update_order);
 router.get('/order/listings', validateToken, resolveAllowedModulesMiddleware, orderController.order_listing);
 router.get('/order/detail/:id', validateToken, resolveAllowedModulesMiddleware, orderController.order_detail);

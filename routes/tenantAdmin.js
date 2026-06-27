@@ -8,6 +8,9 @@ const {
   getTenantAnalytics,
   getBillingInfo,
   upgradePlan,
+  getPlansCatalog,
+  checkoutSubscription,
+  getSubscriptionHistory,
   getTenantUsers,
   inviteUser,
   updateUserModules,
@@ -52,6 +55,9 @@ router.get('/analytics', getTenantAnalytics);
 // Billing & Subscription Routes
 router.get('/billing', getBillingInfo);
 router.post('/billing/upgrade', upgradePlan);
+router.get('/subscription/plans', getPlansCatalog);     // buyable catalog with per-cycle prices
+router.post('/subscription/checkout', checkoutSubscription); // mock buy/renew
+router.get('/subscription/history', getSubscriptionHistory);
 
 // User Management Routes
 router.get('/users', getTenantUsers);

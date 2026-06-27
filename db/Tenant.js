@@ -59,7 +59,8 @@ const tenantSchema = new mongoose.Schema({
     },
     status: {
       type: String,
-      enum: ['active', 'cancelled', 'past_due', 'trial'],
+      // none = never subscribed; expired = endDate passed; trial kept for back-compat
+      enum: ['none', 'active', 'expired', 'cancelled', 'past_due', 'trial'],
       default: 'active'
     },
     startDate: {
