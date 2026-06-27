@@ -5,6 +5,7 @@ const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const Tenant = require('../db/Tenant');
 const SuperAdmin = require('../db/SuperAdmin');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
+const { effectiveStatus } = require('../utils/subscription');
 const User = require('../db/Users');
 const Company = require('../db/Company');
 const Order = require('../db/Order');
@@ -157,7 +158,13 @@ const getAllTenants = catchAsync(async (req, res, next) => {
         usage: { users, orders, customers, carriers },
         revenue,
         lastActive,
-        subscriptionPlan: subscriptionPlan || null
+        subscriptionPlan: subscriptionPlan || null,
+        billing: {
+          status: effectiveStatus(tenant), // none/active/expired (lazy)
+          planSlug: tenant.subscription?.planSlug || subscriptionPlan?.slug || null,
+          billingCycle: tenant.subscription?.billingCycle || null,
+          endDate: tenant.subscription?.endDate || null
+        }
       };
     })
   );
@@ -495,32 +502,67 @@ const deleteSubscriptionPlan = catchAsync(async (req, res, next) => {
  * Create new tenant
  */
 const createTenant = catchAsync(async (req, res, next) => {
-  const {
-    name,
-    subdomain,
-    adminName,
-    adminEmail,
-    adminPhone,
-    subscriptionPlan,
-    companyInfo
-  } = req.body;
+  const { name, subdomain, subscriptionPlan, companyInfo, contactInfo = {} } = req.body;
+
+  // Support both payload shapes (top-level fields OR a contactInfo object).
+  const adminName = req.body.adminName || contactInfo.adminName || 'Administrator';
+  const adminEmail = String(req.body.adminEmail || contactInfo.adminEmail || '').trim().toLowerCase();
+  const adminPhone = req.body.adminPhone || contactInfo.phone || '';
+  const adminAddress = (companyInfo && companyInfo.address) || contactInfo.address || 'N/A';
+
+  if (!name || !adminEmail) {
+    return next(new AppError('Company name and admin email are required', 400));
+  }
 
   // Check if admin email already exists
   const existingUser = await User.findOne({ email: adminEmail });
   if (existingUser) {
-    return next(new AppError('Admin email already exists', 400));
+    return next(new AppError(`Email '${adminEmail}' is already in use. Use a different email.`, 409));
   }
 
-  // Get subscription plan details
-  const plan = await SubscriptionPlan.findOne({ slug: subscriptionPlan });
-  if (!plan) {
-    return next(new AppError('Subscription plan not found', 404));
+  // Subscription plan is OPTIONAL at creation. New tenants start with NO plan
+  // (status 'none'); the tenant admin buys one after login. A plan slug is only
+  // honored if a super admin explicitly passes one.
+  let plan = null;
+  if (subscriptionPlan) {
+    plan = await SubscriptionPlan.findOne({ slug: subscriptionPlan });
+    if (!plan) return next(new AppError('Subscription plan not found', 404));
   }
-
-  // Map plan slug to tenant schema enum (basic|standard|premium|enterprise)
   const allowedPlans = ['basic', 'standard', 'premium', 'enterprise'];
-  const planSlug = plan?.slug || subscriptionPlan;
+  const planSlug = plan?.slug || '';
   const tenantPlanKey = allowedPlans.find(p => planSlug.startsWith(p)) || 'basic';
+
+  // Modules the tenant can use (both by default until a plan locks them down).
+  const validModules = ['outsourcing', 'regular'];
+  const planModules = (plan && Array.isArray(plan.allowedModules) && plan.allowedModules.length
+    ? plan.allowedModules : validModules)
+    .map((m) => String(m).toLowerCase()).filter((m) => validModules.includes(m));
+
+  // Admin permissions: feature perms always; module perms follow the plan modules.
+  const adminPermissions = ['accounting', 'customers', 'customers_write', 'employees', 'subadmin'];
+  if (planModules.includes('regular')) adminPermissions.push('regular');
+  if (planModules.includes('outsourcing')) adminPermissions.push('outsourcing', 'carriers', 'carriers_write');
+
+  // Subscription block — active (with end date) when a plan was passed, else 'none'.
+  const subscriptionBlock = plan ? {
+    plan: plan._id,
+    legacyPlan: tenantPlanKey,
+    planSlug: plan.slug,
+    status: 'active',
+    startDate: new Date(),
+    endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    billingCycle: 'monthly',
+    planLimits: plan?.limits || undefined,
+    planFeatures: Array.isArray(plan?.features) ? plan.features : undefined,
+    allowedModules: planModules
+  } : {
+    status: 'none',
+    startDate: new Date(),
+    billingCycle: 'monthly',
+    planLimits: { maxUsers: 10, maxOrders: 1000, maxCustomers: 1000, maxCarriers: 500 },
+    planFeatures: ['orders', 'customers', 'carriers', 'basic_reporting'],
+    allowedModules: planModules
+  };
 
   // Helper function to create URL-friendly tenant ID from name
   const createTenantId = (name) => {
@@ -561,18 +603,7 @@ const createTenant = catchAsync(async (req, res, next) => {
       adminEmail,
       phone: adminPhone || ''
     },
-    subscription: {
-      plan: plan._id,
-      legacyPlan: tenantPlanKey,
-      planSlug: plan.slug,
-      status: 'active',
-      startDate: new Date(),
-      endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
-      billingCycle: 'monthly',
-      planLimits: plan?.limits || undefined,
-      planFeatures: Array.isArray(plan?.features) ? plan.features : undefined,
-      allowedModules: Array.isArray(plan?.allowedModules) ? plan.allowedModules : undefined
-    },
+    subscription: subscriptionBlock,
     settings: {
       maxUsers: plan?.limits?.maxUsers ?? 10,
       maxOrders: plan?.limits?.maxOrders ?? 500,
@@ -616,11 +647,14 @@ const createTenant = catchAsync(async (req, res, next) => {
     password: tempPassword, // Plain password - will be hashed by User model pre-save hook
     phone: adminPhone,
     country: 'USA',
-    address: (companyInfo && companyInfo.address) ? companyInfo.address : 'N/A',
+    address: adminAddress,
+    is_admin: 1,
     role: 3, // Admin role
+    isTenantAdmin: true,
+    permissions: adminPermissions,
+    allowedModules: planModules,
     position: 'Administrator',
-    corporateID: `ADMIN_${Date.now()}`,
-    isTenantAdmin: true
+    corporateID: `ADMIN_${Date.now()}`
   });
 
   // Remove password from response
@@ -635,12 +669,19 @@ const createTenant = catchAsync(async (req, res, next) => {
     details: { tenantId, plan: planSlug },
   });
 
+  // One-time credentials for the super admin to hand off to the tenant admin.
+  const baseDomain = process.env.DOMAIN || 'localhost';
+  const tenantUrl = process.env.NODE_ENV === 'production'
+    ? `https://${tenant.subdomain || tenantId}.${baseDomain}`
+    : `http://localhost:3000/?tenant=${tenantId}`;
+
   res.status(201).json({
     status: true,
     data: {
-      tenant,
+      tenant: { ...tenant.toObject(), url: tenantUrl },
       company,
       adminUser,
+      credentials: { email: adminEmail, password: tempPassword, url: tenantUrl },
       tempPassword: isProd ? undefined : tempPassword
     },
     message: 'Tenant created successfully'
