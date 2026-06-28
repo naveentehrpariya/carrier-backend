@@ -122,7 +122,7 @@ const getAllTenants = catchAsync(async (req, res, next) => {
   // Get usage stats and subscription plan details for each tenant
   const tenantsWithUsage = await Promise.all(
     tenants.map(async (tenant) => {
-      const [usage, subscriptionPlan, financialAgg] = await Promise.all([
+      const [usage, subscriptionPlan, financialAgg, company, admin] = await Promise.all([
         Promise.all([
           User.countDocuments(User.activeFilter(tenant.tenantId)),
           Order.countDocuments({ tenantId: tenant.tenantId }),
@@ -146,9 +146,14 @@ const getAllTenants = catchAsync(async (req, res, next) => {
               lastOrderDate: { $max: '$createdAt' }
             }
           }
-        ])
+        ]),
+        // Company record (registered company name etc)
+        Company.findOne({ tenantId: tenant.tenantId }).select('name email phone mc_code dot_number').lean(),
+        // The tenant admin user (full contact details)
+        User.findOne({ tenantId: tenant.tenantId, $or: [{ is_admin: 1 }, { role: 3 }] })
+          .select('name email phone position').lean()
       ]);
-      
+
       const [users, orders, customers, carriers] = usage;
       const revenue = (financialAgg[0]?.totalRevenue) || 0;
       const lastActive = financialAgg[0]?.lastOrderDate || null;
@@ -159,6 +164,12 @@ const getAllTenants = catchAsync(async (req, res, next) => {
         revenue,
         lastActive,
         subscriptionPlan: subscriptionPlan || null,
+        company: company || null,
+        admin: admin
+          ? { name: admin.name, email: admin.email, phone: admin.phone, position: admin.position }
+          : (tenant.contactInfo
+            ? { name: tenant.contactInfo.adminName, email: tenant.contactInfo.adminEmail, phone: tenant.contactInfo.phone }
+            : null),
         billing: {
           status: effectiveStatus(tenant), // none/active/expired (lazy)
           planSlug: tenant.subscription?.planSlug || subscriptionPlan?.slug || null,

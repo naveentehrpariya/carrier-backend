@@ -43,6 +43,7 @@ const { checkOrderModuleAccess, resolveAllowedModulesMiddleware, requireActiveSu
 const { isSubscriptionActive, effectiveStatus, currentOrderPeriod } = require('../utils/subscription');
 const OrderModel = require('../db/Order');
 const SubscriptionPlanModel = require('../db/SubscriptionPlan');
+const TenantModel = require('../db/Tenant');
 const catchAsyncStatus = require('../utils/catchAsync');
 
 // Import new tenant admin controller
@@ -181,8 +182,10 @@ router.delete('/user/delete', validateToken, userController.deleteCurrentUser);
 router.get('/user/staff-listing', validateToken, userController.staffListing);
 
 // Lightweight subscription status for ANY tenant user (drives the in-app billing + order-limit banners).
+// Resolve the tenant by the authoritative token tenantId (NOT req.tenant, which can be a stale
+// X-Tenant-ID context and disagree with the user's actual tenant).
 router.get('/subscription/status', validateToken, catchAsyncStatus(async (req, res) => {
-  const tenant = req.tenant;
+  const tenant = await TenantModel.findOne({ tenantId: req.tenantId }).lean();
 
   // Resolve the monthly order limit from the plan (or the snapshot on the subscription).
   let maxOrders = tenant?.subscription?.planLimits?.maxOrders;
@@ -209,9 +212,9 @@ router.get('/subscription/status', validateToken, catchAsyncStatus(async (req, r
   res.json({
     status: true,
     data: {
-      active: isSubscriptionActive(req.tenant),
-      subStatus: effectiveStatus(req.tenant),
-      endDate: req.tenant?.subscription?.endDate || null,
+      active: isSubscriptionActive(tenant),
+      subStatus: effectiveStatus(tenant),
+      endDate: tenant?.subscription?.endDate || null,
       orders: {
         used,
         limit: maxOrders,        // 0 == unlimited

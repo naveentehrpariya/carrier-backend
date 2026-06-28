@@ -6,9 +6,58 @@ const orderController = require('../controllers/orderController');
 const tripController = require('../controllers/tripController');
 const restrictOrderMiddleware = require('../middlewares/restrictOrderMiddleware');
 const { checkOrderLimit } = require('../middlewares/planLimitsMiddleware');
-const { checkOrderModuleAccess, resolveAllowedModulesMiddleware } = require('../middlewares/planModulesMiddleware');
+const { checkOrderModuleAccess, resolveAllowedModulesMiddleware, requireActiveSubscription } = require('../middlewares/planModulesMiddleware');
+const catchAsync = require('../utils/catchAsync');
+const Tenant = require('../db/Tenant');
+const Order = require('../db/Order');
+const SubscriptionPlan = require('../db/SubscriptionPlan');
+const { isSubscriptionActive, effectiveStatus, currentOrderPeriod } = require('../utils/subscription');
 
-router.route('/order/add').post(validateToken, resolveTenant, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
+// Subscription status for ANY tenant user — drives the in-app billing + order-limit banners.
+// Resolved by the authoritative token tenantId (root-mounted so the frontend hits /subscription/status).
+router.get('/subscription/status', validateToken, catchAsync(async (req, res) => {
+  const tenant = await Tenant.findOne({ tenantId: req.tenantId }).lean();
+
+  let maxOrders = tenant?.subscription?.planLimits?.maxOrders;
+  const planRef = tenant?.subscription?.plan;
+  if (planRef) {
+    try {
+      const plan = typeof planRef === 'string'
+        ? await SubscriptionPlan.findOne({ slug: planRef }).lean()
+        : await SubscriptionPlan.findById(planRef).lean();
+      if (plan?.limits?.maxOrders != null) maxOrders = plan.limits.maxOrders;
+    } catch (_) { /* fall back to snapshot */ }
+  }
+  maxOrders = Number(maxOrders) || 0;
+
+  const { start, end } = currentOrderPeriod(tenant);
+  const used = await Order.countDocuments({
+    tenantId: req.tenantId,
+    $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+    createdAt: { $gte: start, $lt: end }
+  });
+  const unlimited = maxOrders === 0;
+
+  res.json({
+    status: true,
+    data: {
+      active: isSubscriptionActive(tenant),
+      subStatus: effectiveStatus(tenant),
+      endDate: tenant?.subscription?.endDate || null,
+      orders: {
+        used,
+        limit: maxOrders,
+        remaining: unlimited ? null : Math.max(0, maxOrders - used),
+        unlimited,
+        exceeded: !unlimited && used >= maxOrders,
+        periodStart: start,
+        resetDate: end
+      }
+    }
+  });
+}));
+
+router.route('/order/add').post(validateToken, resolveTenant, requireActiveSubscription, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
 router.route('/order/update/:id').put(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.update_order);
 router.route('/order/listings').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_listing);
 router.route('/order/detail/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_detail);

@@ -1,6 +1,7 @@
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
 const SubscriptionPlan = require('../db/SubscriptionPlan');
+const Tenant = require('../db/Tenant');
 const { isSubscriptionActive } = require('../utils/subscription');
 
 const valid = ['outsourcing', 'regular'];
@@ -9,10 +10,15 @@ const valid = ['outsourcing', 'regular'];
  * Blocks the action unless the tenant has a live subscription (bought + not expired).
  * Used on order creation. Super admin bypasses. Returns a stable error code the
  * frontend uses to show the "billing expired / no plan" banner.
+ * Resolves the tenant by the authoritative token tenantId (req.tenant can be a stale
+ * X-Tenant-ID context).
  */
 const requireActiveSubscription = catchAsync(async (req, res, next) => {
   if (req.isSuperAdminUser || req.user?.permissions?.includes('super_admin')) return next();
-  if (isSubscriptionActive(req.tenant)) return next();
+  const tenant = (req.tenant && req.tenant.tenantId === req.tenantId)
+    ? req.tenant
+    : await Tenant.findOne({ tenantId: req.tenantId }).lean();
+  if (isSubscriptionActive(tenant)) return next();
   return res.status(403).json({
     status: false,
     error: 'subscription_inactive',
