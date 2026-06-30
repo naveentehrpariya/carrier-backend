@@ -9,6 +9,8 @@ const EmptyMoveNote = require('../db/EmptyMoveNote');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const { logActivity } = require('../utils/activityLogger');
+const { MI_PER_KM, deriveTripMiles, pickDriverRate } = require('../utils/distance');
+const driverSalaryController = require('./driverSalaryController');
 
 const emptyDistanceCache = new Map();
 
@@ -509,90 +511,37 @@ exports.getDriverTripSummary = async (req, res) => {
         const { driverId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
-        const driverObjId = new mongoose.Types.ObjectId(driverId);
-        // Match trips where driver is in drivers[] OR in single driver field (covers both storage patterns)
-        const match = {
-            tenantId,
-            deletedAt: null,
-            $or: [{ drivers: driverObjId }, { driver: driverObjId }]
+
+        // Reuse the single driver-pay engine (real miles from order KM, order-month attribution,
+        // all-trips proportioning denominator) so this matches the saved driver salary + owner payslip.
+        const range = {
+            from: from ? new Date(from) : new Date(2000, 0, 1),
+            to: to ? new Date(to) : new Date(9999, 11, 31, 23, 59, 59, 999),
         };
-        if (from || to) {
-            match.createdAt = {};
-            if (from) match.createdAt.$gte = new Date(from);
-            if (to) match.createdAt.$lte = new Date(to);
-        }
-        const driverProfile = await DriverProfile.findOne({ tenantId, user: driverId }).lean();
-        const soloRate = Number(driverProfile?.ratePerMileSolo ?? driverProfile?.ratePerMile ?? 0) || 0;
-        const teamRate = Number(driverProfile?.ratePerMileTeam ?? driverProfile?.ratePerMile ?? 0) || 0;
+        const tp = await driverSalaryController.computeDriverTripPay(tenantId, driverId, range);
 
-        const pipeline = [
-            { $match: match },
-            { $addFields: {
-                // Count drivers from the drivers[] array. If empty but driver field set, treat as 1 (solo).
-                driverCount: {
-                    $cond: [
-                        { $gt: [{ $size: { $ifNull: ['$drivers', []] } }, 0] },
-                        { $size: '$drivers' },
-                        1
-                    ]
-                }
-            }},
-            { $addFields: {
-                driverCountEffective: { $max: ['$driverCount', 1] }
-            }},
-            { $addFields: {
-                myMiles: { $divide: [{ $ifNull: ['$miles', 0] }, '$driverCountEffective'] },
-                myKm: { $divide: [{ $ifNull: ['$total_km', 0] }, '$driverCountEffective'] },
-                rateType: { $cond: [{ $gt: ['$driverCountEffective', 1] }, 'team', 'solo'] },
-                rateUsed: { $cond: [{ $gt: ['$driverCountEffective', 1] }, teamRate, soloRate] }
-            }},
-            { $addFields: {
-                myPay: { $multiply: ['$myMiles', '$rateUsed'] }
-            }}
-        ];
+        const byOrder = tp.byOrder.map((b) => ({
+            _id: b.order,
+            orderSerial: b.serial_no,
+            miles: b.miles,
+            km: b.km,
+            trips: b.trips,
+            pay: b.payUsd,         // USD; frontend converts to display currency
+            rateUsed: b.rateUsed,
+            rateType: b.rateType,
+        }));
 
-        const summary = await Trip.aggregate([
-            ...pipeline,
-            { $group: {
-                _id: null,
-                totalTrips: { $sum: 1 },
-                totalMiles: { $sum: '$myMiles' },
-                totalKm: { $sum: '$myKm' },
-                totalPay: { $sum: '$myPay' }
-            } }
-        ]);
-
-        const byOrder = await Trip.aggregate([
-            ...pipeline,
-            { $group: {
-                _id: '$order',
-                miles: { $sum: '$myMiles' },
-                km: { $sum: '$myKm' },
-                trips: { $sum: 1 },
-                pay: { $sum: '$myPay' },
-                rateUsed: { $max: '$rateUsed' },
-                rateType: { $last: '$rateType' }
-            } },
-            {
-                $lookup: {
-                    from: 'orders',
-                    localField: '_id',
-                    foreignField: '_id',
-                    as: 'orderDoc'
-                }
-            },
-            { $unwind: { path: '$orderDoc', preserveNullAndEmptyArrays: true } },
-            { $addFields: { orderSerial: '$orderDoc.serial_no' } },
-            { $project: { orderDoc: 0 } },
-            { $sort: { trips: -1 } }
-        ]);
-
-        const computedPay = summary[0] ? summary[0].totalPay : 0;
-        const baseSummary = summary[0] || { totalTrips: 0, totalMiles: 0, totalKm: 0 };
         res.json({
             status: true,
-            summary: { ...baseSummary, totalPay: computedPay, soloRate, teamRate },
-            byOrder
+            summary: {
+                totalTrips: tp.totalTrips,
+                totalMiles: tp.totalMiles,
+                totalKm: tp.totalKm,
+                totalPay: tp.totalPayUsd,
+                soloRate: tp.soloRate,
+                teamRate: tp.teamRate,
+            },
+            byOrder,
         });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error summarizing driver trips' });
@@ -697,6 +646,42 @@ exports.getTruckTripSummary = async (req, res) => {
     }
 };
 
+// Per-trip truck revenue share: orderAmount(USD base) × (tripRaw / sum of the order's trip raws).
+// The raw/raw ratio is unit-agnostic (works whether trip distance is km or miles, and regardless
+// of trip-vs-order distance mismatch). Also returns real miles for display.
+async function buildTruckTripGross(tenantId, trips) {
+  const orderIds = [...new Set(trips.map((t) => String(t.order?._id || t.order)).filter(Boolean))];
+  const allTrips = orderIds.length
+    ? await Trip.find({ tenantId, deletedAt: null, order: { $in: orderIds } }).select('order totalDistance miles total_km').lean()
+    : [];
+  const orderRawTotal = new Map();
+  allTrips.forEach((t) => {
+    const oid = String(t.order);
+    const raw = Math.max(Number(t.totalDistance || t.miles || t.total_km || 0), 0);
+    orderRawTotal.set(oid, Number(orderRawTotal.get(oid) || 0) + raw);
+  });
+  return trips.map((t) => {
+    const o = (t.order && t.order._id) ? t.order : null;
+    const oid = String(o?._id || t.order);
+    const raw = Math.max(Number(t.totalDistance || t.miles || t.total_km || 0), 0);
+    const denom = Number(orderRawTotal.get(oid) || 0);
+    const ratio = denom > 0 ? (raw / denom) : 0;
+    const usdAmount = Number(o?.total_amount || 0);                          // base USD revenue
+    const hasInput = Number(o?.input_total_amount) > 0;
+    const inputAmount = hasInput ? Number(o.input_total_amount) : usdAmount; // exact typed revenue
+    const inputCurrency = (o?.input_currency || o?.revenue_currency || 'usd');
+    const grossUsd = usdAmount * ratio;          // for summing across mixed currencies
+    const grossInput = inputAmount * ratio;      // exact, in the order's input currency
+    const realMiles = deriveTripMiles(t, Number(o?.totalDistance || 0), denom);
+    return {
+      ...t, _orderId: oid,
+      _grossUsd: grossUsd, _grossInput: grossInput,
+      _inputAmount: inputAmount, _inputCurrency: inputCurrency,
+      _realMiles: realMiles, _realKm: realMiles / MI_PER_KM,
+    };
+  });
+}
+
 exports.getTrucksGrossEarnings = async (req, res) => {
     try {
         const tenantId = req.user.tenantId;
@@ -724,58 +709,32 @@ exports.getTrucksGrossEarnings = async (req, res) => {
             match.status = { $ne: 'cancelled' };
         }
 
-        const pipeline = [
-            { $match: match },
-            {
-                $lookup: {
-                    from: 'orders',
-                    localField: 'order',
-                    foreignField: '_id',
-                    as: 'orderDoc'
-                }
-            },
-            { $unwind: '$orderDoc' },
-            ...(companyId ? [{ $match: { 'orderDoc.company': companyId } }] : []),
-            {
-                $addFields: {
-                    orderDistance: { $ifNull: ['$orderDoc.totalDistance', 0] },
-                    orderAmount: { $ifNull: ['$orderDoc.total_amount', 0] },
-                    tripMiles: { $ifNull: ['$miles', 0] }
-                }
-            },
-            {
-                $addFields: {
-                    gross: {
-                        $cond: [
-                            { $gt: ['$orderDistance', 0] },
-                            { $multiply: ['$orderAmount', { $divide: ['$tripMiles', '$orderDistance'] }] },
-                            0
-                        ]
-                    }
-                }
-            },
-            { $sort: { updatedAt: -1, createdAt: -1 } },
-            {
-                $group: {
-                    _id: '$truck',
-                    totalTrips: { $sum: 1 },
-                    totalMiles: { $sum: '$tripMiles' },
-                    totalGross: { $sum: '$gross' },
-                    lastTripAt: { $first: '$updatedAt' },
-                    lastLocation: { $first: '$end_location' },
-                    lastDriver: { $first: '$driver' }
-                }
+        const tripsRaw = await Trip.find(match)
+            .populate('order', 'serial_no total_amount totalDistance revenue_currency company input_total_amount input_currency')
+            .select('truck order miles totalDistance total_km end_location driver updatedAt createdAt')
+            .lean();
+        const scopedTrips = companyId
+            ? tripsRaw.filter((t) => t?.order?.company && String(t.order.company) === String(companyId))
+            : tripsRaw;
+        const enriched = await buildTruckTripGross(tenantId, scopedTrips);
+        const byTruck = new Map();
+        enriched.forEach((t) => {
+            const tid = String(t.truck);
+            const cur = byTruck.get(tid) || { totalTrips: 0, totalMiles: 0, totalGross: 0, lastTripAt: null, lastLocation: '', lastDriver: null };
+            cur.totalTrips += 1;
+            cur.totalMiles += Number(t._realMiles || 0);
+            cur.totalGross += Number(t._grossUsd || 0);
+            if (!cur.lastTripAt || (t.updatedAt && new Date(t.updatedAt) > new Date(cur.lastTripAt))) {
+                cur.lastTripAt = t.updatedAt; cur.lastLocation = t.end_location; cur.lastDriver = t.driver;
             }
-        ];
-
-        const agg = await Trip.aggregate(pipeline);
-        const byTruck = new Map(agg.map((r) => [String(r._id), r]));
+            byTruck.set(tid, cur);
+        });
 
         const truckFilter = { tenantId, deletedAt: null };
         if (companyId) truckFilter.company = companyId;
         const trucks = await Truck.find(truckFilter).select('_id plateNumber unitNumber').lean();
 
-        const driverIds = agg.map((r) => r.lastDriver).filter(Boolean);
+        const driverIds = Array.from(byTruck.values()).map((r) => r.lastDriver).filter(Boolean);
         const drivers = driverIds.length
             ? await User.find({ _id: { $in: driverIds } }).select('_id name corporateID').lean()
             : [];
@@ -817,6 +776,7 @@ exports.getTrucksGrossEarnings = async (req, res) => {
                 totalGross,
                 totalExpenses,
                 profit: totalGross - totalExpenses,
+                currency: 'usd', // gross/expenses in USD base; frontend converts to display currency
                 lastTripAt: row?.lastTripAt || null,
                 lastLocation: row?.lastLocation || '',
                 lastDriver: lastDriver ? { _id: lastDriver._id, name: lastDriver.name, corporateID: lastDriver.corporateID } : null
@@ -862,53 +822,35 @@ exports.getTruckGrossEarningsDetail = async (req, res) => {
             match.status = { $ne: 'cancelled' };
         }
 
-        const pipeline = [
-            { $match: match },
-            {
-                $lookup: {
-                    from: 'orders',
-                    localField: 'order',
-                    foreignField: '_id',
-                    as: 'orderDoc'
-                }
-            },
-            { $unwind: '$orderDoc' },
-            ...(companyId ? [{ $match: { 'orderDoc.company': companyId } }] : []),
-            {
-                $addFields: {
-                    orderDistance: { $ifNull: ['$orderDoc.totalDistance', 0] },
-                    orderAmount: { $ifNull: ['$orderDoc.total_amount', 0] },
-                    tripMiles: { $ifNull: ['$miles', 0] }
-                }
-            },
-            {
-                $addFields: {
-                    gross: {
-                        $cond: [
-                            { $gt: ['$orderDistance', 0] },
-                            { $multiply: ['$orderAmount', { $divide: ['$tripMiles', '$orderDistance'] }] },
-                            0
-                        ]
-                    }
-                }
-            },
-            {
-                $group: {
-                    _id: '$order',
-                    orderSerial: { $first: '$orderDoc.serial_no' },
-                    orderTotalAmount: { $first: '$orderDoc.total_amount' },
-                    orderTotalDistance: { $first: '$orderDoc.totalDistance' },
-                    orderCurrency: { $first: '$orderDoc.revenue_currency' },
-                    trips: { $sum: 1 },
-                    miles: { $sum: '$tripMiles' },
-                    gross: { $sum: '$gross' },
-                    lastTripAt: { $max: '$updatedAt' }
-                }
-            },
-            { $sort: { lastTripAt: -1 } }
-        ];
-
-        const rows = await Trip.aggregate(pipeline);
+        const tripsRaw = await Trip.find(match)
+            .populate('order', 'serial_no total_amount totalDistance revenue_currency company input_total_amount input_currency')
+            .select('order miles totalDistance total_km updatedAt')
+            .lean();
+        const scopedTrips = companyId
+            ? tripsRaw.filter((t) => t?.order?.company && String(t.order.company) === String(companyId))
+            : tripsRaw;
+        const enriched = await buildTruckTripGross(tenantId, scopedTrips);
+        const byOrderMap = new Map();
+        enriched.forEach((t) => {
+            const o = (t.order && t.order._id) ? t.order : null;
+            const oid = String(o?._id || t.order);
+            const cur = byOrderMap.get(oid) || {
+                _id: o?._id || t.order,
+                orderSerial: o?.serial_no ?? null,
+                orderTotalAmount: Number(t._inputAmount || 0),       // exact typed revenue
+                orderCurrency: t._inputCurrency || 'usd',            // its input currency
+                orderTotalMiles: Number(o?.totalDistance || 0) * MI_PER_KM, // order full distance, real miles
+                trips: 0, miles: 0, km: 0, gross: 0, grossUsd: 0, lastTripAt: null,
+            };
+            cur.trips += 1;
+            cur.miles += Number(t._realMiles || 0);
+            cur.km += Number(t._realKm || 0);
+            cur.gross += Number(t._grossInput || 0);    // exact, in order's input currency
+            cur.grossUsd += Number(t._grossUsd || 0);   // base, for the truck summary
+            if (!cur.lastTripAt || (t.updatedAt && new Date(t.updatedAt) > new Date(cur.lastTripAt))) cur.lastTripAt = t.updatedAt;
+            byOrderMap.set(oid, cur);
+        });
+        const rows = Array.from(byOrderMap.values()).sort((a, b) => new Date(b.lastTripAt || 0) - new Date(a.lastTripAt || 0));
 
         // Auto-create fixed monthly expenses (insurance, parking) if truck has them configured
         const truck = await Truck.findOne({ _id: truckId, tenantId }).lean();
@@ -957,15 +899,16 @@ exports.getTruckGrossEarningsDetail = async (req, res) => {
             (acc, r) => {
                 acc.totalTrips += Number(r.trips || 0);
                 acc.totalMiles += Number(r.miles || 0);
-                acc.totalGross += Number(r.gross || 0);
+                acc.totalGross += Number(r.grossUsd || 0); // USD base (rows may be different input currencies)
                 return acc;
             },
             { totalTrips: 0, totalMiles: 0, totalGross: 0 }
         );
         summary.totalExpenses = totalExpenses;
         summary.profit = summary.totalGross - totalExpenses;
+        summary.currency = 'usd'; // gross/expenses USD base; frontend converts to display currency
 
-        res.json({ status: true, from: start, to: end, summary, orders: rows, expenses: expenseRows, expenseByType });
+        res.json({ status: true, from: start, to: end, currency: 'usd', summary, orders: rows, expenses: expenseRows, expenseByType });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error computing truck gross detail' });
     }

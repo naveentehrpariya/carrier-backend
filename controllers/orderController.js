@@ -1098,7 +1098,7 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       
       // 1× scale keeps file size small; quality is still crisp at A4 print resolution
       await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 1 });
-      await page.setContent(fullHtml, { waitUntil: ['networkidle0', 'load', 'domcontentloaded'] });
+      await page.setContent(fullHtml, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
       
       // Small delay to ensure any dynamic images (like logos) are fully rendered
       await new Promise(resolve => setTimeout(resolve, 500));

@@ -16,7 +16,8 @@ const Trip = require('../db/Trip');
 const DriverProfile = require('../db/DriverProfile');
 const Users = require('../db/Users');
 const { logActivity } = require('../utils/activityLogger');
-const SUPPORTED_CURRENCIES = new Set(['CAD', 'USD', 'INR']);
+const { MI_PER_KM, kmToMiles, normalizeTripMiles, deriveTripMiles, pickDriverRate } = require('../utils/distance');
+const { SUPPORTED_CURRENCIES, normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount } = require('../utils/fx');
 
 function getTenantId(req) {
   return req.tenantId || req.user?.tenantId || null;
@@ -53,79 +54,40 @@ async function generateOwnerOperatorId(tenantId) {
   throw new Error('Failed to generate unique owner operator id');
 }
 
-function buildDateRange(month, year) {
-  const m = Number(month);
-  const y = Number(year);
-  if (!m || !y || m < 1 || m > 12 || y < 2000 || y > 9999) return null;
-  const from = new Date(y, m - 1, 1, 0, 0, 0, 0);
-  const to = new Date(y, m, 0, 23, 59, 59, 999);
-  return { from, to, month: m, year: y };
-}
 
-function normalizeCurrency(value, fallback = 'USD') {
-  const code = String(value || fallback).trim().toUpperCase();
-  const normalizedFallback = String(fallback || 'USD').toUpperCase();
-  if (!/^[A-Z]{3}$/.test(code)) return normalizedFallback;
-  if (!SUPPORTED_CURRENCIES.has(code)) return normalizedFallback;
-  return code;
-}
-
-async function getFxRatesMap(tenantId, month, year, targetCurrency) {
-  const target = normalizeCurrency(targetCurrency, 'USD');
-  const rows = await ConversionRate.find({
-    tenantId,
-    month: Number(month),
-    year: Number(year),
-    targetCurrency: target,
-  })
-    .select('sourceCurrency targetCurrency rate')
-    .lean();
-  const map = new Map([[target, 1]]);
-  (rows || []).forEach((row) => {
-    const source = normalizeCurrency(row?.sourceCurrency, target);
-    const rate = Number(row?.rate || 0);
-    if (rate > 0) map.set(source, rate);
-  });
-  return map;
-}
-
-function convertAmount(amount, sourceCurrency, targetCurrency, fxMap) {
-  const source = normalizeCurrency(sourceCurrency, targetCurrency);
-  const target = normalizeCurrency(targetCurrency, 'USD');
-  const numeric = Number(amount || 0);
-  if (source === target) return { value: numeric, rate: 1 };
-  const directRate = Number(fxMap?.get(source) || 0);
-  if (directRate > 0) return { value: numeric * directRate, rate: directRate };
-  return { value: numeric, rate: 1 };
-}
-
-function normalizeTripMiles(trip) {
-  const unit = String(trip?.distance_unit || '').toLowerCase();
-  const milesField = Number(trip?.miles || 0);
-  const totalDistanceField = Number(trip?.totalDistance || 0);
-  const totalKmField = Number(trip?.total_km || 0);
-
-  // If trip distance is stored in KM, convert to miles no matter which numeric field carries value.
-  if (unit === 'km') {
-    const kmValue = totalKmField > 0 ? totalKmField : (totalDistanceField > 0 ? totalDistanceField : milesField);
-    return kmValue > 0 ? kmValue / 1.60934 : 0;
-  }
-
-  // For MI, prefer explicit miles first.
-  if (unit === 'mi') {
-    if (milesField > 0) return milesField;
-    if (totalDistanceField > 0) return totalDistanceField;
-    if (totalKmField > 0) return totalKmField / 1.60934;
-    return 0;
-  }
-
-  // Unknown/missing unit (legacy data):
-  // Prefer explicit miles. If unavailable, prefer total_km converted to miles.
-  // Keep totalDistance as the final fallback because some old records stored km there.
-  if (milesField > 0) return milesField;
-  if (totalKmField > 0) return totalKmField / 1.60934;
-  if (totalDistanceField > 0) return totalDistanceField;
-  return 0;
+// Resolve an owner-operated order's amounts for a payslip/statement.
+// Order price/settle/profit come from the exact typed values (input_*) in the order's
+// input_currency, so payslips match the order list/detail screens. The driver deduction
+// has no input snapshot, so it stays in base USD (revenue_currency). Payable is recomputed
+// in the target currency because settle and deduction may convert from different sources.
+function resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap) {
+  const priceSourceCurrency = normalizeCurrency(o?.input_currency || o?.revenue_currency, targetCurrency);
+  const deductionSourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
+  const hasInput = Number(o?.input_total_amount) > 0;
+  const hasInputSettle = Number(o?.input_settle_amount) > 0;
+  const originalDeduction = Number(ded?.deduction || 0);
+  const originalOrderPrice = hasInput ? Number(o.input_total_amount) : Number(o?.total_amount || 0);
+  const originalSettleAmount = hasInputSettle ? Number(o.input_settle_amount) : Number(o?.settle_amount || 0);
+  const originalOwnerProfit = (hasInput && hasInputSettle)
+    ? (originalOrderPrice - originalSettleAmount)
+    : Number(o?.owner_profit || (Number(o?.total_amount || 0) - Number(o?.settle_amount || 0)) || 0);
+  const ownerProfitSourceCurrency = (hasInput && hasInputSettle) ? priceSourceCurrency : deductionSourceCurrency;
+  const orderPriceConversion = convertAmount(originalOrderPrice, priceSourceCurrency, targetCurrency, fxRatesMap);
+  const settleAmountConversion = convertAmount(originalSettleAmount, priceSourceCurrency, targetCurrency, fxRatesMap);
+  const ownerProfitConversion = convertAmount(originalOwnerProfit, ownerProfitSourceCurrency, targetCurrency, fxRatesMap);
+  const deductionConversion = convertAmount(originalDeduction, deductionSourceCurrency, targetCurrency, fxRatesMap);
+  const orderPrice = Number(orderPriceConversion.value || 0);
+  const settleAmount = Number(settleAmountConversion.value || 0);
+  const ownerProfit = Number(ownerProfitConversion.value || 0);
+  const deduction = Number(deductionConversion.value || 0);
+  const payable = settleAmount - deduction;
+  const originalPayable = originalSettleAmount - originalDeduction;
+  return {
+    priceSourceCurrency, deductionSourceCurrency,
+    originalOrderPrice, originalSettleAmount, originalOwnerProfit, originalDeduction, originalPayable,
+    orderPrice, settleAmount, ownerProfit, deduction, payable,
+    orderPriceConversion, settleAmountConversion, ownerProfitConversion, deductionConversion,
+  };
 }
 
 function buildFxMonthEndDate(year, month) {
@@ -218,6 +180,7 @@ async function ensureMonthlyFxRates(tenantId, month, year, targetCurrency, sourc
 
   return getFxRatesMap(tenantId, month, year, target);
 }
+exports.ensureMonthlyFxRates = ensureMonthlyFxRates;
 
 async function buildOrderDriverDeductions(tenantId, orderIds) {
   const emptyResult = { byOrder: new Map(), soloTotal: 0, teamTotal: 0 };
@@ -269,21 +232,14 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     const count = Math.max(list.length, 1);
     const isTeam = count > 1;
     const orderId = String(trip.order);
-    const rawDistance = Number(trip.totalDistance || trip.miles || trip.total_km || 0);
     const orderDistanceKm = Number(orderDistanceKmMap.get(orderId) || 0);
-    const orderDistanceMiles = orderDistanceKm > 0 ? orderDistanceKm * 0.6214 : 0;
     const orderRawTotal = Number(orderTripDistanceTotals.get(orderId) || 0);
-    const miles = orderDistanceMiles > 0 && orderRawTotal > 0
-      ? (Math.max(rawDistance, 0) / orderRawTotal) * orderDistanceMiles
-      : normalizeTripMiles(trip);
+    const miles = deriveTripMiles(trip, orderDistanceKm, orderRawTotal);
     let tripDeduction = 0;
     let tripWeightedRateMiles = 0;
     list.forEach((driverId) => {
       const profile = profileMap.get(String(driverId));
-      const soloRate = Number(profile?.ratePerMileSolo ?? profile?.ratePerMile ?? 0) || 0;
-      const teamRate = Number(profile?.ratePerMileTeam ?? profile?.ratePerMile ?? 0) || 0;
-      const profileRate = isTeam ? teamRate : soloRate;
-      const rate = Number(trip.rate_per_mile || 0) > 0 ? Number(trip.rate_per_mile || 0) : profileRate;
+      const rate = pickDriverRate(profile, isTeam, trip.rate_per_mile);
       tripDeduction += (miles / count) * rate;
       tripWeightedRateMiles += (miles / count) * rate;
     });
@@ -707,9 +663,10 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
       createdAt: { $gte: range.from, $lte: range.to },
       ...normalizeDeletedFilter(),
     })
-      .select('serial_no customer_order_no ownerOperator total_amount settle_amount owner_profit revenue_currency driver_assignment_mode')
+      .select('serial_no customer_order_no ownerOperator total_amount settle_amount owner_profit revenue_currency input_total_amount input_settle_amount input_currency driver_assignment_mode')
       .lean();
-    const fxRatesMap = await getFxRatesMap(tenantId, range.month, range.year, targetCurrency);
+    // Auto-seed any missing month FX rates so amounts never silently convert 1:1.
+    const fxRatesMap = await ensureMonthlyFxRates(tenantId, range.month, range.year, targetCurrency, ['USD', 'CAD', 'INR'], req.user?._id);
     const orderIds = orders.map((o) => o._id);
 
     const { byOrder, soloTotal, teamTotal } = await buildOrderDriverDeductions(tenantId, orderIds);
@@ -718,28 +675,18 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
       const ownerOrders = orders.filter((o) => String(o.ownerOperator) === String(owner._id));
       const breakdown = ownerOrders.map((o) => {
         const ded = byOrder.get(String(o._id));
-        const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-        const originalDeduction = Number(ded?.deduction || 0);
-        const originalOrderPrice = Number(o.total_amount || 0);
-        const originalSettleAmount = Number(o.settle_amount || 0);
-        const originalOwnerProfit = Number(o.owner_profit || originalOrderPrice - originalSettleAmount || 0);
-        const originalPayable = originalSettleAmount - originalDeduction;
-        const orderPriceConversion = convertAmount(originalOrderPrice, sourceCurrency, targetCurrency, fxRatesMap);
-        const settleAmountConversion = convertAmount(originalSettleAmount, sourceCurrency, targetCurrency, fxRatesMap);
-        const ownerProfitConversion = convertAmount(originalOwnerProfit, sourceCurrency, targetCurrency, fxRatesMap);
-        const deductionConversion = convertAmount(originalDeduction, sourceCurrency, targetCurrency, fxRatesMap);
-        const payableConversion = convertAmount(originalPayable, sourceCurrency, targetCurrency, fxRatesMap);
-        const orderPrice = Number(orderPriceConversion.value || 0);
-        const settleAmount = Number(settleAmountConversion.value || 0);
-        const ownerProfit = Number(ownerProfitConversion.value || 0);
-        const deduction = Number(deductionConversion.value || 0);
-        const payable = Number(payableConversion.value || 0);
+        const amounts = resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap);
+        const {
+          deductionSourceCurrency, priceSourceCurrency,
+          originalDeduction, originalOrderPrice, originalSettleAmount, originalOwnerProfit, originalPayable,
+          orderPrice, settleAmount, ownerProfit, deduction, payable, ownerProfitConversion,
+        } = amounts;
         let driverRateType = 'none';
         if ((ded?.soloSegments || 0) > 0 && (ded?.teamSegments || 0) > 0) driverRateType = 'mixed';
         else if ((ded?.teamSegments || 0) > 0) driverRateType = 'team';
         else if ((ded?.soloSegments || 0) > 0) driverRateType = 'solo';
         const originalDriverAvgRate = Number(ded?.miles || 0) > 0 ? Number((ded?.weightedRateMiles || 0) / (ded?.miles || 1)) : 0;
-        const driverAvgRate = Number(convertAmount(originalDriverAvgRate, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
+        const driverAvgRate = Number(convertAmount(originalDriverAvgRate, deductionSourceCurrency, targetCurrency, fxRatesMap).value || 0);
         return {
           order: o._id,
           serial_no: o.serial_no || null,
@@ -749,7 +696,7 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
           ownerProfit,
           driverDeduction: deduction,
           payable,
-          sourceCurrency,
+          sourceCurrency: priceSourceCurrency,
           targetCurrency,
           fxRate: Number(ownerProfitConversion.rate || 1),
           originalOrderPrice,
@@ -781,17 +728,19 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
       const ownerAdjustments = ownerOperatorId
         ? adjustments
         : (adjustments[String(owner._id)] || {});
-      const previousSalary = await OwnerOperatorSalary.findOne({
-        tenantId,
-        ownerOperator: owner._id,
-        $or: [
-          { year: { $lt: range.year } },
-          { year: range.year, month: { $lt: range.month } },
-        ],
-      })
-        .sort({ year: -1, month: -1 })
-        .select('currency dueAmount')
-        .lean();
+      // Immediately previous month only (not any prior month) so a skipped/old due isn't
+      // repeatedly carried forward. Matches the driver salary carry-forward semantics.
+      const prevRange = buildDateRange(range.month === 1 ? 12 : range.month - 1, range.month === 1 ? range.year - 1 : range.year);
+      const previousSalary = prevRange
+        ? await OwnerOperatorSalary.findOne({
+            tenantId,
+            ownerOperator: owner._id,
+            month: prevRange.month,
+            year: prevRange.year,
+          })
+            .select('currency dueAmount')
+            .lean()
+        : null;
       const existingSalaryCurrency = normalizeCurrency(existingSalary?.currency, targetCurrency);
       const previousSalaryCurrency = normalizeCurrency(previousSalary?.currency, targetCurrency);
       const convertedExistingPaid = convertAmount(Number(existingSalary?.paidAmount || 0), existingSalaryCurrency, targetCurrency, fxRatesMap).value;
@@ -812,7 +761,7 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
       const finalPayable = basePayable - totalDriverDeduction + previousDueAdded + manualAddition - manualDeduction;
       const paidAmount = Number(convertedExistingPaid || 0);
       const dueAmount = Math.max(finalPayable - paidAmount, 0);
-      const paymentStatus = dueAmount === 0 ? 'paid' : (paidAmount > 0 ? 'partial' : 'pending');
+      const paymentStatus = (dueAmount === 0 && finalPayable > 0) ? 'paid' : (paidAmount > 0 ? 'partial' : 'pending');
       const salaryData = {
         tenantId,
         company: req.user?.company?._id || req.user?.company || null,
@@ -1042,8 +991,17 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     }
     
     if (!companyLogoUrl) {
-      const domainUrl = process.env.DOMAIN_URL || 'http://localhost:3000';
-      companyLogoUrl = `${domainUrl}/logo.png`;
+      // No company logo uploaded — embed the bundled default logo as a base64 data URI so it
+      // always renders in the PDF (no dependency on DOMAIN_URL being reachable from puppeteer).
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const logoBuf = fs.readFileSync(path.join(__dirname, '..', 'assets', 'logo.png'));
+        companyLogoUrl = `data:image/png;base64,${logoBuf.toString('base64')}`;
+      } catch (e) {
+        const domainUrl = process.env.DOMAIN_URL || 'http://localhost:3000';
+        companyLogoUrl = `${domainUrl}/logo.png`;
+      }
     }
 
     const owner = salary?.ownerOperator;
@@ -1057,7 +1015,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
       createdAt: { $gte: range.from, $lte: range.to },
       ...normalizeDeletedFilter(),
     })
-      .select('serial_no customer_order_no total_amount settle_amount owner_profit revenue_currency shipping_details truck input_total_amount input_currency createdAt')
+      .select('serial_no customer_order_no total_amount settle_amount owner_profit revenue_currency shipping_details truck input_total_amount input_settle_amount input_currency createdAt')
       .populate('truck', 'plateNumber unitNumber')
       .lean();
 
@@ -1074,12 +1032,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
 
     const orderBreakdown = orders.map((o) => {
       const ded = byOrder.get(String(o._id));
-      const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-      const originalOrderPrice = Number(o.total_amount || 0);
-      const originalSettleAmount = Number(o.settle_amount || 0);
-      const originalOwnerProfit = Number(o.owner_profit || originalOrderPrice - originalSettleAmount || 0);
-      const originalDriverDeduction = Number(ded?.deduction || 0);
-      const originalPayable = originalSettleAmount - originalDriverDeduction;
+      const amounts = resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap);
       const driverNames = Array.from(ded?.drivers || []).map((id) => driverNameMap.get(String(id)) || '').filter(Boolean);
       return {
         order: o._id,
@@ -1089,11 +1042,12 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
         truck: o.truck || null,
         orderCreatedAt: o.createdAt || null,
         driverNames,
-        orderPrice: Number(convertAmount(originalOrderPrice, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
-        settleAmount: Number(convertAmount(originalSettleAmount, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
-        ownerProfit: Number(convertAmount(originalOwnerProfit, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
-        driverDeduction: Number(convertAmount(originalDriverDeduction, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
-        payable: Number(convertAmount(originalPayable, sourceCurrency, targetCurrency, fxRatesMap).value || 0),
+        driverMiles: Number(ded?.miles || 0),
+        orderPrice: amounts.orderPrice,
+        settleAmount: amounts.settleAmount,
+        ownerProfit: amounts.ownerProfit,
+        driverDeduction: amounts.deduction,
+        payable: amounts.payable,
       };
     });
 
@@ -1475,7 +1429,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     });
     const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: 'networkidle0' });
+    await page.setContent(html, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
     const pdfBuffer = await page.pdf({
       format: 'A4',
       printBackground: true,
@@ -1545,11 +1499,12 @@ exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
     const convertedAmount = Number(convertAmount(amount, inputCurrency, salaryCurrency, fxRatesMap).value || 0);
     if (convertedAmount <= 0) return res.status(400).json({ status: false, message: 'Converted payment amount should be greater than 0' });
 
-    const nextPaid = Number(salary.paidAmount || 0) + convertedAmount;
-    const dueAmount = Number(salary.finalPayable || 0) - nextPaid;
+    // Clamp paid to payable so overpayment can't inflate the paid total / reporting.
+    const finalPayable = Number(salary.finalPayable || 0);
+    const nextPaid = Math.min(Number(salary.paidAmount || 0) + convertedAmount, Math.max(finalPayable, 0));
     salary.paidAmount = nextPaid;
-    salary.dueAmount = Math.max(dueAmount, 0);
-    if (salary.dueAmount === 0) salary.paymentStatus = 'paid';
+    salary.dueAmount = Math.max(finalPayable - nextPaid, 0);
+    if (salary.dueAmount === 0 && finalPayable > 0) salary.paymentStatus = 'paid';
     else if (salary.paidAmount > 0) salary.paymentStatus = 'partial';
     else salary.paymentStatus = 'pending';
     await salary.save();
@@ -1907,21 +1862,20 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
       ...normalizeDeletedFilter(),
       ...dateFilter,
     };
-    const ownerOrders = await Order.find(orderFilter).select('ownerOperator truck total_amount settle_amount owner_profit revenue_currency').lean();
+    const ownerOrders = await Order.find(orderFilter).select('ownerOperator truck total_amount settle_amount owner_profit revenue_currency input_total_amount input_settle_amount input_currency').lean();
     const fxRatesMap = range ? await getFxRatesMap(tenantId, range.month, range.year, targetCurrency) : new Map([[targetCurrency, 1]]);
     const ownerOrderCount = ownerOrders.length;
-    const totalOrderValue = ownerOrders.reduce((acc, o) => {
-      const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-      return acc + Number(convertAmount(o.total_amount, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-    }, 0);
-    const totalSettleAmount = ownerOrders.reduce((acc, o) => {
-      const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-      return acc + Number(convertAmount(o.settle_amount, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-    }, 0);
-    const totalOwnerProfit = ownerOrders.reduce((acc, o) => {
-      const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-      return acc + Number(convertAmount(o.owner_profit, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-    }, 0);
+    // Driver deductions per order (needed up-front so amounts use the shared resolver below).
+    const ownerOrderIds = ownerOrders.map((o) => o._id);
+    const { byOrder, soloTotal, teamTotal } = await buildOrderDriverDeductions(tenantId, ownerOrderIds);
+    // Resolve every order's amounts once (input-sourced price/settle/profit, USD-sourced deduction)
+    // so dashboard totals match the payslip/statement screens.
+    const amountsByOrder = new Map(
+      ownerOrders.map((o) => [String(o._id), resolveOwnerOrderAmounts(o, byOrder.get(String(o._id)), targetCurrency, fxRatesMap)])
+    );
+    const totalOrderValue = ownerOrders.reduce((acc, o) => acc + Number(amountsByOrder.get(String(o._id))?.orderPrice || 0), 0);
+    const totalSettleAmount = ownerOrders.reduce((acc, o) => acc + Number(amountsByOrder.get(String(o._id))?.settleAmount || 0), 0);
+    const totalOwnerProfit = ownerOrders.reduce((acc, o) => acc + Number(amountsByOrder.get(String(o._id))?.ownerProfit || 0), 0);
 
     const ownerDocs = await OwnerOperator.find({ tenantId, ...normalizeDeletedFilter() })
       .select('fullName companyName ownerOperatorId status')
@@ -1944,39 +1898,35 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
         finalPayable: 0,
       };
       cur.orders += 1;
-      const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-      cur.revenue += Number(convertAmount(o.total_amount, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-      cur.settleAmount += Number(convertAmount(o.settle_amount, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-      cur.ownerProfit += Number(convertAmount(o.owner_profit, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      const amt = amountsByOrder.get(String(o._id));
+      cur.revenue += Number(amt?.orderPrice || 0);
+      cur.settleAmount += Number(amt?.settleAmount || 0);
+      cur.ownerProfit += Number(amt?.ownerProfit || 0);
       ownerPerfMap.set(key, cur);
     });
-    const ownerOrderIds = ownerOrders.map((o) => o._id);
-    const { byOrder, soloTotal, teamTotal } = await buildOrderDriverDeductions(tenantId, ownerOrderIds);
     const convertedTeamTotal = ownerOrders.reduce((acc, o) => {
       const ded = byOrder.get(String(o._id));
-      const orderSourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
       const isTeamOrder = Number(ded?.teamSegments || 0) > 0;
       if (!isTeamOrder) return acc;
-      return acc + Number(convertAmount(Number(ded?.deduction || 0), orderSourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      return acc + Number(amountsByOrder.get(String(o._id))?.deduction || 0);
     }, 0);
     const convertedSoloTotal = ownerOrders.reduce((acc, o) => {
       const ded = byOrder.get(String(o._id));
-      const orderSourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
       const isSoloOnly = Number(ded?.teamSegments || 0) === 0 && Number(ded?.soloSegments || 0) > 0;
       if (!isSoloOnly) return acc;
-      return acc + Number(convertAmount(Number(ded?.deduction || 0), orderSourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      return acc + Number(amountsByOrder.get(String(o._id))?.deduction || 0);
     }, 0);
     ownerOrders.forEach((o) => {
       const key = String(o.ownerOperator || '');
       if (!key) return;
       const cur = ownerPerfMap.get(key);
       if (!cur) return;
-      const ded = byOrder.get(String(o._id));
-      const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-      const deduction = Number(convertAmount(Number(ded?.deduction || 0), sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-      const ownerProfit = Number(convertAmount(o.owner_profit, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      const amt = amountsByOrder.get(String(o._id));
+      const deduction = Number(amt?.deduction || 0);
+      const settleAmount = Number(amt?.settleAmount || 0);
       cur.driverDeduction += deduction;
-      cur.finalPayable += ownerProfit - deduction;
+      // Owner payable = settlement - driver cost (matches generated salary basePayable = settle).
+      cur.finalPayable += settleAmount - deduction;
       ownerPerfMap.set(key, cur);
     });
 
@@ -2110,7 +2060,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
       createdAt: { $gte: range.from, $lte: range.to },
       ...normalizeDeletedFilter(),
     })
-      .select('serial_no customer_order_no total_amount settle_amount owner_profit revenue_currency shipping_details truck input_total_amount input_currency createdAt')
+      .select('serial_no customer_order_no total_amount settle_amount owner_profit revenue_currency shipping_details truck input_total_amount input_settle_amount input_currency createdAt')
       .populate('truck', 'plateNumber unitNumber')
       .lean();
     const fxRatesMap = await getFxRatesMap(tenantId, range.month, range.year, targetCurrency);
@@ -2126,23 +2076,18 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
 
     const orderBreakdown = orders.map((o) => {
       const ded = byOrder.get(String(o._id));
-      const sourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
-      const originalOrderPrice = Number(o.total_amount || 0);
-      const originalSettleAmount = Number(o.settle_amount || 0);
-      const originalOwnerProfit = Number(o.owner_profit || originalOrderPrice - originalSettleAmount || 0);
-      const originalDriverDeduction = Number(ded?.deduction || 0);
-      const originalPayable = originalSettleAmount - originalDriverDeduction;
-      const orderPrice = Number(convertAmount(originalOrderPrice, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-      const settleAmount = Number(convertAmount(originalSettleAmount, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-      const ownerProfit = Number(convertAmount(originalOwnerProfit, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-      const driverDeduction = Number(convertAmount(originalDriverDeduction, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
-      const payable = Number(convertAmount(originalPayable, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      const amounts = resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap);
+      const {
+        priceSourceCurrency, deductionSourceCurrency,
+        originalOrderPrice, originalSettleAmount, originalOwnerProfit, originalDeduction: originalDriverDeduction, originalPayable,
+        orderPrice, settleAmount, ownerProfit, deduction: driverDeduction, payable,
+      } = amounts;
       let driverRateType = 'none';
       if ((ded?.soloSegments || 0) > 0 && (ded?.teamSegments || 0) > 0) driverRateType = 'mixed';
       else if ((ded?.teamSegments || 0) > 0) driverRateType = 'team';
       else if ((ded?.soloSegments || 0) > 0) driverRateType = 'solo';
       const originalDriverAvgRate = Number(ded?.miles || 0) > 0 ? Number((ded?.weightedRateMiles || 0) / (ded?.miles || 1)) : 0;
-      const driverAvgRate = Number(convertAmount(originalDriverAvgRate, sourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      const driverAvgRate = Number(convertAmount(originalDriverAvgRate, deductionSourceCurrency, targetCurrency, fxRatesMap).value || 0);
       const driverNames = Array.from(ded?.drivers || []).map((id) => driverNameMap2.get(String(id)) || '').filter(Boolean);
       return {
         order: o._id,
@@ -2152,16 +2097,16 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
         truck: o.truck || null,
         orderCreatedAt: o.createdAt || null,
         input_total_amount: Number(o.input_total_amount || 0),
-        input_currency: normalizeCurrency(o.input_currency, sourceCurrency),
+        input_currency: normalizeCurrency(o.input_currency, priceSourceCurrency),
         driverNames,
         orderPrice,
         settleAmount,
         ownerProfit,
         driverDeduction,
         payable,
-        sourceCurrency,
+        sourceCurrency: priceSourceCurrency,
         targetCurrency,
-        fxRate: Number(convertAmount(1, sourceCurrency, targetCurrency, fxRatesMap).value || 1),
+        fxRate: Number(convertAmount(1, priceSourceCurrency, targetCurrency, fxRatesMap).value || 1),
         originalOrderPrice,
         originalSettleAmount,
         originalOwnerProfit,
@@ -2214,7 +2159,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
     const finalPayable = basePayable - totalDriverDeduction + previousDueAdded + manualAddition - manualDeduction;
     const paidAmount = Number(convertAmount(salaryDoc?.paidAmount, salaryCurrency, targetCurrency, fxRatesMap).value || 0);
     const dueAmount = Math.max(finalPayable - paidAmount, 0);
-    const paymentStatus = dueAmount === 0 ? 'paid' : (paidAmount > 0 ? 'partial' : 'pending');
+    const paymentStatus = (dueAmount === 0 && finalPayable > 0) ? 'paid' : (paidAmount > 0 ? 'partial' : 'pending');
 
     const payload = {
       ownerOperator: owner,
