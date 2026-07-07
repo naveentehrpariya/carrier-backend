@@ -318,6 +318,14 @@ exports.deleteCustomer = catchAsync(async (req, res) => {
           error: 'customer not found.',
         });
       }
+      // Free email + phone so they can be re-used for a new customer in this company
+      const delTs = Date.now();
+      if (customer.email && !String(customer.email).startsWith('deleted_')) {
+        customer.email = `deleted_${delTs}_${customer.email}`;
+      }
+      if (customer.phone && !String(customer.phone).startsWith('deleted_')) {
+        customer.phone = `deleted_${delTs}_${customer.phone}`;
+      }
       customer.deletedAt = Date.now();
       const result = await customer.save();
       if (result) {

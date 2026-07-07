@@ -798,8 +798,14 @@ const inviteUser = catchAsync(async (req, res, next) => {
 
   const { name, email, role, position, allowedModules: requestedModulesRaw } = req.body;
   
-  // Check if user already exists
-  const existingUser = await User.findOne({ email, tenantId: req.tenantId });
+  // Check if user already exists (scoped to admin's company — same email may
+  // exist in a different company of the same tenant)
+  const inviteCompanyId = req.user?.company?._id || req.user?.company || null;
+  const existingUser = await User.findOne({
+    email,
+    tenantId: req.tenantId,
+    ...(inviteCompanyId ? { company: inviteCompanyId } : {}),
+  });
   if (existingUser) {
     return next(new AppError('User with this email already exists in your organization', 400));
   }
@@ -942,15 +948,24 @@ const removeUser = catchAsync(async (req, res, next) => {
     return next(new AppError('Only tenant administrators can remove users', 403));
   }
 
-  const user = await User.findOneAndUpdate(
+  const user = await User.findOne(
     { _id: req.params.id, tenantId: req.tenantId },
-    { status: 'inactive', deletedAt: new Date() },
-    { new: true }
+    null,
+    { includeInactive: true }
   );
 
   if (!user) {
     return next(new AppError('User not found', 404));
   }
+
+  const deletedAt = new Date();
+  // Free the email so it can be re-used for a new user in this company
+  if (user.email && !user.email.startsWith('deleted_')) {
+    user.email = `deleted_${deletedAt.getTime()}_${user.email}`;
+  }
+  user.status = 'inactive';
+  user.deletedAt = deletedAt;
+  await user.save({ validateBeforeSave: false });
 
   logActivity(req, {
     action: 'DELETE',

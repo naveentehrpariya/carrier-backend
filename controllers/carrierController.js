@@ -150,6 +150,10 @@ exports.deleteCarrier = catchAsync(async (req, res) => {
         });
       }
       
+      // Free the email so it can be re-used for a new carrier in this company
+      if (carrier.email && !String(carrier.email).startsWith('deleted_')) {
+        carrier.email = `deleted_${Date.now()}_${carrier.email}`;
+      }
       carrier.deletedAt = Date.now();
       const result = await carrier.save();
       if (result) {

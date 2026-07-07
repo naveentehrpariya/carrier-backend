@@ -20,7 +20,6 @@ const schema = new mongoose.Schema({
     },
     email: {
         type: String,
-        unique: true,
         required: [true, 'Please enter carrier email address.'],
     },
     secondary_phone: {
@@ -66,8 +65,7 @@ const schema = new mongoose.Schema({
         required: [true, 'Please enter carrier location.'],
     },
     carrierID: {
-        type: String,
-        unique: true
+        type: String
     },
     createdAt: {
        type: Date,
@@ -81,8 +79,10 @@ const schema = new mongoose.Schema({
 });
 
 // Compound indexes for multi-tenant performance
-schema.index({ tenantId: 1, email: 1 }, { unique: true });
-schema.index({ tenantId: 1, carrierID: 1 }, { unique: true });
+// Email/carrierID unique per company (not per tenant) — same email allowed in
+// different companies; carrier listings are company-scoped.
+schema.index({ tenantId: 1, company: 1, email: 1 }, { unique: true });
+schema.index({ tenantId: 1, company: 1, carrierID: 1 }, { unique: true });
 schema.index({ tenantId: 1, mc_code: 1 });
 schema.index({ tenantId: 1, createdAt: -1 });
 

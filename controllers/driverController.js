@@ -39,7 +39,12 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'Missing required fields' });
     }
 
-    const isEmailUsed = await User.findOne({ email, tenantId }, null, { includeInactive: true });
+    const addCompanyId = req.user?.company?._id || req.user?.company || null;
+    const isEmailUsed = await User.findOne(
+      { email, tenantId, ...(addCompanyId ? { company: addCompanyId } : {}) },
+      null,
+      { includeInactive: true }
+    );
     if (isEmailUsed) {
       return res.json({ status: false, message: 'Your given email address is already used.' });
     }
@@ -249,7 +254,13 @@ exports.removeDriver = catchAsync(async (req, res, next) => {
     if (!user) {
       return res.status(404).json({ status: false, message: 'Driver not found' });
     }
-    user.deletedAt = new Date();
+    const deletedAt = new Date();
+    // Free the email so the same address can be re-used for a new driver.
+    // Compound unique index { tenantId, email } would otherwise block re-add.
+    if (user.email && !user.email.startsWith('deleted_')) {
+      user.email = `deleted_${deletedAt.getTime()}_${user.email}`;
+    }
+    user.deletedAt = deletedAt;
     user.status = 'inactive';
     await user.save({ validateBeforeSave: false });
     await DriverProfile.findOneAndUpdate({ tenantId, user: user._id }, { deletedAt: new Date() });

@@ -165,7 +165,9 @@ schema.statics.activeFilter = function(tenantId, extra = {}) {
 };
 
 // Compound indexes for multi-tenant performance
-schema.index({ tenantId: 1, email: 1 }, { unique: true });
+// Email unique per company (not per tenant) — same email allowed in different
+// companies of the same tenant; their data/listings are company-scoped anyway.
+schema.index({ tenantId: 1, company: 1, email: 1 }, { unique: true });
 schema.index({ tenantId: 1, corporateID: 1 }, { unique: true });
 schema.index({ tenantId: 1, role: 1 });
 schema.index({ tenantId: 1, status: 1 });

@@ -22,7 +22,6 @@ const schema = new mongoose.Schema({
     },
     email: {
         type: String,
-        unique: true,
         required: [true, 'Please enter customer email address.'],
     },
     secondary_email: {
@@ -78,7 +77,9 @@ const schema = new mongoose.Schema({
 });
 
 // Compound indexes for multi-tenant performance
-schema.index({ tenantId: 1, email: 1 }, { unique: true });
+// Email unique per company (not per tenant) — same email allowed in different
+// companies; customer listings are company-scoped.
+schema.index({ tenantId: 1, company: 1, email: 1 }, { unique: true });
 schema.index({ tenantId: 1, customerCode: 1 });
 schema.index({ tenantId: 1, createdAt: -1 });
 

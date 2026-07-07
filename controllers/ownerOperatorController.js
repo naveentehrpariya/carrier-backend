@@ -329,8 +329,10 @@ exports.addOwnerOperator = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'Full name, phone and email are required' });
     }
 
+    const ownerCompanyId = req.user?.company?._id || req.user?.company || null;
     const exists = await OwnerOperator.findOne({
       tenantId,
+      ...(ownerCompanyId ? { company: ownerCompanyId } : {}),
       email: String(email).trim().toLowerCase(),
       ...normalizeDeletedFilter(),
     }).lean();
