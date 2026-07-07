@@ -202,7 +202,13 @@ exports.driversLists = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'Tenant context is required', lists: [] });
     }
     const companyId = req.user?.company?._id || req.user?.company || null;
-    const filter = { tenantId, $or: [{ permissions: 'driver' }, { role: 0 }] };
+    const filter = {
+      tenantId,
+      $and: [
+        { $or: [{ permissions: 'driver' }, { role: 0 }] },
+        { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] },
+      ],
+    };
     if (companyId) {
       filter.company = companyId;
     }
