@@ -237,13 +237,9 @@ exports.removeDriver = catchAsync(async (req, res, next) => {
     if (!tenantId) {
       return res.status(400).json({ status: false, message: 'Tenant context is required' });
     }
-    const companyId = req.user?.company?._id || req.user?.company || null;
     const id = req.params.id;
-    const filter = { _id: id, tenantId, $or: [{ permissions: 'driver' }, { role: 0 }] };
-    if (companyId) {
-      filter.company = companyId;
-    }
-    const user = await User.findOne(filter);
+    const filter = { _id: id, tenantId };
+    const user = await User.findOne(filter, null, { includeInactive: true });
     if (!user) {
       return res.status(404).json({ status: false, message: 'Driver not found' });
     }
