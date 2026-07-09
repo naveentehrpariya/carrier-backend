@@ -173,8 +173,11 @@ exports.customerDetails = catchAsync(async (req, res, next) => {
   // Scope by tenant + assignment only (mirror customers_listing).
   // Do NOT filter by company — listing doesn't, and many customers have no
   // company set, which wrongly denied access to legitimately-assigned ones.
-  const criteria = { _id: req.params.id };
-  if (req.tenantId) criteria.tenantId = req.tenantId;
+  const tenantIdDet = req.tenantId || req.user?.tenantId;
+  if (!tenantIdDet) {
+    return res.status(400).send({ status: false, result: null, message: 'Tenant context missing.' });
+  }
+  const criteria = { _id: req.params.id, tenantId: tenantIdDet };
 
   const permsD = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
   const isAdminDet = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || permsD.includes('subadmin');
@@ -212,9 +215,13 @@ exports.customerDetails = catchAsync(async (req, res, next) => {
 
 exports.updateCustomer = catchAsync(async (req, res, next) => {
   const { name, secondary_email, secondary_phone, mc_code, phone, email, emails, address, country, state, city, zipcode, assigned_to } = req.body;
-  
+
+  const tenantIdUpd = req.tenantId || req.user?.tenantId;
+  if (!tenantIdUpd) {
+    return res.status(400).send({ status: false, message: 'Tenant context missing.' });
+  }
   if (mc_code) {
-    const existingCustomer = await Customer.findOne({ mc_code: mc_code, _id: { $ne: req.params.id }, ...(req.tenantId ? { tenantId: req.tenantId } : {}) });
+    const existingCustomer = await Customer.findOne({ mc_code: mc_code, _id: { $ne: req.params.id }, tenantId: tenantIdUpd });
     if (existingCustomer) {
       return res.status(200).send({
         status: false,
@@ -243,8 +250,7 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
     }
   }
 
-  const updateQuery = { _id: req.params.id };
-  if (req.tenantId) updateQuery.tenantId = req.tenantId;
+  const updateQuery = { _id: req.params.id, tenantId: tenantIdUpd };
   const isAdminUpd = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || req.user?.permissions?.includes('subadmin');
   const canWriteUpd = req.user?.permissions?.includes('customers_write');
   if (req.user && !isAdminUpd && !canWriteUpd) {
@@ -300,8 +306,11 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
 
 exports.deleteCustomer = catchAsync(async (req, res) => {
     try {
-      const criteria = { _id: req.params.id };
-      if (req.tenantId) criteria.tenantId = req.tenantId;
+      const tenantIdDel = req.tenantId || req.user?.tenantId;
+      if (!tenantIdDel) {
+        return res.status(400).json({ status: false, message: 'Tenant context missing.' });
+      }
+      const criteria = { _id: req.params.id, tenantId: tenantIdDel };
       const isAdminDel = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || req.user?.permissions?.includes('subadmin');
       const canWriteDel = req.user?.permissions?.includes('customers_write');
       if (req.user && !isAdminDel && !canWriteDel) {

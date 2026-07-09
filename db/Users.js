@@ -20,8 +20,8 @@ const schema = new mongoose.Schema({
         required: [true, 'Please enter your email address.'],
         lowercase: true,
         validate: [validator.isEmail, 'Please provide a valid email address.'],
-        // NOTE: No global unique — multi-tenant: uniqueness is enforced by
-        // the compound index { tenantId, email } defined below
+        // NOTE: Globally unique (index below) — login resolves the tenant from
+        // the email, so the same email can never exist in two tenants.
     },
     avatar: {type: String},
     status: {
@@ -32,11 +32,11 @@ const schema = new mongoose.Schema({
     staff_commision: {
         type: Number,
     },
-    corporateID: { 
+    corporateID: {
         type: String,
         required: [true, 'Corporate ID can not be empty.'],
-        unique: true,
-        index: true 
+        // No global unique — tenant-scoped uniqueness via { tenantId, corporateID } below
+        index: true
     },
     position : { 
         type: String,
@@ -165,8 +165,11 @@ schema.statics.activeFilter = function(tenantId, extra = {}) {
 };
 
 // Compound indexes for multi-tenant performance
-// Email unique per company (not per tenant) — same email allowed in different
-// companies of the same tenant; their data/listings are company-scoped anyway.
+// Login email is GLOBALLY unique across all tenants — multi-tenant login and
+// forgot-password resolve the account (and thus the tenant) from the email
+// alone, so a duplicate across tenants would make login ambiguous.
+// Soft-deleted users get their email mangled (`deleted_<ts>_...`), freeing it.
+schema.index({ email: 1 }, { unique: true });
 schema.index({ tenantId: 1, company: 1, email: 1 }, { unique: true });
 schema.index({ tenantId: 1, corporateID: 1 }, { unique: true });
 schema.index({ tenantId: 1, role: 1 });

@@ -993,7 +993,7 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       if (!base64Logo) {
          const companyId = req.user?.company?._id || req.user?.company;
          if (companyId) {
-            const companyDoc = await Company.findById(companyId).select('logo_base64 pdf_logo logo').lean();
+            const companyDoc = await Company.findOne({ _id: companyId, tenantId: req.tenantId || req.user?.tenantId }).select('logo_base64 pdf_logo logo').lean();
             if (companyDoc?.logo_base64) {
                base64Logo = companyDoc.logo_base64;
             } else if (companyDoc?.pdf_logo || companyDoc?.logo) {
@@ -1008,7 +1008,7 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
                   const contentType = response.headers['content-type'] || 'image/png';
                   base64Logo = `data:${contentType};base64,${buffer.toString('base64')}`;
                   // Cache it for next time
-                  await Company.findByIdAndUpdate(companyId, { logo_base64: base64Logo });
+                  await Company.findOneAndUpdate({ _id: companyId, tenantId: req.tenantId || req.user?.tenantId }, { logo_base64: base64Logo });
                } catch (e) {
                   console.error('Failed to fetch remote logo for PDF:', e.message);
                }
@@ -1564,17 +1564,19 @@ exports.getFxRate = catchAsync(async (req, res) => {
 
 exports.order_detail = catchAsync(async (req, res) => {
    const id = req.params.id;
+   const tenantIdCtx = req.tenantId || req.user?.tenantId;
+   if (!tenantIdCtx) {
+      return res.status(400).json({ status: false, orders: null, message: 'Tenant context missing.' });
+   }
    const criteria = {
       _id: id,
+      tenantId: tenantIdCtx,
       $or: [
          { deletedAt: null },
          { deletedAt: '' },
          { deletedAt: { $exists: false } }
       ]
    };
-   if (req.tenantId) {
-      criteria.tenantId = req.tenantId;
-   }
    if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
       criteria.order_type = { $in: req.allowedOrderTypes };
    }

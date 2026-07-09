@@ -140,8 +140,11 @@ exports.deleteCarrier = catchAsync(async (req, res) => {
     }
 
     try {
-      const criteria = { _id: req.params.id };
-      if (req.tenantId) criteria.tenantId = req.tenantId;
+      const tenantIdDel = req.tenantId || req.user?.tenantId;
+      if (!tenantIdDel) {
+        return res.status(400).json({ status: false, message: 'Tenant context missing.' });
+      }
+      const criteria = { _id: req.params.id, tenantId: tenantIdDel };
       const carrier = await Carrier.findOne(criteria);
       if (!carrier) {
         return res.status(404).json({
@@ -192,10 +195,14 @@ exports.updateCarrier = catchAsync(async (req, res, next) => {
     return res.status(403).json({ status: false, message: "You are not authorized to update carriers." });
   }
 
-  try { 
+  try {
     const { mc_code, name, phone, email, emails, location, country, state, city, zipcode, secondary_email, secondary_phone } = req.body;
+    const tenantIdChk = req.tenantId || req.user?.tenantId;
+    if (!tenantIdChk) {
+      return res.status(400).json({ status: false, message: 'Tenant context missing.' });
+    }
     if (mc_code) {
-      const existingCarrier = await Carrier.findOne({ mc_code: mc_code, _id: {$ne: req.params.id }, ...(req.tenantId ? { tenantId: req.tenantId } : {}) });
+      const existingCarrier = await Carrier.findOne({ mc_code: mc_code, _id: {$ne: req.params.id }, tenantId: tenantIdChk });
       if (existingCarrier) {
         return res.status(200).send({
           status: false,

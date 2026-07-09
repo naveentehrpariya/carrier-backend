@@ -120,10 +120,10 @@ const editUser = catchAsync(async (req, res, next) => {
   }
 
   if(req.body.email !== existedUser?.email){
-    // Check if new email is already in use within tenant
-    const emailExists = await User.findOne({ 
-      email: req.body.email, 
-      tenantId: tenantIdFromContext,
+    // Check if new email is already in use — GLOBAL check: login email must be
+    // unique across all tenants (login resolves tenant from email).
+    const emailExists = await User.findOne({
+      email: req.body.email,
       _id: { $ne: req.params.id }
     }, null, { includeInactive: true });
     
@@ -294,8 +294,9 @@ const signup = catchAsync(async (req, res, next) => {
     companyId = foundCompany._id;
   }
 
-  // Check if email is already used within the same tenant
-  const isEmailUsed = await User.findOne({ email: email, tenantId: tenantIdFromContext }, null, { includeInactive: true });
+  // Check if email is already used — GLOBAL check: login email must be unique
+  // across all tenants (login resolves tenant from email).
+  const isEmailUsed = await User.findOne({ email: email }, null, { includeInactive: true });
   let generatedPassword = password || '';
   if(generateAutoPassword === 1){
     generatedPassword = crypto.randomBytes(10).toString('hex');

@@ -823,7 +823,7 @@ const inviteUser = catchAsync(async (req, res, next) => {
   const hashedPassword = await bcrypt.hash(tempPassword, 12);
 
   const companyId = req.user?.company?._id || req.user?.company || null;
-  const company = companyId ? await Company.findById(companyId) : await Company.findOne({ tenantId: req.tenantId });
+  const company = companyId ? await Company.findOne({ _id: companyId, tenantId: req.tenantId }) : await Company.findOne({ tenantId: req.tenantId });
   if (!company) {
     return next(new AppError('Company details are not set up yet. Please add company details first.', 400));
   }

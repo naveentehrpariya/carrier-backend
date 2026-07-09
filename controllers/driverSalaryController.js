@@ -357,7 +357,7 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
     let company = null;
     if (companyId) {
       const Company = require('../db/Company');
-      company = await Company.findById(companyId).lean();
+      company = await Company.findOne({ _id: companyId, tenantId }).lean();
       if (company && (company.pdf_logo || company.logo)) companyLogoUrl = company.pdf_logo || company.logo;
     }
     if (!companyLogoUrl) {

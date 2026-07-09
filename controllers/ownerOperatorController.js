@@ -986,7 +986,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     let companyLogoUrl = req.tenant?.settings?.customizations?.theme?.logo || '';
     if (companyId) {
       const Company = require('../db/Company');
-      const companyDoc = await Company.findById(companyId).lean();
+      const companyDoc = await Company.findOne({ _id: companyId, tenantId }).lean();
       if (companyDoc && (companyDoc.pdf_logo || companyDoc.logo)) {
         companyLogoUrl = companyDoc.pdf_logo || companyDoc.logo;
       }
