@@ -293,9 +293,8 @@ async function resolveRegularOrderOwnerContext({ tenantId, truckId, totalAmount,
    if (settle <= 0) {
       throw new Error('Settle amount is required for owner operated truck');
    }
-   if (settle > orderTotal) {
-      throw new Error('Settle amount can not be greater than order total');
-   }
+   // Settle amount MAY exceed order total (owner paid more than the order
+   // brings in) — owner_profit simply goes negative for that order.
 
    const mode = driverAssignmentMode === 'owner_driver' ? 'owner_driver' : 'company_driver';
    return {
