@@ -40,6 +40,11 @@ const driverProfileSchema = new mongoose.Schema({
       default: Date.now
     }
   }],
+  // Currency the three rates below are entered/stored in. Chosen once at driver creation and
+  // LOCKED thereafter — trips snapshot `rate_per_mile` from these rates, so letting it change
+  // would silently reinterpret every historic trip snapshot. Legacy rows have no value: they
+  // were always USD, hence the default.
+  rateCurrency: { type: String, enum: ['USD', 'CAD', 'INR'], default: 'USD' },
   ratePerMile: { type: Number, default: 0 },
   ratePerMileSolo: { type: Number, default: 0 },
   ratePerMileTeam: { type: Number, default: 0 },

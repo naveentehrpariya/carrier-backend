@@ -13,12 +13,26 @@ const DriverProfile = require('../db/DriverProfile');
 const DriverDeduction = require('../db/DriverDeduction');
 const DriverSalary = require('../db/DriverSalary');
 const { logActivity } = require('../utils/activityLogger');
-const { MI_PER_KM, deriveTripMiles, pickDriverRate } = require('../utils/distance');
-const { normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount } = require('../utils/fx');
+const { MI_PER_KM, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
+const { normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount, missingFxSources } = require('../utils/fx');
 const { ensureMonthlyFxRates } = require('./ownerOperatorController');
 
 function getTenantId(req) {
   return req.tenantId || req.user?.tenantId || null;
+}
+
+// Payslips default to the currency the driver is actually paid in, not the tenant's billing
+// currency — the caller can still ask for any currency explicitly.
+async function resolveSalaryCurrency(req, tenantId, driverId, requested) {
+  if (requested) return normalizeCurrency(requested, 'USD');
+  const profile = await DriverProfile.findOne({ tenantId, user: driverId }).select('rateCurrency').lean();
+  return normalizeCurrency(getDriverRateCurrency(profile), req.tenant?.billing?.currency || 'USD');
+}
+
+// buildDriverSalaryPayload refuses to guess when a month's FX rate is absent — surface that as a
+// 400 instead of letting it fall through to the generic 500 handler.
+function isFxMissing(err) {
+  return err?.code === 'fx_missing';
 }
 
 function hasDriverSalaryAccess(req) {
@@ -35,10 +49,12 @@ const safe = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
 ));
 
 // Per-order trip pay for one driver in a date range. Mirrors getDriverTripSummary math
-// (real miles from order.totalDistance KM, per-driver share, team/solo rate). USD.
+// (real miles from order.totalDistance KM, per-driver share, team/solo rate).
+// All money here is in the driver's locked rateCurrency — NOT necessarily USD.
 async function computeDriverTripPay(tenantId, driverId, range) {
   const driverObjId = new mongoose.Types.ObjectId(driverId);
   const driverProfile = await DriverProfile.findOne({ tenantId, user: driverId }).lean();
+  const rateCurrency = getDriverRateCurrency(driverProfile);
   const soloRate = Number(driverProfile?.ratePerMileSolo ?? driverProfile?.ratePerMile ?? 0) || 0;
   const teamRate = Number(driverProfile?.ratePerMileTeam ?? driverProfile?.ratePerMile ?? 0) || 0;
   const cityRate = Number(driverProfile?.cityHoursRate ?? 0) || 0;
@@ -78,7 +94,7 @@ async function computeDriverTripPay(tenantId, driverId, range) {
   });
 
   const byOrderMap = new Map();
-  let totalTrips = 0, totalMiles = 0, totalKm = 0, totalPayUsd = 0;
+  let totalTrips = 0, totalMiles = 0, totalKm = 0, totalPay = 0;
   driverTrips.forEach((t) => {
     const oid = String(t.order);
     if (!inMonth.has(oid)) return; // only orders created in the window
@@ -93,27 +109,30 @@ async function computeDriverTripPay(tenantId, driverId, range) {
     const rate = pickDriverRate(driverProfile, isTeam, t.rate_per_mile);
     const myPay = myMiles * rate;
 
-    totalTrips += 1; totalMiles += myMiles; totalKm += myKm; totalPayUsd += myPay;
+    totalTrips += 1; totalMiles += myMiles; totalKm += myKm; totalPay += myPay;
 
     const cur = byOrderMap.get(oid) || {
       order: t.order, serial_no: orderSerialMap.get(oid),
-      trips: 0, miles: 0, km: 0, payUsd: 0, rateUsed: 0, rateType: 'solo',
+      trips: 0, miles: 0, km: 0, pay: 0, rateUsed: 0, rateType: 'solo',
     };
-    cur.trips += 1; cur.miles += myMiles; cur.km += myKm; cur.payUsd += myPay;
+    cur.trips += 1; cur.miles += myMiles; cur.km += myKm; cur.pay += myPay;
     cur.rateUsed = Math.max(cur.rateUsed, rate);
     cur.rateType = isTeam ? 'team' : (cur.rateType === 'team' ? 'team' : 'solo');
     byOrderMap.set(oid, cur);
   });
 
   return {
+    rateCurrency,
     soloRate, teamRate, cityRate,
-    totalTrips, totalMiles, totalKm, totalPayUsd,
+    totalTrips, totalMiles, totalKm, totalPay,
     byOrder: Array.from(byOrderMap.values()).sort((a, b) => b.trips - a.trips),
   };
 }
 exports.computeDriverTripPay = computeDriverTripPay;
 
-// Sum DriverDeduction rows (per-date) in range. city_hours -> cityPay/hours; deduct -> deductions. USD.
+// Sum DriverDeduction rows (per-date) in range. city_hours -> cityPay/hours; deduct -> deductions.
+// Rows carry their own snapshotted `currency`, so totals stay bucketed per source currency and the
+// caller converts each bucket — summing them raw would add CAD to USD.
 async function computeDriverDeductions(tenantId, driverId, range) {
   const rows = await DriverDeduction.find({
     tenantId,
@@ -121,57 +140,87 @@ async function computeDriverDeductions(tenantId, driverId, range) {
     deletedAt: null,
     date: { $gte: range.from, $lte: range.to },
   }).lean();
-  let cityHours = 0, cityPay = 0, deductionTotal = 0, additionTotal = 0;
+  let cityHours = 0;
+  const byCurrency = new Map(); // currency -> { cityPay, deductionTotal, additionTotal }
   rows.forEach((d) => {
     const amt = Number(d.amount || 0);
+    const cur = normalizeCurrency(d.currency, 'USD');
+    const bucket = byCurrency.get(cur) || { cityPay: 0, deductionTotal: 0, additionTotal: 0 };
     if (d.type === 'city_hours') {
       cityHours += Number(d.hours || 0);
-      cityPay += amt;
+      bucket.cityPay += amt;
     } else if (d.direction === 'add') {
-      additionTotal += amt;
+      bucket.additionTotal += amt;
     } else {
-      deductionTotal += amt;
+      bucket.deductionTotal += amt;
     }
+    byCurrency.set(cur, bucket);
   });
-  return { cityHours, cityPay, deductionTotal, additionTotal };
+  return { cityHours, byCurrency };
 }
 
 // Build the full (currency-converted) salary payload for a driver/month.
 async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCurrency, opts = {}) {
-  // Auto-seed missing month FX (driver pay is USD) so it never silently converts 1:1.
-  const fxRatesMap = await ensureMonthlyFxRates(tenantId, range.month, range.year, targetCurrency, ['USD'], req.user?._id);
-  const toTarget = (usd) => Number(convertAmount(usd, 'USD', targetCurrency, fxRatesMap).value || 0);
-
   const tp = await computeDriverTripPay(tenantId, driverId, range);
   const dd = await computeDriverDeductions(tenantId, driverId, range);
 
-  const tripPay = toTarget(tp.totalPayUsd);
-  const cityPay = toTarget(dd.cityPay);
-  const deductionTotal = toTarget(dd.deductionTotal);
-  const perDateAddition = toTarget(dd.additionTotal);
+  // Everything that needs converting INTO targetCurrency: the driver's own pay currency, the
+  // currencies its deduction rows were entered in, plus the currencies of the records we carry
+  // forward (previous month's due, this month's saved manual/paid figures).
+  const existing = await DriverSalary.findOne({ tenantId, driver: driverId, month: range.month, year: range.year }).lean();
+  const prevRange = buildDateRange(range.month === 1 ? 12 : range.month - 1, range.month === 1 ? range.year - 1 : range.year);
+  const prev = prevRange
+    ? await DriverSalary.findOne({ tenantId, driver: driverId, month: prevRange.month, year: prevRange.year }).select('currency dueAmount').lean()
+    : null;
+
+  const fxSources = [
+    tp.rateCurrency,
+    ...dd.byCurrency.keys(),
+    ...(existing ? [normalizeCurrency(existing.currency, targetCurrency)] : []),
+    ...(prev ? [normalizeCurrency(prev.currency, targetCurrency)] : []),
+  ];
+  // Auto-seed any missing month FX so conversion never silently falls back to 1:1.
+  const fxRatesMap = await ensureMonthlyFxRates(tenantId, range.month, range.year, targetCurrency, fxSources, req.user?._id);
+
+  // If a rate still can't be resolved, refuse rather than emit a payslip that quietly treats
+  // (say) 1 CAD as 1 USD. Missing FX is a data problem, not a rounding problem.
+  const missing = missingFxSources(fxSources, targetCurrency, fxRatesMap);
+  if (missing.length > 0) {
+    const err = new Error(
+      `No ${range.month}/${range.year} conversion rate for ${missing.join(', ')} → ${targetCurrency}. Add the monthly rate before generating this payslip.`
+    );
+    err.code = 'fx_missing';
+    throw err;
+  }
+
+  const fromRate = (amount) => Number(convertAmount(amount, tp.rateCurrency, targetCurrency, fxRatesMap).value || 0);
+  // Sum each deduction bucket in its own currency, then convert.
+  let cityPay = 0, deductionTotal = 0, perDateAddition = 0;
+  dd.byCurrency.forEach((bucket, cur) => {
+    cityPay += Number(convertAmount(bucket.cityPay, cur, targetCurrency, fxRatesMap).value || 0);
+    deductionTotal += Number(convertAmount(bucket.deductionTotal, cur, targetCurrency, fxRatesMap).value || 0);
+    perDateAddition += Number(convertAmount(bucket.additionTotal, cur, targetCurrency, fxRatesMap).value || 0);
+  });
+
+  const tripPay = fromRate(tp.totalPay);
 
   const orderBreakdown = tp.byOrder.map((b) => {
-    const conv = convertAmount(b.payUsd, 'USD', targetCurrency, fxRatesMap);
+    const conv = convertAmount(b.pay, tp.rateCurrency, targetCurrency, fxRatesMap);
     return {
       order: b.order, serial_no: b.serial_no, trips: b.trips,
       miles: b.miles, km: b.km, rateType: b.rateType,
-      rateUsed: b.rateUsed, pay: Number(conv.value || 0), originalPay: b.payUsd,
+      rateUsed: b.rateUsed, pay: Number(conv.value || 0), originalPay: b.pay,
       fxRate: Number(conv.rate || 1),
     };
   });
 
   // Existing saved record (preserve manual fields + paid on re-generate, like owner).
-  const existing = await DriverSalary.findOne({ tenantId, driver: driverId, month: range.month, year: range.year }).lean();
   const existingCur = normalizeCurrency(existing?.currency, targetCurrency);
   const existPaid = convertAmount(Number(existing?.paidAmount || 0), existingCur, targetCurrency, fxRatesMap).value;
   const existManualDed = convertAmount(Number(existing?.manualDeduction || 0), existingCur, targetCurrency, fxRatesMap).value;
   const existManualAdd = convertAmount(Number(existing?.manualAddition || 0), existingCur, targetCurrency, fxRatesMap).value;
 
   // Previous month's due carry-forward.
-  const prevRange = buildDateRange(range.month === 1 ? 12 : range.month - 1, range.month === 1 ? range.year - 1 : range.year);
-  const prev = prevRange
-    ? await DriverSalary.findOne({ tenantId, driver: driverId, month: prevRange.month, year: prevRange.year }).select('currency dueAmount').lean()
-    : null;
   const prevCur = normalizeCurrency(prev?.currency, targetCurrency);
   const autoPrevDue = convertAmount(Number(prev?.dueAmount || 0), prevCur, targetCurrency, fxRatesMap).value;
 
@@ -202,6 +251,7 @@ async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCu
     month: range.month,
     year: range.year,
     currency: targetCurrency,
+    rateCurrency: tp.rateCurrency,
     soloRate: tp.soloRate, teamRate: tp.teamRate, cityRate: tp.cityRate,
     totalTrips: tp.totalTrips, totalMiles: tp.totalMiles, totalKm: tp.totalKm,
     tripPay, cityHours: dd.cityHours, cityPay, deductionTotal, additionTotal,
@@ -226,7 +276,7 @@ exports.generateDriverSalary = catchAsync(async (req, res, next) => {
     const driver = await Users.findOne({ _id: driverId, tenantId }).lean();
     if (!driver) return res.status(404).json({ status: false, message: 'Driver not found' });
 
-    const targetCurrency = normalizeCurrency(req.body?.currency, req.tenant?.billing?.currency || 'USD');
+    const targetCurrency = await resolveSalaryCurrency(req, tenantId, driverId, req.body?.currency);
     const payload = await buildDriverSalaryPayload(req, tenantId, driverId, range, targetCurrency, {
       includePreviousDue: req.body?.includePreviousDue,
       previousDueAdded: req.body?.previousDueAdded,
@@ -249,6 +299,7 @@ exports.generateDriverSalary = catchAsync(async (req, res, next) => {
 
     return res.json({ status: true, message: 'Driver salary generated', salary });
   } catch (err) {
+    if (isFxMissing(err)) return res.status(400).json({ status: false, code: 'fx_missing', message: err.message });
     JSONerror(res, err, next);
     logger(err);
   }
@@ -264,7 +315,7 @@ exports.getDriverSalary = catchAsync(async (req, res, next) => {
     const { driverId } = req.params;
     const range = buildDateRange(req.query?.month, req.query?.year);
     if (!range) return res.status(400).json({ status: false, message: 'Valid month and year are required' });
-    const targetCurrency = normalizeCurrency(req.query?.currency, req.tenant?.billing?.currency || 'USD');
+    const targetCurrency = await resolveSalaryCurrency(req, tenantId, driverId, req.query?.currency);
 
     const saved = await DriverSalary.findOne({ tenantId, driver: driverId, month: range.month, year: range.year }).lean();
     if (saved && normalizeCurrency(saved.currency, targetCurrency) === targetCurrency) {
@@ -274,6 +325,7 @@ exports.getDriverSalary = catchAsync(async (req, res, next) => {
     const preview = await buildDriverSalaryPayload(req, tenantId, driverId, range, targetCurrency, {});
     return res.json({ status: true, saved: false, salary: preview });
   } catch (err) {
+    if (isFxMissing(err)) return res.status(400).json({ status: false, code: 'fx_missing', message: err.message });
     JSONerror(res, err, next);
     logger(err);
   }
@@ -289,6 +341,32 @@ exports.getDriverSalaryHistory = catchAsync(async (req, res, next) => {
     const { driverId } = req.params;
     const lists = await DriverSalary.find({ tenantId, driver: driverId })
       .sort({ year: -1, month: -1 })
+      .lean();
+    return res.json({ status: true, lists });
+  } catch (err) {
+    JSONerror(res, err, next);
+    logger(err);
+  }
+});
+
+// GET /driver/salaries/list?month&year — all generated payslips of the tenant for one period
+exports.listDriverSalaries = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasDriverSalaryAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to view driver salary' });
+    }
+    const tenantId = getTenantId(req);
+    if (!tenantId) {
+      return res.status(400).json({ status: false, message: 'Tenant context is required' });
+    }
+    const month = parseInt(req.query.month, 10);
+    const year = parseInt(req.query.year, 10);
+    if (!month || !year || month < 1 || month > 12) {
+      return res.status(400).json({ status: false, message: 'Valid month and year are required' });
+    }
+    const lists = await DriverSalary.find({ tenantId, month, year })
+      .populate('driver', 'name corporateID email')
+      .sort({ createdAt: -1 })
       .lean();
     return res.json({ status: true, lists });
   } catch (err) {
@@ -341,7 +419,7 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
     const { driverId } = req.params;
     const range = buildDateRange(req.query?.month, req.query?.year);
     if (!range) return res.status(400).json({ status: false, message: 'Valid month and year are required' });
-    const targetCurrency = normalizeCurrency(req.query?.currency, req.tenant?.billing?.currency || 'USD');
+    const targetCurrency = await resolveSalaryCurrency(req, tenantId, driverId, req.query?.currency);
 
     const driver = await Users.findOne({ _id: driverId, tenantId }).lean();
     if (!driver) return res.status(404).json({ status: false, message: 'Driver not found' });
@@ -373,12 +451,16 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
     const monthName = new Date(range.year, range.month - 1, 1).toLocaleString('en-US', { month: 'long' });
     const cur = targetCurrency;
     const fmt = (n) => `${cur} ${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    // rateUsed is the driver's contracted per-mile rate, stated in the currency it was agreed in —
+    // showing it in `cur` would print a converted number the driver never signed off on.
+    const rateCur = normalizeCurrency(salary.rateCurrency, 'USD');
+    const fmtRate = (n) => `${rateCur} ${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     const rows = (salary.orderBreakdown || []).map((b) => `
       <tr>
         <td>#${safe(b.serial_no ?? '—')}</td>
         <td style="text-transform:uppercase;">${safe(b.rateType)}</td>
         <td style="text-align:right;">${Number(b.miles || 0).toFixed(2)} mi (${Number(b.km || 0).toFixed(2)} km)</td>
-        <td style="text-align:right;">${fmt(b.rateUsed)}/mi</td>
+        <td style="text-align:right;">${fmtRate(b.rateUsed)}/mi</td>
         <td style="text-align:right;font-weight:700;">${fmt(b.pay)}</td>
       </tr>`).join('');
 
@@ -462,6 +544,7 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
     return res.end(pdfBuffer);
   } catch (err) {
     if (browser) { try { await browser.close(); } catch (e) { /* noop */ } }
+    if (isFxMissing(err)) return res.status(400).json({ status: false, code: 'fx_missing', message: err.message });
     JSONerror(res, err, next);
     logger(err);
   }

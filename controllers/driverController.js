@@ -5,6 +5,7 @@ const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
 const bcrypt = require('bcrypt');
 const { logActivity } = require('../utils/activityLogger');
+const { normalizeCurrency } = require('../utils/fx');
 
 const createCorporateId = async () => {
   let corporateID;
@@ -27,6 +28,7 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     }
     const {
       name, email, password, country, phone, address, state, city, zipcode,
+      rateCurrency,
       ratePerMile,
       ratePerMileSolo,
       ratePerMileTeam,
@@ -95,6 +97,8 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       user: user._id,
       emails: normalizedEmails,
       phones: normalizedPhones,
+      // Pay currency is set once, here. editDriver deliberately never updates it.
+      rateCurrency: normalizeCurrency(rateCurrency, 'USD'),
       ratePerMile: Number(ratePerMileSolo ?? ratePerMile) || 0,
       ratePerMileSolo: Number(ratePerMileSolo ?? ratePerMile) || 0,
       ratePerMileTeam: Number(ratePerMileTeam ?? ratePerMile) || 0,
@@ -167,6 +171,9 @@ exports.editDriver = catchAsync(async (req, res, next) => {
       {
         emails: normalizedEmails,
         phones: normalizedPhones,
+        // `rateCurrency` is intentionally absent: the driver's pay currency is locked at creation.
+        // Rate VALUES may be edited, but always in the currency they were created in — changing it
+        // here would reinterpret every trip's existing rate_per_mile snapshot.
         ratePerMile: Number(ratePerMileSolo ?? ratePerMile) || 0,
         ratePerMileSolo: Number(ratePerMileSolo ?? ratePerMile) || 0,
         ratePerMileTeam: Number(ratePerMileTeam ?? ratePerMile) || 0,

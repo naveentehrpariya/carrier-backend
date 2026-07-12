@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const { logActivity } = require('../utils/activityLogger');
+const { getDriverRateCurrency } = require('../utils/distance');
 
 function normalizeCompanyId(req) {
   const raw = req.user?.company?._id || req.user?.company;
@@ -86,6 +87,12 @@ exports.addDeduction = catchAsync(async (req, res, next) => {
     let finalHours = null;
     let finalRate = null;
 
+    // Every amount on this row — city-hours pay, advances, fines, bonuses — is denominated in the
+    // driver's locked pay currency, so the payslip converts one consistent base instead of mixing
+    // USD deductions with (say) CAD trip pay.
+    const profile = await DriverProfile.findOne({ tenantId, user: driverId }).lean();
+    const rowCurrency = getDriverRateCurrency(profile);
+
     if (type === 'city_hours') {
       if (!hours || Number(hours) <= 0) {
         return res.status(400).json({ status: false, message: 'Hours required for city hours entry' });
@@ -93,8 +100,6 @@ exports.addDeduction = catchAsync(async (req, res, next) => {
       // If rate not provided, fetch from driver profile
       let cityRate = Number(rate || 0);
       if (!cityRate) {
-        const companyId = normalizeCompanyId(req);
-        const profile = await DriverProfile.findOne({ tenantId, user: driverId }).lean();
         cityRate = Number(profile?.cityHoursRate || 0);
       }
       finalHours = Number(hours);
@@ -114,6 +119,7 @@ exports.addDeduction = catchAsync(async (req, res, next) => {
       type,
       direction,
       amount: finalAmount,
+      currency: rowCurrency,
       hours: finalHours,
       rate: finalRate,
       description: description || '',

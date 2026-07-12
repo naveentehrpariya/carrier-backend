@@ -18,6 +18,7 @@ router.route('/driver/:driverId/deduction/:deductionId').put(validateToken, reso
 router.route('/driver/:driverId/deduction/:deductionId').delete(validateToken, resolveTenant, driverDeductionController.deleteDeduction);
 
 // Driver monthly salary (parity with owner-operator salary): generate / view / history / adjust / pdf
+router.route('/driver/salaries/list').get(validateToken, resolveTenant, driverSalaryController.listDriverSalaries);
 router.route('/driver/:driverId/salary/generate').post(validateToken, resolveTenant, driverSalaryController.generateDriverSalary);
 router.route('/driver/:driverId/salary/history').get(validateToken, resolveTenant, driverSalaryController.getDriverSalaryHistory);
 router.route('/driver/:driverId/salary/pdf').get(validateToken, resolveTenant, driverSalaryController.getDriverSalaryPdf);

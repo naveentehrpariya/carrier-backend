@@ -51,10 +51,22 @@ function convertAmount(amount, sourceCurrency, targetCurrency, fxMap) {
   return { value: numeric, rate: 1 };
 }
 
+// Source currencies that have no usable rate into `target` in this fx map. convertAmount()
+// silently falls back to 1:1 for these, which produces a wrong (not merely stale) amount —
+// callers that must not guess should assert with this first and fail loudly.
+function missingFxSources(sources, targetCurrency, fxMap) {
+  const target = normalizeCurrency(targetCurrency, 'USD');
+  const unique = Array.from(
+    new Set((sources || []).map((c) => normalizeCurrency(c, target)).filter((c) => c && c !== target))
+  );
+  return unique.filter((source) => !(Number(fxMap?.get(source) || 0) > 0));
+}
+
 module.exports = {
   SUPPORTED_CURRENCIES,
   normalizeCurrency,
   buildDateRange,
   getFxRatesMap,
   convertAmount,
+  missingFxSources,
 };

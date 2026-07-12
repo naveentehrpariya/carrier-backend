@@ -9,9 +9,9 @@ const driverOrderBreakdownSchema = new mongoose.Schema(
     miles: { type: Number, default: 0 },          // this driver's share, real miles
     km: { type: Number, default: 0 },
     rateType: { type: String, enum: ['solo', 'team', 'mixed', 'none'], default: 'none' },
-    rateUsed: { type: Number, default: 0 },        // USD/mile applied
+    rateUsed: { type: Number, default: 0 },        // per-mile rate applied, in the salary's rateCurrency
     pay: { type: Number, default: 0 },             // converted to currency
-    originalPay: { type: Number, default: 0 },     // USD
+    originalPay: { type: Number, default: 0 },     // in the salary's rateCurrency
     fxRate: { type: Number, default: 1 },
   },
   { _id: false }
@@ -24,9 +24,12 @@ const driverSalarySchema = new mongoose.Schema(
     driver: { type: mongoose.Schema.Types.ObjectId, ref: 'users', required: true, index: true },
     month: { type: Number, required: true, min: 1, max: 12, index: true },
     year: { type: Number, required: true, min: 2000, max: 9999, index: true },
-    currency: { type: String, default: 'USD' },
+    currency: { type: String, default: 'USD' },       // output currency of every converted total below
 
-    // Rate snapshot (USD)
+    // Rate snapshot, denominated in `rateCurrency` (the driver's locked pay currency at the time
+    // this payslip was generated) — NOT in `currency`. Kept unconverted so a regenerate reproduces
+    // the same numbers even if FX moves.
+    rateCurrency: { type: String, default: 'USD' },
     soloRate: { type: Number, default: 0 },
     teamRate: { type: Number, default: 0 },
     cityRate: { type: Number, default: 0 },

@@ -50,13 +50,21 @@ function deriveTripMiles(trip, orderDistanceKm, orderRawTotal) {
   return normalizeTripMiles(trip);
 }
 
-// Per-mile USD rate for a driver on a trip: trip override wins, else team/solo profile rate.
+// Per-mile rate for a driver on a trip: trip override wins, else team/solo profile rate.
+// The number is denominated in getDriverRateCurrency(profile) — NOT necessarily USD.
 function pickDriverRate(profile, isTeam, tripRateOverride) {
   const override = Number(tripRateOverride || 0);
   if (override > 0) return override;
   const solo = Number(profile?.ratePerMileSolo ?? profile?.ratePerMile ?? 0) || 0;
   const team = Number(profile?.ratePerMileTeam ?? profile?.ratePerMile ?? 0) || 0;
   return isTeam ? team : solo;
+}
+
+// Currency the driver's stored rates (and any trip rate_per_mile snapshot taken from them)
+// are denominated in. Locked at creation; legacy profiles predate the field and were USD.
+function getDriverRateCurrency(profile) {
+  const code = String(profile?.rateCurrency || '').trim().toUpperCase();
+  return ['USD', 'CAD', 'INR'].includes(code) ? code : 'USD';
 }
 
 module.exports = {
@@ -67,4 +75,5 @@ module.exports = {
   normalizeTripMiles,
   deriveTripMiles,
   pickDriverRate,
+  getDriverRateCurrency,
 };

@@ -9,7 +9,7 @@ const EmptyMoveNote = require('../db/EmptyMoveNote');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const { logActivity } = require('../utils/activityLogger');
-const { MI_PER_KM, deriveTripMiles, pickDriverRate } = require('../utils/distance');
+const { MI_PER_KM, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const driverSalaryController = require('./driverSalaryController');
 
 const emptyDistanceCache = new Map();
@@ -132,6 +132,70 @@ exports.splitOrder = async (req, res) => {
         const order = await Order.findOne({ _id: orderId, tenantId });
         if (!order) {
             return res.status(404).json({ status: false, message: 'Order not found' });
+        }
+
+        // Guard: settlements are order-level (one owner per order), so mixed
+        // owner/company trucks across trips silently corrupt the money math:
+        // an owner-operated order deducts EVERY trip's driver pay from the
+        // owner's settlement, and a second owner's truck earns no settlement
+        // at all. Block the mix until per-trip owner settlement exists.
+        if (order.order_type === 'regular') {
+            const truckIds = [...new Set((segments || []).map(s => s.truck).filter(Boolean).map(String))];
+            if (truckIds.length > 0) {
+                const trucksInUse = await Truck.find({ _id: { $in: truckIds }, tenantId })
+                    .select('ownerOperated ownerOperator')
+                    .populate('ownerOperator', 'fullName')
+                    .lean();
+                const truckMap = new Map(trucksInUse.map(t => [String(t._id), t]));
+                for (const tid of truckIds) {
+                    const t = truckMap.get(tid);
+                    if (!t) {
+                        return res.status(400).json({ status: false, message: 'One of the selected trucks was not found for this tenant.' });
+                    }
+                    if (order.isOwnerOperatedTruck && order.ownerOperator) {
+                        if (!t.ownerOperated || String(t.ownerOperator?._id || t.ownerOperator) !== String(order.ownerOperator)) {
+                            return res.status(400).json({
+                                status: false,
+                                message: 'This order is settled with an owner operator — every trip must use that owner\'s trucks. Mixed owner/company trucks are not supported yet.'
+                            });
+                        }
+                    } else if (t.ownerOperated) {
+                        return res.status(400).json({
+                            status: false,
+                            message: `Truck belongs to owner operator${t.ownerOperator?.fullName ? ` "${t.ownerOperator.fullName}"` : ''} — it cannot be used on a non owner-operated order. Create the order with this truck instead so the owner gets settled.`
+                        });
+                    }
+                }
+            }
+        }
+
+        // Guard: a trip stores ONE blended `rate_per_mile` across its drivers, and driver pay is
+        // later read back in each driver's own locked pay currency. If two drivers on the same trip
+        // are paid in different currencies, that single number gets interpreted as both — e.g. a
+        // blended 0.80 read as 0.80 USD for one driver and 0.80 CAD for the other. Until rates are
+        // stored per driver per trip, require one pay currency per trip.
+        const segmentDriverIds = [...new Set(
+            (segments || []).flatMap(s => (Array.isArray(s.drivers) && s.drivers.length > 0 ? s.drivers : (s.driver ? [s.driver] : [])))
+                .filter(Boolean).map(String)
+        )];
+        if (segmentDriverIds.length > 1) {
+            const profiles = await DriverProfile.find({
+                tenantId,
+                user: { $in: segmentDriverIds },
+            }).select('user rateCurrency').lean();
+            const currencyByDriver = new Map(profiles.map(p => [String(p.user), getDriverRateCurrency(p)]));
+
+            for (const seg of (segments || [])) {
+                const list = (Array.isArray(seg.drivers) && seg.drivers.length > 0 ? seg.drivers : (seg.driver ? [seg.driver] : []))
+                    .filter(Boolean).map(String);
+                const currencies = [...new Set(list.map(id => currencyByDriver.get(id) || 'USD'))];
+                if (currencies.length > 1) {
+                    return res.status(400).json({
+                        status: false,
+                        message: `All drivers on a trip must be paid in the same currency — this trip mixes ${currencies.join(' and ')}. Assign drivers with a matching pay currency.`,
+                    });
+                }
+            }
         }
 
         // Remove existing trips for this order before re-splitting
@@ -526,7 +590,7 @@ exports.getDriverTripSummary = async (req, res) => {
             miles: b.miles,
             km: b.km,
             trips: b.trips,
-            pay: b.payUsd,         // USD; frontend converts to display currency
+            pay: b.pay,            // in tp.rateCurrency; frontend converts to display currency
             rateUsed: b.rateUsed,
             rateType: b.rateType,
         }));
@@ -537,7 +601,10 @@ exports.getDriverTripSummary = async (req, res) => {
                 totalTrips: tp.totalTrips,
                 totalMiles: tp.totalMiles,
                 totalKm: tp.totalKm,
-                totalPay: tp.totalPayUsd,
+                totalPay: tp.totalPay,
+                // Every money field above is denominated in this, not USD — the driver's rates are
+                // stored in the currency they were agreed in.
+                rateCurrency: tp.rateCurrency,
                 soloRate: tp.soloRate,
                 teamRate: tp.teamRate,
             },

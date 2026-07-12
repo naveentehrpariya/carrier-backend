@@ -18,6 +18,8 @@ const ownerOperatorFinancialRecordSchema = new mongoose.Schema(
     month: { type: Number, min: 1, max: 12, index: true },
     year: { type: Number, min: 2000, max: 9999, index: true },
     paymentStatus: { type: String, enum: ['pending', 'partial', 'paid'], default: 'pending' },
+    // User-chosen entry date for ADJUSTMENT rows (statement shows this; createdAt is the fallback)
+    date: { type: Date, default: null },
     notes: { type: String, default: '' },
     meta: { type: mongoose.Schema.Types.Mixed, default: {} },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },

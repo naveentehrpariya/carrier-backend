@@ -16,7 +16,7 @@ const Trip = require('../db/Trip');
 const DriverProfile = require('../db/DriverProfile');
 const Users = require('../db/Users');
 const { logActivity } = require('../utils/activityLogger');
-const { MI_PER_KM, kmToMiles, normalizeTripMiles, deriveTripMiles, pickDriverRate } = require('../utils/distance');
+const { MI_PER_KM, kmToMiles, normalizeTripMiles, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { SUPPORTED_CURRENCIES, normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount } = require('../utils/fx');
 
 function getTenantId(req) {
@@ -182,6 +182,13 @@ async function ensureMonthlyFxRates(tenantId, month, year, targetCurrency, sourc
 }
 exports.ensureMonthlyFxRates = ensureMonthlyFxRates;
 
+// Driver pay charged back against an owner-operator's orders.
+//
+// Every caller (and resolveOwnerOrderAmounts) treats the returned `deduction` as base USD, in the
+// order's revenue_currency. But a driver's rates are stored in whatever currency they were hired
+// at, so a CAD driver's raw pay is NOT USD. We normalize each driver's pay to USD here, using the
+// FX of the month the ORDER was created in — that keeps the owner-side conversion chain untouched
+// and pins the rate to the period the cost belongs to (orders may span months).
 async function buildOrderDriverDeductions(tenantId, orderIds) {
   const emptyResult = { byOrder: new Map(), soloTotal: 0, teamTotal: 0 };
   if (!Array.isArray(orderIds) || orderIds.length === 0) return emptyResult;
@@ -197,10 +204,16 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     tenantId,
     _id: { $in: orderIds },
   })
-    .select('_id totalDistance')
+    .select('_id totalDistance createdAt')
     .lean();
   const orderDistanceKmMap = new Map(
     (orderRows || []).map((o) => [String(o._id), Number(o?.totalDistance || 0)])
+  );
+  const orderMonthMap = new Map(
+    (orderRows || []).map((o) => {
+      const d = o?.createdAt ? new Date(o.createdAt) : new Date();
+      return [String(o._id), { month: d.getMonth() + 1, year: d.getFullYear() }];
+    })
   );
   const orderTripDistanceTotals = new Map();
   (trips || []).forEach((trip) => {
@@ -219,9 +232,32 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     tenantId,
     user: { $in: Array.from(driverIdSet).map((id) => new mongoose.Types.ObjectId(id)) },
   })
-    .select('user ratePerMile ratePerMileSolo ratePerMileTeam')
+    .select('user rateCurrency ratePerMile ratePerMileSolo ratePerMileTeam')
     .lean();
   const profileMap = new Map(driverProfiles.map((p) => [String(p.user), p]));
+
+  // Only fetch FX for the months that actually carry a non-USD driver — the common all-USD tenant
+  // does zero extra queries.
+  const usdFxByMonth = new Map(); // "m-y" -> Map<sourceCurrency, rateToUsd>
+  const nonUsdCurrencies = [...new Set(
+    driverProfiles.map(getDriverRateCurrency).filter((c) => c !== 'USD')
+  )];
+  if (nonUsdCurrencies.length > 0) {
+    const monthKeys = new Map();
+    orderMonthMap.forEach((my) => monthKeys.set(`${my.month}-${my.year}`, my));
+    for (const [key, my] of monthKeys) {
+      // ensureMonthlyFxRates (not getFxRatesMap) — a month with no stored rate would otherwise make
+      // convertAmount fall back to 1:1 and charge the owner a CAD number as if it were USD.
+      usdFxByMonth.set(key, await ensureMonthlyFxRates(tenantId, my.month, my.year, 'USD', nonUsdCurrencies));
+    }
+  }
+  const rateToUsd = (rate, profile, orderId) => {
+    const source = getDriverRateCurrency(profile);
+    if (source === 'USD') return rate;
+    const my = orderMonthMap.get(orderId);
+    const fx = my ? usdFxByMonth.get(`${my.month}-${my.year}`) : null;
+    return Number(convertAmount(rate, source, 'USD', fx).value || 0);
+  };
 
   const byOrder = new Map();
   let soloTotal = 0;
@@ -239,7 +275,8 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     let tripWeightedRateMiles = 0;
     list.forEach((driverId) => {
       const profile = profileMap.get(String(driverId));
-      const rate = pickDriverRate(profile, isTeam, trip.rate_per_mile);
+      // trip.rate_per_mile is snapshotted from this driver's profile, so it shares its currency.
+      const rate = rateToUsd(pickDriverRate(profile, isTeam, trip.rate_per_mile), profile, orderId);
       tripDeduction += (miles / count) * rate;
       tripWeightedRateMiles += (miles / count) * rate;
     });
@@ -1175,7 +1212,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
       const isNeg = signed < 0;
       return `
         <tr>
-          <td style="font-family:'Courier New',monospace;font-size:9px">${safe(fmtDate(r?.createdAt))}</td>
+          <td style="font-family:'Courier New',monospace;font-size:9px">${safe(fmtDate(r?.date || r?.createdAt))}</td>
           <td>${safe(typeLabel)}</td>
           <td class="num" style="color:${isNeg ? '#dc2626' : '#065f46'};font-weight:700;font-family:'Courier New',monospace">${isNeg ? `-${safe(fmtMoney(Math.abs(signed)))}` : `+${safe(fmtMoney(Math.abs(signed)))}`}</td>
           <td style="font-size:9px;color:#64748b">${safe(String(r?.notes || '').slice(0, 30))}</td>
@@ -1603,6 +1640,10 @@ exports.addSalaryExpense = catchAsync(async (req, res, next) => {
     const expenseType = String(req.body?.expenseType || '').toLowerCase();
     const amount = Number(req.body?.amount || 0);
     const notes = String(req.body?.notes || '').trim();
+    const entryDate = req.body?.date ? new Date(req.body.date) : null;
+    if (entryDate && Number.isNaN(entryDate.getTime())) {
+      return res.status(400).json({ status: false, message: 'Invalid date' });
+    }
     if (!['addition', 'deduction'].includes(expenseType)) {
       return res.status(400).json({ status: false, message: 'expenseType must be addition or deduction' });
     }
@@ -1655,6 +1696,7 @@ exports.addSalaryExpense = catchAsync(async (req, res, next) => {
       month: salary.month,
       year: salary.year,
       paymentStatus: salary.paymentStatus,
+      date: entryDate,
       notes,
       meta: {
         expenseType,
@@ -1728,6 +1770,10 @@ exports.updateSalaryExpense = catchAsync(async (req, res, next) => {
 
     record.amount = amount;
     record.notes = notes;
+    if (req.body?.date) {
+      const entryDate = new Date(req.body.date);
+      if (!Number.isNaN(entryDate.getTime())) record.date = entryDate;
+    }
     record.paymentStatus = salary.paymentStatus;
     record.meta = { ...(record.meta || {}), updatedAt: new Date() };
     await record.save();

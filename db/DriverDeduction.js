@@ -12,6 +12,10 @@ const driverDeductionSchema = new mongoose.Schema({
   type: { type: String, enum: DEDUCTION_TYPES, required: true },
   direction: { type: String, enum: DIRECTIONS, required: true },
   amount: { type: Number, required: true, min: 0 },
+  // Currency `amount`/`rate` are denominated in — snapshotted from the driver's locked
+  // rateCurrency at entry time so a later payslip converts it from the right base.
+  // Legacy rows have no value: they were always USD, hence the default.
+  currency: { type: String, enum: ['USD', 'CAD', 'INR'], default: 'USD' },
   // For city_hours: hours worked (amount = hours * rate is computed on read)
   hours: { type: Number, default: null },
   rate: { type: Number, default: null }, // rate at time of entry

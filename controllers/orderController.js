@@ -727,7 +727,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
       if (order.isOwnerOperatedTruck && order.ownerOperator) {
          await syncOwnerOperatorFinancialRecords({
             tenantId,
-            companyId,
+            companyId: req.user?.company?._id || req.user?.company || null,
             userId: req.user?._id,
             order
          });
