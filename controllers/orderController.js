@@ -11,6 +11,7 @@ const Trip = require("../db/Trip");
 const Truck = require("../db/Truck");
 const OwnerOperatorFinancialRecord = require("../db/OwnerOperatorFinancialRecord");
 const ConversionRate = require("../db/ConversionRate");
+const { syncOwnerFinancialRecords, resolveOrderOwnerFields } = require("../utils/ownerSettlement");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity } = require("../utils/activityLogger");
 
@@ -308,41 +309,24 @@ async function resolveRegularOrderOwnerContext({ tenantId, truckId, totalAmount,
    };
 }
 
+async function loadOrderTripsAndTrucks(tenantId, orderId) {
+   const trips = await Trip.find({ tenantId, order: orderId, deletedAt: null })
+      .select('truck miles totalDistance total_km settle_amount')
+      .lean();
+   const truckIds = [...new Set(trips.map((t) => String(t.truck || '')).filter(Boolean))];
+   const truckRows = truckIds.length > 0
+      ? await Truck.find({ tenantId, _id: { $in: truckIds } }).select('ownerOperated ownerOperator').lean()
+      : [];
+   return { trips, truckMap: new Map(truckRows.map((t) => [String(t._id), t])) };
+}
+
+// Owner ledger rows for an order. A mixed split settles per leg, so the trips (and the owner of each
+// trip's truck) decide the rows — see utils/ownerSettlement.js.
 async function syncOwnerOperatorFinancialRecords({ tenantId, companyId, userId, order }) {
-   if (!order?.isOwnerOperatedTruck || !order?.ownerOperator) return;
-   const base = {
-      tenantId,
-      company: companyId || null,
-      ownerOperator: order.ownerOperator,
-      order: order._id,
-      month: new Date(order.createdAt || Date.now()).getMonth() + 1,
-      year: new Date(order.createdAt || Date.now()).getFullYear(),
-      currency: order.revenue_currency || 'cad',
-      createdBy: userId || null
-   };
-
-   await OwnerOperatorFinancialRecord.deleteMany({
-      tenantId,
-      order: order._id,
-      type: { $in: ['SETTLEMENT', 'OWNER_PROFIT', 'DRIVER_DEDUCTION'] }
-   });
-
-   await OwnerOperatorFinancialRecord.insertMany([
-      {
-         ...base,
-         type: 'SETTLEMENT',
-         amount: Number(order.settle_amount || 0),
-         paymentStatus: 'pending',
-         notes: `Settlement for order #${order.serial_no || ''}`.trim()
-      },
-      {
-         ...base,
-         type: 'OWNER_PROFIT',
-         amount: Number(order.owner_profit || 0),
-         paymentStatus: 'pending',
-         notes: `Owner profit for order #${order.serial_no || ''}`.trim()
-      }
-   ]);
+   const { trips, truckMap } = order?.isMixedOwner
+      ? await loadOrderTripsAndTrucks(tenantId, order._id)
+      : { trips: [], truckMap: new Map() };
+   await syncOwnerFinancialRecords({ tenantId, companyId, userId, order, trips, truckMap });
 }
 
 exports.create_order = catchAsync(async (req, res, next) => {
@@ -639,6 +623,32 @@ exports.update_order = catchAsync(async (req, res, next) => {
          });
       }
 
+      // Amounts in the body are the user's TYPED values, in the order's input currency. A caller that
+      // echoes the whole order back (e.g. a screen that only meant to edit the stops) would send the
+      // stored BASE amounts and the base `revenue_currency` instead — which this handler would then
+      // re-stamp as "typed in USD" and re-convert, silently rewriting the order's money. Drop such an
+      // echo: values byte-identical to what is already stored in base are not an edit.
+      const storedInputCurrency = normalizeCurrency(
+         existingOrder.input_currency || existingOrder.revenue_currency || BASE_ORDER_CURRENCY,
+         BASE_ORDER_CURRENCY
+      );
+      const orderIsConverted = storedInputCurrency !== BASE_ORDER_CURRENCY;
+      if (orderIsConverted) {
+         const echoes = (bodyKey, baseKey) =>
+            bodyKey in updateData && Number(updateData[bodyKey]) === Number(existingOrder[baseKey] || 0);
+         if (
+            normalizeCurrency(updateData.revenue_currency, storedInputCurrency) === BASE_ORDER_CURRENCY &&
+            (echoes('total_amount', 'total_amount') || !('total_amount' in updateData))
+         ) {
+            delete updateData.revenue_currency;
+            if (echoes('total_amount', 'total_amount')) delete updateData.total_amount;
+            if (echoes('carrier_amount', 'carrier_amount')) delete updateData.carrier_amount;
+            if (echoes('settle_amount', 'settle_amount')) delete updateData.settle_amount;
+            delete updateData.revenue_items;
+            delete updateData.carrier_revenue_items;
+         }
+      }
+
       const hasAmountRelatedUpdate =
          ('total_amount' in updateData) ||
          ('carrier_amount' in updateData) ||
@@ -684,7 +694,10 @@ exports.update_order = catchAsync(async (req, res, next) => {
       }
 
       const nextOrderType = existingOrder.order_type;
-      if (nextOrderType === 'regular') {
+      // A mixed-owner order is settled per trip, not from order.truck — recomputing the owner context
+      // from the first trip's truck here would hand the whole settlement to one owner. Its owner
+      // columns are re-derived from the trips after the update instead.
+      if (nextOrderType === 'regular' && !existingOrder.isMixedOwner) {
          // Respect explicit truck from the request (including an intentional clear to null).
          // Only fall back to the stored value when the client didn't send the field at all.
          const nextTruck = ('truck' in updateData) ? updateData.truck : existingOrder.truck;
@@ -724,7 +737,21 @@ exports.update_order = catchAsync(async (req, res, next) => {
          new: true,
          runValidators: true,
       });
-      if (order.isOwnerOperatedTruck && order.ownerOperator) {
+      if (order.isMixedOwner) {
+         // Revenue/settle may have changed — re-derive each owner leg's share from the trips.
+         const { trips, truckMap } = await loadOrderTripsAndTrucks(tenantId, order._id);
+         const fields = resolveOrderOwnerFields({ order: order.toObject(), trips, truckMap });
+         order.isOwnerOperatedTruck = fields.isOwnerOperatedTruck;
+         order.ownerOperator = fields.ownerOperator;
+         order.ownerOperators = fields.ownerOperators;
+         order.isMixedOwner = fields.isMixedOwner;
+         order.settle_amount = fields.settle_amount;
+         order.input_settle_amount = fields.input_settle_amount;
+         order.owner_profit = fields.owner_profit;
+         order.carrier_amount = fields.carrier_amount;
+         await order.save();
+      }
+      if (order.isOwnerOperatedTruck) {
          await syncOwnerOperatorFinancialRecords({
             tenantId,
             companyId: req.user?.company?._id || req.user?.company || null,

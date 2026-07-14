@@ -39,6 +39,11 @@ const schema = new mongo.Schema({
     truck: { type: mongoose.Schema.Types.ObjectId, ref: 'trucks' },
     trailer: { type: mongoose.Schema.Types.ObjectId, ref: 'trailers' },
     ownerOperator: { type: mongoose.Schema.Types.ObjectId, ref: 'owneroperators', default: null, index: true },
+    // Split across more than one settlement party (two owner operators, or an owner + a company
+    // truck). Settlement is then per trip: `ownerOperator` is null and `ownerOperators` lists every
+    // owner with a leg on this order.
+    isMixedOwner: { type: Boolean, default: false, index: true },
+    ownerOperators: [{ type: mongoose.Schema.Types.ObjectId, ref: 'owneroperators' }],
     isOwnerOperatedTruck: { type: Boolean, default: false, index: true },
     settle_amount: { type: Number, default: 0 },
     owner_profit: { type: Number, default: 0 },
@@ -250,6 +255,7 @@ schema.index({ tenantId: 1, order_status: 1 });
 schema.index({ tenantId: 1, customer_payment_status: 1 });
 schema.index({ tenantId: 1, carrier_payment_status: 1 });
 schema.index({ tenantId: 1, ownerOperator: 1, createdAt: -1 });
+schema.index({ tenantId: 1, ownerOperators: 1, createdAt: -1 });
 schema.index({ tenantId: 1, isOwnerOperatedTruck: 1, createdAt: -1 });
 
 

@@ -18,6 +18,7 @@ const Users = require('../db/Users');
 const { logActivity } = require('../utils/activityLogger');
 const { MI_PER_KM, kmToMiles, normalizeTripMiles, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { SUPPORTED_CURRENCIES, normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount } = require('../utils/fx');
+const { legKey, buildOrderLegs, ownerOrderMatch } = require('../utils/ownerSettlement');
 
 function getTenantId(req) {
   return req.tenantId || req.user?.tenantId || null;
@@ -66,14 +67,30 @@ function resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap) {
   const hasInput = Number(o?.input_total_amount) > 0;
   const hasInputSettle = Number(o?.input_settle_amount) > 0;
   const originalDeduction = Number(ded?.deduction || 0);
-  const originalOrderPrice = hasInput ? Number(o.input_total_amount) : Number(o?.total_amount || 0);
-  const originalSettleAmount = hasInputSettle ? Number(o.input_settle_amount) : Number(o?.settle_amount || 0);
-  const originalOwnerProfit = (hasInput && hasInputSettle)
+  // Mixed-owner order: this owner only earns their legs. `settleOriginal` is their share of the
+  // order's settle pot (miles-share or the admin's per-trip override) and `priceRatio` their share
+  // of the order revenue. A non-mixed order carries neither, and reads the order's own columns.
+  // `settleOriginal` is null on a legacy (non-mixed) leg — and Number(null) is 0, not NaN, so it must
+  // be excluded explicitly or every existing payslip would settle at zero.
+  const isLeg = ded?.settleOriginal !== null
+    && ded?.settleOriginal !== undefined
+    && Number.isFinite(Number(ded.settleOriginal));
+  const priceRatio = Number.isFinite(Number(ded?.priceRatio)) ? Number(ded.priceRatio) : 1;
+  const fullOrderPrice = hasInput ? Number(o.input_total_amount) : Number(o?.total_amount || 0);
+  const originalOrderPrice = isLeg ? fullOrderPrice * priceRatio : fullOrderPrice;
+  const originalSettleAmount = isLeg
+    ? Number(ded.settleOriginal || 0)
+    : (hasInputSettle ? Number(o.input_settle_amount) : Number(o?.settle_amount || 0));
+  const originalOwnerProfit = (isLeg || (hasInput && hasInputSettle))
     ? (originalOrderPrice - originalSettleAmount)
     : Number(o?.owner_profit || (Number(o?.total_amount || 0) - Number(o?.settle_amount || 0)) || 0);
-  const ownerProfitSourceCurrency = (hasInput && hasInputSettle) ? priceSourceCurrency : deductionSourceCurrency;
+  const ownerProfitSourceCurrency = (isLeg || (hasInput && hasInputSettle)) ? priceSourceCurrency : deductionSourceCurrency;
+  // A leg's settle share is denominated in whatever currency the order's settle pot was typed in.
+  const settleSourceCurrency = isLeg
+    ? normalizeCurrency(ded?.settleCurrency, priceSourceCurrency)
+    : priceSourceCurrency;
   const orderPriceConversion = convertAmount(originalOrderPrice, priceSourceCurrency, targetCurrency, fxRatesMap);
-  const settleAmountConversion = convertAmount(originalSettleAmount, priceSourceCurrency, targetCurrency, fxRatesMap);
+  const settleAmountConversion = convertAmount(originalSettleAmount, settleSourceCurrency, targetCurrency, fxRatesMap);
   const ownerProfitConversion = convertAmount(originalOwnerProfit, ownerProfitSourceCurrency, targetCurrency, fxRatesMap);
   const deductionConversion = convertAmount(originalDeduction, deductionSourceCurrency, targetCurrency, fxRatesMap);
   const orderPrice = Number(orderPriceConversion.value || 0);
@@ -190,7 +207,7 @@ exports.ensureMonthlyFxRates = ensureMonthlyFxRates;
 // FX of the month the ORDER was created in — that keeps the owner-side conversion chain untouched
 // and pins the rate to the period the cost belongs to (orders may span months).
 async function buildOrderDriverDeductions(tenantId, orderIds) {
-  const emptyResult = { byOrder: new Map(), soloTotal: 0, teamTotal: 0 };
+  const emptyResult = { byOrder: new Map(), byOwnerOrder: new Map(), soloTotal: 0, teamTotal: 0 };
   if (!Array.isArray(orderIds) || orderIds.length === 0) return emptyResult;
 
   const trips = await Trip.find({
@@ -198,14 +215,19 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     order: { $in: orderIds },
     deletedAt: null,
   })
-    .select('order miles totalDistance total_km distance_unit rate_per_mile drivers driver')
+    .select('order miles totalDistance total_km distance_unit rate_per_mile drivers driver truck settle_amount')
     .lean();
   const orderRows = await Order.find({
     tenantId,
     _id: { $in: orderIds },
   })
-    .select('_id totalDistance createdAt')
+    .select('_id totalDistance createdAt isMixedOwner ownerOperator ownerOperators settle_amount input_settle_amount input_currency revenue_currency total_amount input_total_amount fx_to_usd')
     .lean();
+  const truckIds = [...new Set((trips || []).map((t) => String(t.truck || '')).filter(Boolean))];
+  const truckRows = truckIds.length > 0
+    ? await Truck.find({ tenantId, _id: { $in: truckIds } }).select('ownerOperated ownerOperator').lean()
+    : [];
+  const truckMap = new Map((truckRows || []).map((t) => [String(t._id), t]));
   const orderDistanceKmMap = new Map(
     (orderRows || []).map((o) => [String(o._id), Number(o?.totalDistance || 0)])
   );
@@ -259,7 +281,17 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     return Number(convertAmount(rate, source, 'USD', fx).value || 0);
   };
 
+  const emptyAgg = () => ({
+    deduction: 0,
+    soloSegments: 0,
+    teamSegments: 0,
+    drivers: new Set(),
+    miles: 0,
+    weightedRateMiles: 0,
+  });
+
   const byOrder = new Map();
+  const byTrip = new Map(); // tripId -> driver-pay aggregate for that single trip
   let soloTotal = 0;
   let teamTotal = 0;
   (trips || []).forEach((trip) => {
@@ -280,14 +312,7 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
       tripDeduction += (miles / count) * rate;
       tripWeightedRateMiles += (miles / count) * rate;
     });
-    const current = byOrder.get(orderId) || {
-      deduction: 0,
-      soloSegments: 0,
-      teamSegments: 0,
-      drivers: new Set(),
-      miles: 0,
-      weightedRateMiles: 0,
-    };
+    const current = byOrder.get(orderId) || emptyAgg();
     current.deduction += tripDeduction;
     current.miles += miles;
     current.weightedRateMiles += tripWeightedRateMiles;
@@ -295,12 +320,74 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     else current.soloSegments += 1;
     list.forEach((driverId) => current.drivers.add(driverId));
     byOrder.set(orderId, current);
+    byTrip.set(String(trip._id), {
+      deduction: tripDeduction,
+      miles,
+      weightedRateMiles: tripWeightedRateMiles,
+      isTeam,
+      drivers: list,
+    });
     if (isTeam) teamTotal += tripDeduction;
     else soloTotal += tripDeduction;
   });
 
-  return { byOrder, soloTotal, teamTotal };
+  // Per-(order, owner) legs. A non-mixed order yields one leg holding the whole order — identical
+  // numbers to the old order-level math, so already-generated payslips don't move.
+  const tripsByOrder = new Map();
+  (trips || []).forEach((t) => {
+    const list = tripsByOrder.get(String(t.order)) || [];
+    list.push(t);
+    tripsByOrder.set(String(t.order), list);
+  });
+
+  const byOwnerOrder = new Map();
+  (orderRows || []).forEach((order) => {
+    const orderId = String(order._id);
+    const orderTrips = tripsByOrder.get(orderId) || [];
+    const { legs } = buildOrderLegs({ order, trips: orderTrips, truckMap });
+    legs.forEach((leg, ownerId) => {
+      const agg = emptyAgg();
+      leg.tripIds.forEach((tripId) => {
+        const t = byTrip.get(String(tripId));
+        if (!t) return;
+        agg.deduction += t.deduction;
+        agg.miles += t.miles;
+        agg.weightedRateMiles += t.weightedRateMiles;
+        if (t.isTeam) agg.teamSegments += 1;
+        else agg.soloSegments += 1;
+        t.drivers.forEach((d) => agg.drivers.add(String(d)));
+      });
+      byOwnerOrder.set(legKey(orderId, ownerId), {
+        ...agg,
+        settleOriginal: leg.settleOriginal,
+        settleCurrency: leg.settleCurrency,
+        priceRatio: leg.priceRatio,
+        isMixedOwner: !!order.isMixedOwner,
+        legMiles: leg.miles,
+      });
+    });
+  });
+
+  return { byOrder, byOwnerOrder, soloTotal, teamTotal };
 }
+
+// Driver-pay aggregate for one owner's legs of an order. Falls back to the order-level aggregate for
+// orders that predate mixed splits (or carry no owner at all).
+function ownerOrderDeduction(deds, orderId, ownerId) {
+  if (!ownerId) return deds?.byOrder?.get(String(orderId));
+  return deds?.byOwnerOrder?.get(legKey(orderId, ownerId)) || deds?.byOrder?.get(String(orderId));
+}
+
+// The order is settled to this owner outright, or the owner runs one leg of a mixed split.
+function orderHasOwner(o, ownerId) {
+  if (!ownerId) return false;
+  if (String(o?.ownerOperator || '') === String(ownerId)) return true;
+  return (o?.ownerOperators || []).some((id) => String(id) === String(ownerId));
+}
+
+// Owner-order columns every settlement screen needs (mixed-split fields included).
+const OWNER_ORDER_FIELDS =
+  'serial_no customer_order_no ownerOperator ownerOperators isMixedOwner total_amount settle_amount owner_profit revenue_currency input_total_amount input_settle_amount input_currency fx_to_usd totalDistance driver_assignment_mode';
 
 exports.ownerOperatorListings = catchAsync(async (req, res, next) => {
   try {
@@ -443,11 +530,17 @@ exports.ownerOperatorDetail = catchAsync(async (req, res, next) => {
     }
     const orders = await Order.find({
       tenantId,
-      ...normalizeDeletedFilter(),
-      $or: [
-        { ownerOperator: ownerOperator._id },
-        ...(truckIds.length ? [{ truck: { $in: truckIds } }] : []),
-        ...(tripOrderIds.length ? [{ _id: { $in: tripOrderIds } }] : []),
+      // $and, not two sibling $or keys — the second would silently replace the deleted-filter one.
+      $and: [
+        normalizeDeletedFilter(),
+        {
+          $or: [
+            { ownerOperator: ownerOperator._id },
+            { ownerOperators: ownerOperator._id },
+            ...(truckIds.length ? [{ truck: { $in: truckIds } }] : []),
+            ...(tripOrderIds.length ? [{ _id: { $in: tripOrderIds } }] : []),
+          ],
+        },
       ],
     })
       .select('serial_no order_status order_type total_amount settle_amount owner_profit input_total_amount input_currency revenue_currency createdAt pickup_date delivery_date customer truck shipping_details')
@@ -698,22 +791,22 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
       tenantId,
       order_type: 'regular',
       isOwnerOperatedTruck: true,
-      ownerOperator: { $in: ownerIds },
       createdAt: { $gte: range.from, $lte: range.to },
-      ...normalizeDeletedFilter(),
+      $and: [ownerOrderMatch(ownerIds), normalizeDeletedFilter()],
     })
-      .select('serial_no customer_order_no ownerOperator total_amount settle_amount owner_profit revenue_currency input_total_amount input_settle_amount input_currency driver_assignment_mode')
+      .select(OWNER_ORDER_FIELDS)
       .lean();
     // Auto-seed any missing month FX rates so amounts never silently convert 1:1.
     const fxRatesMap = await ensureMonthlyFxRates(tenantId, range.month, range.year, targetCurrency, ['USD', 'CAD', 'INR'], req.user?._id);
     const orderIds = orders.map((o) => o._id);
 
-    const { byOrder, soloTotal, teamTotal } = await buildOrderDriverDeductions(tenantId, orderIds);
+    const deds = await buildOrderDriverDeductions(tenantId, orderIds);
+    const { soloTotal, teamTotal } = deds;
     const salaries = [];
     for (const owner of ownerOperators) {
-      const ownerOrders = orders.filter((o) => String(o.ownerOperator) === String(owner._id));
+      const ownerOrders = orders.filter((o) => orderHasOwner(o, owner._id));
       const breakdown = ownerOrders.map((o) => {
-        const ded = byOrder.get(String(o._id));
+        const ded = ownerOrderDeduction(deds, o._id, owner._id);
         const amounts = resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap);
         const {
           deductionSourceCurrency, priceSourceCurrency,
@@ -900,7 +993,7 @@ exports.salaryListings = catchAsync(async (req, res, next) => {
           .map((id) => String(id))
       )
     );
-    const fallbackMap = allOrderIds.length > 0 ? (await buildOrderDriverDeductions(tenantId, allOrderIds)).byOrder : new Map();
+    const fallbackDeds = allOrderIds.length > 0 ? await buildOrderDriverDeductions(tenantId, allOrderIds) : null;
     const orderMetaRows = allOrderIds.length > 0
       ? await Order.find({ tenantId, _id: { $in: allOrderIds } })
           .select('_id serial_no customer_order_no')
@@ -918,7 +1011,8 @@ exports.salaryListings = catchAsync(async (req, res, next) => {
           const hasMiles = b?.driverMiles !== undefined && b?.driverMiles !== null && Number(b?.driverMiles || 0) > 0;
           const hasRate = b?.driverAvgRate !== undefined && b?.driverAvgRate !== null && Number(b?.driverAvgRate || 0) > 0;
           if (hasMiles && hasRate) return b;
-          const ded = fallbackMap.get(String(b?.order || ''));
+          const ownerId = salary?.ownerOperator?._id || salary?.ownerOperator;
+          const ded = ownerOrderDeduction(fallbackDeds, b?.order || '', ownerId);
           const meta = orderMetaMap.get(String(b?.order || '')) || {};
           const fallbackMiles = Number(ded?.miles || 0);
           const fallbackRate = fallbackMiles > 0 ? Number((ded?.weightedRateMiles || 0) / fallbackMiles) : 0;
@@ -958,7 +1052,7 @@ exports.salaryDetail = catchAsync(async (req, res, next) => {
     }
 
     const orderIds = Array.from(new Set((salary?.orderBreakdown || []).map((b) => b?.order).filter(Boolean).map((id) => String(id))));
-    const fallbackMap = orderIds.length > 0 ? (await buildOrderDriverDeductions(tenantId, orderIds)).byOrder : new Map();
+    const fallbackDeds = orderIds.length > 0 ? await buildOrderDriverDeductions(tenantId, orderIds) : null;
     const orderMetaRows = orderIds.length > 0
       ? await Order.find({ tenantId, _id: { $in: orderIds } })
           .select('_id serial_no customer_order_no')
@@ -973,7 +1067,8 @@ exports.salaryDetail = catchAsync(async (req, res, next) => {
         const hasMiles = b?.driverMiles !== undefined && b?.driverMiles !== null && Number(b?.driverMiles || 0) > 0;
         const hasRate = b?.driverAvgRate !== undefined && b?.driverAvgRate !== null && Number(b?.driverAvgRate || 0) > 0;
         if (hasMiles && hasRate && b?.serial_no && b?.customer_order_no) return b;
-        const ded = fallbackMap.get(String(b?.order || ''));
+        const ownerId = salary?.ownerOperator?._id || salary?.ownerOperator;
+        const ded = ownerOrderDeduction(fallbackDeds, b?.order || '', ownerId);
         const meta = orderMetaMap.get(String(b?.order || '')) || {};
         const fallbackMiles = Number(ded?.miles || 0);
         const fallbackRate = fallbackMiles > 0 ? Number((ded?.weightedRateMiles || 0) / fallbackMiles) : 0;
@@ -1050,27 +1145,26 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
       tenantId,
       order_type: 'regular',
       isOwnerOperatedTruck: true,
-      ownerOperator: owner._id,
       createdAt: { $gte: range.from, $lte: range.to },
-      ...normalizeDeletedFilter(),
+      $and: [ownerOrderMatch([owner._id]), normalizeDeletedFilter()],
     })
-      .select('serial_no customer_order_no total_amount settle_amount owner_profit revenue_currency shipping_details truck input_total_amount input_settle_amount input_currency createdAt')
+      .select(`${OWNER_ORDER_FIELDS} shipping_details truck createdAt`)
       .populate('truck', 'plateNumber unitNumber')
       .lean();
 
     const fxRatesMap = await getFxRatesMap(tenantId, range.month, range.year, targetCurrency);
     const orderIds = orders.map((o) => o._id);
-    const { byOrder } = await buildOrderDriverDeductions(tenantId, orderIds);
+    const deds = await buildOrderDriverDeductions(tenantId, orderIds);
 
     const allDriverIds = new Set();
-    byOrder.forEach((v) => v.drivers.forEach((id) => allDriverIds.add(String(id))));
+    deds.byOrder.forEach((v) => v.drivers.forEach((id) => allDriverIds.add(String(id))));
     const driverDocs = allDriverIds.size > 0
       ? await Users.find({ _id: { $in: Array.from(allDriverIds) } }, { _id: 1, name: 1 }).lean()
       : [];
     const driverNameMap = new Map(driverDocs.map((u) => [String(u._id), u.name || '']));
 
     const orderBreakdown = orders.map((o) => {
-      const ded = byOrder.get(String(o._id));
+      const ded = ownerOrderDeduction(deds, o._id, owner._id);
       const amounts = resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap);
       const driverNames = Array.from(ded?.drivers || []).map((id) => driverNameMap.get(String(id)) || '').filter(Boolean);
       return {
@@ -1082,6 +1176,7 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
         orderCreatedAt: o.createdAt || null,
         driverNames,
         driverMiles: Number(ded?.miles || 0),
+        isMixedOwner: !!o.isMixedOwner,
         orderPrice: amounts.orderPrice,
         settleAmount: amounts.settleAmount,
         ownerProfit: amounts.ownerProfit,
@@ -1910,17 +2005,25 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
       ...normalizeDeletedFilter(),
       ...dateFilter,
     };
-    const ownerOrders = await Order.find(orderFilter).select('ownerOperator truck total_amount settle_amount owner_profit revenue_currency input_total_amount input_settle_amount input_currency').lean();
+    const ownerOrders = await Order.find(orderFilter).select(`${OWNER_ORDER_FIELDS} truck`).lean();
     const fxRatesMap = range ? await getFxRatesMap(tenantId, range.month, range.year, targetCurrency) : new Map([[targetCurrency, 1]]);
     const ownerOrderCount = ownerOrders.length;
     // Driver deductions per order (needed up-front so amounts use the shared resolver below).
     const ownerOrderIds = ownerOrders.map((o) => o._id);
-    const { byOrder, soloTotal, teamTotal } = await buildOrderDriverDeductions(tenantId, ownerOrderIds);
+    const deds = await buildOrderDriverDeductions(tenantId, ownerOrderIds);
+    const { byOrder, soloTotal, teamTotal } = deds;
     // Resolve every order's amounts once (input-sourced price/settle/profit, USD-sourced deduction)
-    // so dashboard totals match the payslip/statement screens.
+    // so dashboard totals match the payslip/statement screens. Company-wide totals stay order-level
+    // (an order's revenue and settle pot are counted once, however many owners split it).
     const amountsByOrder = new Map(
       ownerOrders.map((o) => [String(o._id), resolveOwnerOrderAmounts(o, byOrder.get(String(o._id)), targetCurrency, fxRatesMap)])
     );
+    // Per-owner rollup is leg-level: a mixed order contributes only that owner's legs.
+    const ownersOfOrder = (o) => (o?.isMixedOwner
+      ? (o?.ownerOperators || []).map(String)
+      : (o?.ownerOperator ? [String(o.ownerOperator)] : []));
+    const legAmounts = (o, ownerId) =>
+      resolveOwnerOrderAmounts(o, ownerOrderDeduction(deds, o._id, ownerId), targetCurrency, fxRatesMap);
     const totalOrderValue = ownerOrders.reduce((acc, o) => acc + Number(amountsByOrder.get(String(o._id))?.orderPrice || 0), 0);
     const totalSettleAmount = ownerOrders.reduce((acc, o) => acc + Number(amountsByOrder.get(String(o._id))?.settleAmount || 0), 0);
     const totalOwnerProfit = ownerOrders.reduce((acc, o) => acc + Number(amountsByOrder.get(String(o._id))?.ownerProfit || 0), 0);
@@ -1935,22 +2038,22 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
       ])
     );
     ownerOrders.forEach((o) => {
-      const key = String(o.ownerOperator || '');
-      if (!key) return;
-      const cur = ownerPerfMap.get(key) || {
-        orders: 0,
-        revenue: 0,
-        settleAmount: 0,
-        ownerProfit: 0,
-        driverDeduction: 0,
-        finalPayable: 0,
-      };
-      cur.orders += 1;
-      const amt = amountsByOrder.get(String(o._id));
-      cur.revenue += Number(amt?.orderPrice || 0);
-      cur.settleAmount += Number(amt?.settleAmount || 0);
-      cur.ownerProfit += Number(amt?.ownerProfit || 0);
-      ownerPerfMap.set(key, cur);
+      ownersOfOrder(o).forEach((key) => {
+        const cur = ownerPerfMap.get(key) || {
+          orders: 0,
+          revenue: 0,
+          settleAmount: 0,
+          ownerProfit: 0,
+          driverDeduction: 0,
+          finalPayable: 0,
+        };
+        cur.orders += 1;
+        const amt = legAmounts(o, key);
+        cur.revenue += Number(amt?.orderPrice || 0);
+        cur.settleAmount += Number(amt?.settleAmount || 0);
+        cur.ownerProfit += Number(amt?.ownerProfit || 0);
+        ownerPerfMap.set(key, cur);
+      });
     });
     const convertedTeamTotal = ownerOrders.reduce((acc, o) => {
       const ded = byOrder.get(String(o._id));
@@ -1965,17 +2068,17 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
       return acc + Number(amountsByOrder.get(String(o._id))?.deduction || 0);
     }, 0);
     ownerOrders.forEach((o) => {
-      const key = String(o.ownerOperator || '');
-      if (!key) return;
-      const cur = ownerPerfMap.get(key);
-      if (!cur) return;
-      const amt = amountsByOrder.get(String(o._id));
-      const deduction = Number(amt?.deduction || 0);
-      const settleAmount = Number(amt?.settleAmount || 0);
-      cur.driverDeduction += deduction;
-      // Owner payable = settlement - driver cost (matches generated salary basePayable = settle).
-      cur.finalPayable += settleAmount - deduction;
-      ownerPerfMap.set(key, cur);
+      ownersOfOrder(o).forEach((key) => {
+        const cur = ownerPerfMap.get(key);
+        if (!cur) return;
+        const amt = legAmounts(o, key);
+        const deduction = Number(amt?.deduction || 0);
+        const settleAmount = Number(amt?.settleAmount || 0);
+        cur.driverDeduction += deduction;
+        // Owner payable = settlement - driver cost (matches generated salary basePayable = settle).
+        cur.finalPayable += settleAmount - deduction;
+        ownerPerfMap.set(key, cur);
+      });
     });
 
     const ownerMetaMap = new Map(ownerDocs.map((o) => [String(o._id), o]));
@@ -2104,16 +2207,16 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
       tenantId,
       order_type: 'regular',
       isOwnerOperatedTruck: true,
-      ownerOperator: ownerOperatorId,
       createdAt: { $gte: range.from, $lte: range.to },
-      ...normalizeDeletedFilter(),
+      $and: [ownerOrderMatch([ownerOperatorId]), normalizeDeletedFilter()],
     })
-      .select('serial_no customer_order_no total_amount settle_amount owner_profit revenue_currency shipping_details truck input_total_amount input_settle_amount input_currency createdAt')
+      .select(`${OWNER_ORDER_FIELDS} shipping_details truck createdAt`)
       .populate('truck', 'plateNumber unitNumber')
       .lean();
     const fxRatesMap = await getFxRatesMap(tenantId, range.month, range.year, targetCurrency);
     const orderIds = orders.map((o) => o._id);
-    const { byOrder } = await buildOrderDriverDeductions(tenantId, orderIds);
+    const deds = await buildOrderDriverDeductions(tenantId, orderIds);
+    const { byOrder } = deds;
 
     const allDriverIds2 = new Set();
     byOrder.forEach((v) => v.drivers.forEach((id) => allDriverIds2.add(String(id))));
@@ -2123,7 +2226,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
     const driverNameMap2 = new Map(driverDocs2.map((u) => [String(u._id), u.name || '']));
 
     const orderBreakdown = orders.map((o) => {
-      const ded = byOrder.get(String(o._id));
+      const ded = ownerOrderDeduction(deds, o._id, ownerOperatorId);
       const amounts = resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap);
       const {
         priceSourceCurrency, deductionSourceCurrency,
@@ -2144,8 +2247,12 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
         shipping_details: Array.isArray(o.shipping_details) ? o.shipping_details : [],
         truck: o.truck || null,
         orderCreatedAt: o.createdAt || null,
-        input_total_amount: Number(o.input_total_amount || 0),
+        // On a mixed split this owner only ran part of the load, so the statement shows their leg's
+        // share of the order price — not the full order value.
+        input_total_amount: Number(originalOrderPrice || 0),
         input_currency: normalizeCurrency(o.input_currency, priceSourceCurrency),
+        isMixedOwner: !!o.isMixedOwner,
+        legMiles: Number(ded?.legMiles || ded?.miles || 0),
         driverNames,
         orderPrice,
         settleAmount,

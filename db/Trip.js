@@ -31,6 +31,10 @@ const tripSchema = new mongoose.Schema({
     distance_unit: { type: String, enum: ['mi', 'km'], default: 'mi' },
     rate_per_mile: { type: Number, default: 0 }, // Decided rate for this driver at time of split
     total_driver_pay: { type: Number, default: 0 },
+
+    // Owner-operator settlement for this leg, typed by the admin in the ORDER's input currency.
+    // null = derive it from the order's settle amount by miles share (see utils/ownerSettlement.js).
+    settle_amount: { type: Number, default: null },
     
     status: {
         type: String,

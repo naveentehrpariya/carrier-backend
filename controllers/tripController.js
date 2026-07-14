@@ -10,9 +10,18 @@ const mongoose = require('mongoose');
 const axios = require('axios');
 const { logActivity } = require('../utils/activityLogger');
 const { MI_PER_KM, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
+const { resolveOrderOwnerFields, syncOwnerFinancialRecords } = require('../utils/ownerSettlement');
 const driverSalaryController = require('./driverSalaryController');
 
 const emptyDistanceCache = new Map();
+
+// A trip's settle amount is optional: null means "derive it from the order's settle pot by miles".
+function normalizeSegmentSettle(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+}
 
 function getGoogleApiKey() {
     return (
@@ -134,38 +143,35 @@ exports.splitOrder = async (req, res) => {
             return res.status(404).json({ status: false, message: 'Order not found' });
         }
 
-        // Guard: settlements are order-level (one owner per order), so mixed
-        // owner/company trucks across trips silently corrupt the money math:
-        // an owner-operated order deducts EVERY trip's driver pay from the
-        // owner's settlement, and a second owner's truck earns no settlement
-        // at all. Block the mix until per-trip owner settlement exists.
+        // An order may be split across an owner's truck, a second owner's truck and a company truck.
+        // Settlement is then per trip (see utils/ownerSettlement.js): each owner is paid only for the
+        // legs their trucks ran. Validate the trucks exist and that the owner legs actually carry money.
+        const truckMap = new Map();
         if (order.order_type === 'regular') {
             const truckIds = [...new Set((segments || []).map(s => s.truck).filter(Boolean).map(String))];
             if (truckIds.length > 0) {
                 const trucksInUse = await Truck.find({ _id: { $in: truckIds }, tenantId })
                     .select('ownerOperated ownerOperator')
-                    .populate('ownerOperator', 'fullName')
                     .lean();
-                const truckMap = new Map(trucksInUse.map(t => [String(t._id), t]));
+                trucksInUse.forEach(t => truckMap.set(String(t._id), t));
                 for (const tid of truckIds) {
-                    const t = truckMap.get(tid);
-                    if (!t) {
+                    if (!truckMap.has(tid)) {
                         return res.status(400).json({ status: false, message: 'One of the selected trucks was not found for this tenant.' });
                     }
-                    if (order.isOwnerOperatedTruck && order.ownerOperator) {
-                        if (!t.ownerOperated || String(t.ownerOperator?._id || t.ownerOperator) !== String(order.ownerOperator)) {
-                            return res.status(400).json({
-                                status: false,
-                                message: 'This order is settled with an owner operator — every trip must use that owner\'s trucks. Mixed owner/company trucks are not supported yet.'
-                            });
-                        }
-                    } else if (t.ownerOperated) {
-                        return res.status(400).json({
-                            status: false,
-                            message: `Truck belongs to owner operator${t.ownerOperator?.fullName ? ` "${t.ownerOperator.fullName}"` : ''} — it cannot be used on a non owner-operated order. Create the order with this truck instead so the owner gets settled.`
-                        });
-                    }
                 }
+            }
+
+            const settleErrors = [];
+            (segments || []).forEach((seg, i) => {
+                if (seg.settle_amount === null || seg.settle_amount === undefined || seg.settle_amount === '') return;
+                const v = Number(seg.settle_amount);
+                if (!Number.isFinite(v) || v < 0) settleErrors.push(`Trip ${i + 1}`);
+            });
+            if (settleErrors.length > 0) {
+                return res.status(400).json({
+                    status: false,
+                    message: `Settle amount must be a positive number (${settleErrors.join(', ')}).`,
+                });
             }
         }
 
@@ -198,9 +204,32 @@ exports.splitOrder = async (req, res) => {
             }
         }
 
+        // Owner legs must actually carry money: an owner whose settle share is zero would be paid
+        // nothing for the miles they ran. Check on the incoming segments, before any trip is written.
+        let ownerFields = null;
+        if (order.order_type === 'regular') {
+            const segTrips = (segments || []).map((seg, i) => ({
+                _id: `seg-${i}`,
+                truck: seg.truck,
+                miles: Number(seg.miles || seg.totalDistance || 0),
+                totalDistance: Number(seg.totalDistance || seg.miles || 0),
+                total_km: Number(seg.total_km || 0),
+                settle_amount: normalizeSegmentSettle(seg.settle_amount),
+            }));
+            ownerFields = resolveOrderOwnerFields({ order, trips: segTrips, truckMap });
+            // settlePot is the base-currency payout: it covers legacy orders too, which carry the
+            // amount in settle_amount and leave input_settle_amount at 0.
+            if (ownerFields.isOwnerOperatedTruck && Number(ownerFields.settlePot || 0) <= 0) {
+                return res.status(400).json({
+                    status: false,
+                    message: 'This split uses an owner operator\'s truck but has no settle amount. Enter the settle amount for each owner-operated trip (or set it on the order) so the owner gets paid.',
+                });
+            }
+        }
+
         // Remove existing trips for this order before re-splitting
         await Trip.deleteMany({ order: orderId, tenantId });
-        
+
         const createdTrips = [];
         for (let i = 0; i < segments.length; i++) {
             const seg = segments[i];
@@ -236,11 +265,16 @@ exports.splitOrder = async (req, res) => {
                 totalDistance: Number(seg.totalDistance || seg.miles || 0),
                 distance_unit: seg.distance_unit || 'mi',
                 rate_per_mile: rate || 0,
+                // On a mixed split the owner leg's share is frozen onto the trip (see
+                // resolveOrderOwnerFields) so re-reading the order can't re-split it a second time.
+                settle_amount: ownerFields?.tripSettle?.has(`seg-${i}`)
+                    ? ownerFields.tripSettle.get(`seg-${i}`)
+                    : normalizeSegmentSettle(seg.settle_amount),
                 notes: seg.notes,
                 instructions: seg.instructions,
                 created_by: req.user._id
             });
-            
+
             await trip.save();
             createdTrips.push(trip);
         }
@@ -255,7 +289,28 @@ exports.splitOrder = async (req, res) => {
             order.trailer = base.trailer || null;
             order.drivers = baseDrivers;
             order.driver = baseDriver;
+            // The trucks the trips run decide who gets settled — an order split across two owners has
+            // no single ownerOperator, so it carries `isMixedOwner` + `ownerOperators` instead.
+            if (ownerFields) {
+                order.isOwnerOperatedTruck = ownerFields.isOwnerOperatedTruck;
+                order.ownerOperator = ownerFields.ownerOperator;
+                order.ownerOperators = ownerFields.ownerOperators;
+                order.isMixedOwner = ownerFields.isMixedOwner;
+                order.settle_amount = ownerFields.settle_amount;
+                order.input_settle_amount = ownerFields.input_settle_amount;
+                order.owner_profit = ownerFields.owner_profit;
+                order.carrier_amount = ownerFields.carrier_amount;
+            }
             await order.save();
+
+            await syncOwnerFinancialRecords({
+                tenantId,
+                companyId: req.user?.company?._id || req.user?.company || null,
+                userId: req.user?._id,
+                order,
+                trips: createdTrips,
+                truckMap,
+            });
         }
 
         logActivity(req, {
