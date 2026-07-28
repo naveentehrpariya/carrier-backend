@@ -617,11 +617,15 @@ const checkoutSubscription = catchAsync(async (req, res, next) => {
   );
 
   // Re-sync tenant admins so module access matches the new plan.
-  const admins = await User.find({ tenantId: req.tenantId, $or: [{ is_admin: 1 }, { role: 3 }] });
+  // As with the tenant above, use targeted updates — admin.save() runs full-document
+  // validation and fails on legacy admins missing unrelated required fields (address, etc).
+  const admins = await User.find({ tenantId: req.tenantId, $or: [{ is_admin: 1 }, { role: 3 }] })
+    .select('_id permissions');
   for (const admin of admins) {
-    admin.permissions = adminPermsForPlan(admin.permissions, planModules);
-    admin.allowedModules = planModules;
-    await admin.save();
+    await User.updateOne(
+      { _id: admin._id },
+      { $set: { permissions: adminPermsForPlan(admin.permissions, planModules), allowedModules: planModules } }
+    );
   }
 
   // Record history (mock payment).
