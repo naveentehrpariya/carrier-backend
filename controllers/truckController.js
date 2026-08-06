@@ -36,7 +36,8 @@ exports.addTruck = catchAsync(async (req, res, next) => {
       ownerOperator
     } = req.body;
     if (!plateNumber) return res.status(400).json({ status: false, message: 'Plate number is required' });
-    const exists = await Truck.findOne({ tenantId, plateNumber });
+    // Only live trucks block the plate — a soft-deleted truck can be re-added.
+    const exists = await Truck.findOne({ tenantId, plateNumber, deletedAt: null });
     if (exists) return res.status(400).json({ status: false, message: 'Truck with this plate already exists' });
     const isOwnerOperated = ownerOperated === true || ownerOperated === 'true' || ownerOperated === 1 || ownerOperated === '1';
     let ownerOperatorDoc = null;
@@ -173,6 +174,15 @@ exports.updateTruck = catchAsync(async (req, res, next) => {
     const tenantId = req.tenantId || req.user?.tenantId;
     const id = req.params.id;
     const updateData = { ...req.body };
+    if (updateData.plateNumber) {
+      const clash = await Truck.findOne({
+        tenantId,
+        plateNumber: updateData.plateNumber,
+        deletedAt: null,
+        _id: { $ne: id }
+      }).lean();
+      if (clash) return res.status(400).json({ status: false, message: 'Truck with this plate already exists' });
+    }
     const isOwnerOperated = updateData.ownerOperated === true || updateData.ownerOperated === 'true' || updateData.ownerOperated === 1 || updateData.ownerOperated === '1';
     if ('ownerOperated' in updateData) {
       updateData.ownerOperated = isOwnerOperated;

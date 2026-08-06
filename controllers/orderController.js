@@ -14,6 +14,11 @@ const ConversionRate = require("../db/ConversionRate");
 const { syncOwnerFinancialRecords, resolveOrderOwnerFields } = require("../utils/ownerSettlement");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity } = require("../utils/activityLogger");
+const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn } = require("../utils/orderMoney");
+
+const DISTANCE_SOURCES = ['auto_fastest', 'auto_domestic', 'auto_corridor', 'manual'];
+const normalizeDistanceSource = (value) =>
+   DISTANCE_SOURCES.includes(String(value || '')) ? String(value) : 'auto_fastest';
 
 const SUPPORTED_CURRENCIES = new Set(['CAD', 'USD', 'INR']);
 const BASE_ORDER_CURRENCY = 'USD';
@@ -366,6 +371,10 @@ exports.create_order = catchAsync(async (req, res, next) => {
          revenue_currency,
 
          totalDistance,
+         // Route assumptions from /getdistance (or 'manual' when the dispatcher typed the miles).
+         route_crosses_border,
+         route_countries,
+         distance_source,
 
          order_status,
        } = req.body;
@@ -515,6 +524,9 @@ exports.create_order = catchAsync(async (req, res, next) => {
          input_carrier_amount: Number(carrier_amount || 0),
          input_settle_amount: Number(settle_amount || 0),
          totalDistance,
+         route_crosses_border: !!route_crosses_border,
+         route_countries: Array.isArray(route_countries) ? route_countries : [],
+         distance_source: normalizeDistanceSource(distance_source),
          order_status,
          tenantId: tenantId,
          company:req.user && req.user.company ? req.user.company._id : null,
@@ -597,6 +609,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
          'customer_order_no', 'company_name', 'reference_no',
          'total_amount', 'carrier_amount', 'profit',
          'shipping_details', 'totalDistance', 'notes',
+         'route_crosses_border', 'route_countries', 'distance_source',
          'order_status', 'pickup_date', 'delivery_date',
          'commodity', 'equipment', 'charges', 'extra_charges',
          'documents', 'invoice_number', 'po_number',
@@ -1467,16 +1480,26 @@ exports.overview = catchAsync(async (req, res) => {
    completedLoads = await Order.countDocuments({ order_status: 'completed', ...queryFilter });
    pendingLoads = await Order.countDocuments({ order_status: 'added', ...queryFilter });
 
-   // Calculate total profit and revenue
+   // Calculate total profit and revenue.
+   // Money is summed in the display currency, converted ONCE from each order's exact typed
+   // amount — never from the USD base column, which would round-trip and drift off the order card.
+   const displayCurrency = resolveDisplayCurrency(req, BASE_ORDER_CURRENCY);
+   const fx = createOrderFxConverter(overviewTenantId, displayCurrency);
+
+   const moneyFields = 'total_amount carrier_amount settle_amount order_type isOwnerOperatedTruck created_by createdAt input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount';
    const allOrdersForProfit = await Order.find(queryFilter)
-         .select('total_amount carrier_amount order_type created_by')
-         .populate({ path: 'created_by', select: 'staff_commision' });
-   
+         .select(moneyFields)
+         .populate({ path: 'created_by', select: 'staff_commision' })
+         .lean();
+
+   await fx.prime(allOrdersForProfit.map((o) => o.createdAt));
+
    let totalProfit = 0;
    let totalRevenue = 0;
    allOrdersForProfit.forEach(o => {
-      totalProfit += Number(o.profit) || 0;
-      totalRevenue += Number(o.total_amount) || 0;
+      const money = orderMoneyIn(o, fx);
+      totalProfit += money.profit;
+      totalRevenue += money.revenue;
    });
 
    // carrier payments
@@ -1496,14 +1519,18 @@ exports.overview = catchAsync(async (req, res) => {
       const monthFilter = { ...queryFilter, createdAt: { $gte: startOfMonth, $lte: endOfMonth } };
       
       const monthlyOrders = await Order.find(monthFilter)
-         .select('total_amount carrier_amount order_type created_by')
-         .populate({ path: 'created_by', select: 'staff_commision' });
-      
+         .select(moneyFields)
+         .populate({ path: 'created_by', select: 'staff_commision' })
+         .lean();
+
+      await fx.prime(monthlyOrders.map((o) => o.createdAt));
+
       let monthlyRevenue = 0;
       let monthlyProfit = 0;
       monthlyOrders.forEach(o => {
-         monthlyRevenue += Number(o.total_amount) || 0;
-         monthlyProfit += Number(o.profit) || 0;
+         const money = orderMoneyIn(o, fx);
+         monthlyRevenue += money.revenue;
+         monthlyProfit += money.profit;
       });
 
       const monthName = startOfMonth.toLocaleString('default', { month: 'short' });
@@ -1515,7 +1542,8 @@ exports.overview = catchAsync(async (req, res) => {
       });
    }
 
-   const baseCurrency = BASE_ORDER_CURRENCY;
+   // Amounts are already in this currency — the frontend renders them as-is (rate 1).
+   const baseCurrency = displayCurrency;
 
    res.json({
       status: true,

@@ -19,6 +19,7 @@ const EmployeeDoc = require("../db/EmployeeDoc");
 const Tenant = require("../db/Tenant");
 const SuperAdmin = require("../db/SuperAdmin");
 const fileupload = require('../utils/fileupload');
+const { normalizePolicy: normalizeRoutePolicy } = require("../utils/routeDistance");
 
 const signToken = async (id) => {
   const token = jwt.sign(
@@ -959,7 +960,7 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
   if (!tenantIdForCompany) {
     return res.status(400).json({ status: false, message: "Tenant context is required." });
   }
-  const {name, email, phone, address, companyID, bank_name, account_name, account_number, routing_number, remittance_primary_email, remittance_secondary_email, rate_confirmation_terms, order_prefix} = req.body;
+  const {name, email, phone, address, companyID, bank_name, account_name, account_number, routing_number, remittance_primary_email, remittance_secondary_email, rate_confirmation_terms, order_prefix, route_country_policy} = req.body;
   if(companyID){
     // Find company by ID and ensure it belongs to the current tenant
     const filter = { _id: companyID, tenantId: tenantIdForCompany };
@@ -978,6 +979,9 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
       existing.rate_confirmation_terms = rate_confirmation_terms !== '' && rate_confirmation_terms !== undefined ? rate_confirmation_terms : existing.rate_confirmation_terms;
       if (order_prefix !== undefined) {
         existing.order_prefix = order_prefix ? order_prefix.toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 6) : null;
+      }
+      if (route_country_policy !== undefined) {
+        existing.route_country_policy = normalizeRoutePolicy(route_country_policy);
       }
       await existing.save();
       logActivity(req, {
@@ -1006,6 +1010,7 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
     remittance_primary_email: remittance_primary_email,
     remittance_secondary_email: remittance_secondary_email,
     rate_confirmation_terms: rate_confirmation_terms,
+    route_country_policy: normalizeRoutePolicy(route_country_policy),
     tenantId: tenantIdForCompany,
   }).then(result => {
     logActivity(req, {

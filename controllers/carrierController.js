@@ -6,6 +6,7 @@ const logger = require("../utils/logger");
 const axios = require("axios");
 const { checkCarrierLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity } = require("../utils/activityLogger");
+const { resolveRouteDistance } = require("../utils/routeDistance");
 
 exports.addCarrier = catchAsync(async (req, res, next) => {
   const isAdmin = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
@@ -309,64 +310,56 @@ exports.carrierDetail = catchAsync(async (req, res, next) => {
 });
 
 exports.getDistance = async (req, res) => {
-    
-  const apiKey = process.env.GOOGLE_API_KEY;
-  const locations = req.body.locations
+  const locations = req.body.locations;
 
   if (!locations || locations.length <= 1) {
-    return res.status(200).json({ 
+    return res.status(200).json({
       status: false,
       msg: "At least 2 locations are required."
      });
   }
   const origin = locations[0];
   const destination = locations[locations?.length - 1];
-  const waypoints = locations.slice(1, -1); 
-  const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(
-    origin
-  )}&destination=${encodeURIComponent(destination)}${
-    waypoints.length ? `&waypoints=optimize:true|${waypoints.map(encodeURIComponent).join("|")}` : "" }&key=${apiKey}`;
+  const waypoints = locations.slice(1, -1);
 
   try {
-    const response = await axios.get(url);
-    if (response?.data?.routes.length === 0 || response?.data?.status !== "OK") {
+    // Routing honours the company's route_country_policy: a trip whose ends are in the same
+    // country is kept inside that country, because Google's fastest route otherwise cuts across
+    // the border and reports fewer miles than the truck actually drives.
+    const tenantId = req.tenantId || req.user?.tenantId;
+    const result = await resolveRouteDistance({
+      origin,
+      destination,
+      waypoints,
+      tenantId,
+      optimizeWaypoints: true,
+    });
+
+    if (!result.ok) {
       return res.status(200).json({
         status: false,
-        msg: response?.data?.error_message || "No route found between given locations.",
+        msg: result.error || "No route found between given locations.",
       });
     }
-    const legs = response?.data?.routes[0]?.legs;
-    
-    let totalDistance = 0;
-    let totalDuration = 0;
-
-    if(response?.data?.error_message){
-      res.json({
-        status:false,
-        msg:response?.data?.error_message,
-      })
-    }
-    if(legs){
-      legs.forEach((leg) => {
-        totalDistance += leg?.distance?.value; 
-        totalDuration += leg?.duration?.value;
-      });
-    }
-    
-
-    const totalKM = (totalDistance / 1000).toFixed(2);
-    const totalDistanceMiles = (totalDistance / 1609.34).toFixed(2);
 
     res.json({
-      status:true,
-      msg:"Distance calculated successfully",
+      status: true,
+      msg: "Distance calculated successfully",
       origin,
       destination,
       waypoints,
       locations,
-      totalKm: totalKM,
-      totalMiles: totalDistanceMiles,
-      totalDurationMin: Math.round(totalDuration / 60),
+      totalKm: result.km.toFixed(2),
+      totalMiles: result.miles.toFixed(2),
+      totalDurationMin: Math.round(result.durationSeconds / 60),
+      // Assumptions behind the number — stored on the order and shown as a badge, so a route
+      // that had to cross a border is visible instead of silently baked into driver pay.
+      crossesBorder: result.crossesBorder,
+      countries: result.countries,
+      homeCountry: result.homeCountry,
+      routePolicy: result.policy,
+      distanceSource: result.source,
+      corridorUsed: result.corridorUsed,
     });
   } catch (error) {
     res.status(200).json({

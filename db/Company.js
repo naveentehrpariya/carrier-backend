@@ -20,6 +20,16 @@ const schema = new mongoose.Schema({
       maxlength: 6,
       default: null,
    },
+   // How order distance is routed. 'domestic_only' keeps a trip whose origin and destination are
+   // in the same country inside that country — Google's fastest route otherwise cuts across the
+   // border (e.g. AB -> ON via North Dakota) and understates the miles the truck really drives,
+   // which flows straight into driver pay and owner settlement. 'fastest' restores Google's
+   // default for fleets that genuinely run cross-border.
+   route_country_policy: {
+      type: String,
+      enum: ['domestic_only', 'fastest'],
+      default: 'domestic_only',
+   },
    logo: {
       type:String,
    },

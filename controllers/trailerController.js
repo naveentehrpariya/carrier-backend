@@ -11,7 +11,8 @@ exports.addTrailer = catchAsync(async (req, res, next) => {
     if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
     const { plateNumber, unitNumber, vin, licenseNumber, type, length, make, model, notes, ratePerMile } = req.body;
     if (!plateNumber) return res.status(400).json({ status: false, message: 'Plate number is required' });
-    const exists = await Trailer.findOne({ tenantId, plateNumber });
+    // Only live trailers block the plate — a soft-deleted trailer can be re-added.
+    const exists = await Trailer.findOne({ tenantId, plateNumber, deletedAt: null });
     if (exists) return res.status(400).json({ status: false, message: 'Trailer with this plate already exists' });
     const trailer = await Trailer.create({
       tenantId,
@@ -88,6 +89,15 @@ exports.updateTrailer = catchAsync(async (req, res, next) => {
     const payload = { ...req.body };
     if (payload.ratePerMile !== undefined) {
       payload.ratePerMile = Number(payload.ratePerMile) || 0;
+    }
+    if (payload.plateNumber) {
+      const clash = await Trailer.findOne({
+        tenantId,
+        plateNumber: payload.plateNumber,
+        deletedAt: null,
+        _id: { $ne: id }
+      }).lean();
+      if (clash) return res.status(400).json({ status: false, message: 'Trailer with this plate already exists' });
     }
     const trailer = await Trailer.findOneAndUpdate({ _id: id, tenantId }, payload, { new: true });
     logActivity(req, {

@@ -119,9 +119,19 @@ const schema = new mongo.Schema({
         type: Number,
         // required:[true, 'Please enter total distance of this order.'],
     },
-    totalDistanceInKM : { 
+    totalDistanceInKM : {
         type: Number,
         // required:[true, 'Please enter total distance of this order.'],
+    },
+    // Assumptions behind totalDistance. A bare number could not be audited — that is how an
+    // AB -> ON order ended up storing a route through North Dakota (133 mi short) without anyone
+    // noticing until the client counted the miles.
+    route_crosses_border: { type: Boolean, default: false },
+    route_countries: { type: [String], default: [] },      // e.g. ['CA'] or ['CA','US']
+    distance_source: {
+        type: String,
+        enum: ['auto_fastest', 'auto_domestic', 'auto_corridor', 'manual'],
+        default: 'auto_fastest',
     },
     revenue_items: [],
     carrier_revenue_items: [],

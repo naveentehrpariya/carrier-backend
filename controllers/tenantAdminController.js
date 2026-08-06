@@ -14,6 +14,7 @@ const bcrypt = require('bcrypt');
 const { getTenantUsageSummary } = require('../middlewares/planLimitsMiddleware');
 const { logActivity } = require('../utils/activityLogger');
 const { computeCyclePrice, priceMatrix, computeEndDate, effectiveStatus, isSubscriptionActive, currentOrderPeriod } = require('../utils/subscription');
+const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn, orderBaseCurrency, EXACT_AMOUNT_FIELDS } = require('../utils/orderMoney');
 
 /**
  * Get tenant information
@@ -379,9 +380,12 @@ const getTenantAnalytics = catchAsync(async (req, res, next) => {
     revenueByMonth
   ] = await Promise.all([
     Order.countDocuments({ tenantId: req.tenantId, ...baseFilter }),
+    // Sum the EXACT typed amount per input currency; converted once below. Summing the USD
+    // base column and converting afterwards drifts against what the order cards show.
     Order.aggregate([
       { $match: { tenantId: req.tenantId, ...baseFilter } },
-      { $group: { _id: null, total: { $sum: '$total_amount' } } }
+      { $addFields: EXACT_AMOUNT_FIELDS },
+      { $group: { _id: '$_exactCurrency', total: { $sum: '$_exactAmount' }, lastAt: { $max: '$createdAt' } } }
     ]),
 
     Customer.countDocuments(baseFilter),
@@ -404,13 +408,15 @@ const getTenantAnalytics = catchAsync(async (req, res, next) => {
 
     Order.aggregate([
       { $match: { tenantId: req.tenantId, ...baseFilter } },
+      { $addFields: EXACT_AMOUNT_FIELDS },
       {
         $group: {
           _id: {
             year: { $year: '$createdAt' },
-            month: { $month: '$createdAt' }
+            month: { $month: '$createdAt' },
+            currency: '$_exactCurrency'
           },
-          revenue: { $sum: '$total_amount' },
+          revenue: { $sum: '$_exactAmount' },
           orders: { $sum: 1 }
         }
       },
@@ -418,12 +424,34 @@ const getTenantAnalytics = catchAsync(async (req, res, next) => {
     ])
   ]);
 
-  const revenue = totalRevenue.length > 0 ? totalRevenue[0].total : 0;
+  const displayCurrency = resolveDisplayCurrency(req);
+  const fx = createOrderFxConverter(req.tenantId, displayCurrency);
+  await fx.prime([
+    ...totalRevenue.map((r) => r.lastAt),
+    ...revenueByMonth.map((r) => new Date(r._id.year, r._id.month - 1, 1))
+  ]);
+
+  const revenue = totalRevenue.reduce(
+    (sum, row) => sum + fx.convert(Number(row.total || 0), row._id || 'USD', row.lastAt),
+    0
+  );
+
+  // Merge the per-currency month rows back into one converted figure per month.
+  const monthlyMap = new Map();
+  revenueByMonth.forEach((item) => {
+    const key = `${item._id.year}-${String(item._id.month).padStart(2, '0')}`;
+    const monthDate = new Date(item._id.year, item._id.month - 1, 1);
+    const cur = monthlyMap.get(key) || { period: key, revenue: 0, orders: 0 };
+    cur.revenue += fx.convert(Number(item.revenue || 0), item._id.currency || 'USD', monthDate);
+    cur.orders += Number(item.orders || 0);
+    monthlyMap.set(key, cur);
+  });
 
   res.json({
     status: true,
     data: {
       period,
+      currency: displayCurrency,
       summary: {
         totalOrders,
         totalRevenue: revenue,
@@ -435,11 +463,7 @@ const getTenantAnalytics = catchAsync(async (req, res, next) => {
           status: item._id,
           count: item.count
         })),
-        revenueByMonth: revenueByMonth.map(item => ({
-          period: `${item._id.year}-${String(item._id.month).padStart(2, '0')}`,
-          revenue: item.revenue,
-          orders: item.orders
-        }))
+        revenueByMonth: Array.from(monthlyMap.values()).sort((a, b) => a.period.localeCompare(b.period))
       },
       recentOrders
     }
@@ -1084,29 +1108,40 @@ const getFinancialReport = catchAsync(async (req, res, next) => {
     if (endDate) filter.createdAt.$lte = new Date(endDate);
   }
 
+  // Grouped by the currency each order was typed in, then converted once (see utils/orderMoney).
   const financialData = await Order.aggregate([
     { $match: filter },
+    { $addFields: EXACT_AMOUNT_FIELDS },
     {
       $group: {
-        _id: null,
-        totalRevenue: { $sum: '$total_amount' },
-        totalCarrierCost: { $sum: '$carrier_amount' },
+        _id: '$_exactCurrency',
+        totalRevenue: { $sum: '$_exactAmount' },
+        totalCarrierCost: {
+          $sum: { $cond: [{ $gt: ['$input_carrier_amount', 0] }, '$input_carrier_amount', { $ifNull: ['$carrier_amount', 0] }] }
+        },
         totalOrders: { $sum: 1 },
-        averageOrderValue: { $avg: '$total_amount' }
+        lastAt: { $max: '$createdAt' }
       }
     }
   ]);
 
-  const result = financialData[0] || {
-    totalRevenue: 0,
-    totalCarrierCost: 0,
-    totalOrders: 0,
-    averageOrderValue: 0
-  };
+  const displayCurrency = resolveDisplayCurrency(req);
+  const fx = createOrderFxConverter(req.tenantId, displayCurrency);
+  await fx.prime(financialData.map((row) => row.lastAt));
 
+  const result = financialData.reduce((acc, row) => {
+    const cur = row._id || 'USD';
+    acc.totalRevenue += fx.convert(Number(row.totalRevenue || 0), cur, row.lastAt);
+    acc.totalCarrierCost += fx.convert(Number(row.totalCarrierCost || 0), cur, row.lastAt);
+    acc.totalOrders += Number(row.totalOrders || 0);
+    return acc;
+  }, { totalRevenue: 0, totalCarrierCost: 0, totalOrders: 0, averageOrderValue: 0 });
+
+  result.averageOrderValue = result.totalOrders > 0 ? result.totalRevenue / result.totalOrders : 0;
   result.grossProfit = result.totalRevenue - result.totalCarrierCost;
-  result.profitMargin = result.totalRevenue > 0 ? 
+  result.profitMargin = result.totalRevenue > 0 ?
     (result.grossProfit / result.totalRevenue) * 100 : 0;
+  result.currency = displayCurrency;
 
   res.json({
     status: true,
@@ -1179,15 +1214,23 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     createdAt: { $gte: dateRange.from, $lte: dateRange.to }
   };
 
+  // All money in this report is converted ONCE from each order's exact typed amount into the
+  // display currency. Reading the USD base column and converting on the frontend would drift
+  // against the order cards these rows mirror.
+  const displayCurrency = resolveDisplayCurrency(req);
+  const fx = createOrderFxConverter(req.tenantId, displayCurrency);
+
   if (type === 'outsourcing') {
     const orders = await Order.find(baseFilter)
       .populate('customer', 'name')
       .populate('carrier', 'name mc_code')
       .populate('truck', 'unitNumber plateNumber')
       .populate('created_by', 'name staff_commision')
-      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by')
+      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount settle_amount')
       .sort({ createdAt: -1 })
       .lean();
+
+    await fx.prime(orders.map((o) => o.createdAt));
 
     let totalRevenue = 0, totalCarrierCost = 0, totalCommission = 0;
     let pendingCustomerAmt = 0, pendingCustomerCount = 0;
@@ -1195,14 +1238,17 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     let paidCustomerAmt = 0, paidCarrierAmt = 0;
 
     for (const o of orders) {
-      const rev = Number(o.total_amount) || 0;
-      const cost = Number(o.carrier_amount) || 0;
-      // Net profit = revenue - carrier cost. Commission comes out of that net profit.
-      const netProfit = rev - cost;
-      const rate = Number(o.created_by?.staff_commision) || 0;
-      const commission = netProfit * (rate / 100);
+      const money = orderMoneyIn(o, fx);
+      const rev = money.revenue;
+      const cost = money.carrierAmount;
+      const commission = money.commission;
+      // Row values are overwritten with display-currency figures so the table and the
+      // summary cards can never disagree.
+      o.total_amount = rev;
+      o.carrier_amount = cost;
       o.commission = commission;
-      o.profit = netProfit - commission;
+      o.profit = money.profit;
+      o.currency = displayCurrency;
       totalRevenue += rev;
       totalCarrierCost += cost;
       totalCommission += commission;
@@ -1245,6 +1291,7 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
           paidCustomerAmt,
           paidCarrierAmt
         },
+        currency: displayCurrency,
         orders
       }
     });
@@ -1255,22 +1302,32 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     .populate('customer', 'name')
     .populate('truck', 'unitNumber plateNumber')
     .populate('ownerOperator', 'fullName ownerOperatorId')
-    .select('serial_no customer_order_no total_amount settle_amount owner_profit isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator')
+    .select('serial_no customer_order_no total_amount settle_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator input_currency revenue_currency input_total_amount input_settle_amount input_carrier_amount carrier_amount created_by')
     .sort({ createdAt: -1 })
     .lean();
+
+  await fx.prime(orders.map((o) => o.createdAt));
 
   let totalRevenue = 0;
   let ownerOperatorOrders = 0, ownerOperatorSettlement = 0, ownerOperatorProfit = 0;
   let companyDriverOrders = 0, companyDriverRevenue = 0, totalProfit = 0;
 
   for (const o of orders) {
-    const rev = Number(o.total_amount) || 0;
+    const money = orderMoneyIn(o, fx);
+    const rev = money.revenue;
+    // owner_profit has no exact typed twin — convert the stored base figure from its own currency.
+    const ownerProfit = fx.convert(Number(o.owner_profit || 0), orderBaseCurrency(o), o.createdAt);
+    o.total_amount = rev;
+    o.settle_amount = money.settle;
+    o.owner_profit = ownerProfit;
+    o.profit = money.profit;
+    o.currency = displayCurrency;
     totalRevenue += rev;
-    totalProfit += Number(o.owner_profit) || 0;
+    totalProfit += ownerProfit;
     if (o.isOwnerOperatedTruck) {
       ownerOperatorOrders++;
-      ownerOperatorSettlement += Number(o.settle_amount) || 0;
-      ownerOperatorProfit += Number(o.owner_profit) || 0;
+      ownerOperatorSettlement += money.settle;
+      ownerOperatorProfit += ownerProfit;
     } else {
       companyDriverOrders++;
       companyDriverRevenue += rev;
@@ -1293,6 +1350,7 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
         companyDriverRevenue,
         totalProfit
       },
+      currency: displayCurrency,
       orders
     }
   });
@@ -1324,15 +1382,21 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
   let orders = [];
   let summary = {};
 
+  // Same one-conversion rule as the JSON report so the PDF and the screen agree to the cent.
+  const displayCurrency = resolveDisplayCurrency(req);
+  const fx = createOrderFxConverter(req.tenantId, displayCurrency);
+
   if (type === 'outsourcing') {
     orders = await Order.find(baseFilter)
       .populate('customer', 'name')
       .populate('carrier', 'name mc_code')
       .populate('truck', 'unitNumber plateNumber')
       .populate('created_by', 'name staff_commision')
-      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by')
+      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount settle_amount')
       .sort({ createdAt: -1 })
       .lean();
+
+    await fx.prime(orders.map((o) => o.createdAt));
 
     let totalRevenue = 0, totalCarrierCost = 0, totalCommission = 0;
     let pendingCustomerAmt = 0, pendingCustomerCount = 0;
@@ -1340,14 +1404,14 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
     let paidCustomerAmt = 0, paidCarrierAmt = 0;
 
     for (const o of orders) {
-      const rev = Number(o.total_amount) || 0;
-      const cost = Number(o.carrier_amount) || 0;
-      // Net profit = revenue - carrier cost. Commission comes out of that net profit.
-      const netProfit = rev - cost;
-      const rate = Number(o.created_by?.staff_commision) || 0;
-      const commission = netProfit * (rate / 100);
+      const money = orderMoneyIn(o, fx);
+      const rev = money.revenue;
+      const cost = money.carrierAmount;
+      const commission = money.commission;
+      o.total_amount = rev;
+      o.carrier_amount = cost;
       o.commission = commission;
-      o.profit = netProfit - commission;
+      o.profit = money.profit;
       totalRevenue += rev;
       totalCarrierCost += cost;
       totalCommission += commission;
@@ -1372,21 +1436,29 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
       .populate('customer', 'name')
       .populate('truck', 'unitNumber plateNumber')
       .populate('ownerOperator', 'fullName ownerOperatorId')
-      .select('serial_no customer_order_no total_amount settle_amount owner_profit isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator')
+      .select('serial_no customer_order_no total_amount settle_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator input_currency revenue_currency input_total_amount input_settle_amount input_carrier_amount carrier_amount created_by')
       .sort({ createdAt: -1 })
       .lean();
+
+    await fx.prime(orders.map((o) => o.createdAt));
 
     let totalRevenue = 0, ownerOperatorOrders = 0, ownerOperatorSettlement = 0;
     let ownerOperatorProfit = 0, companyDriverOrders = 0, companyDriverRevenue = 0, totalProfit = 0;
 
     for (const o of orders) {
-      const rev = Number(o.total_amount) || 0;
+      const money = orderMoneyIn(o, fx);
+      const rev = money.revenue;
+      const ownerProfit = fx.convert(Number(o.owner_profit || 0), orderBaseCurrency(o), o.createdAt);
+      o.total_amount = rev;
+      o.settle_amount = money.settle;
+      o.owner_profit = ownerProfit;
+      o.profit = money.profit;
       totalRevenue += rev;
-      totalProfit += Number(o.owner_profit) || 0;
+      totalProfit += ownerProfit;
       if (o.isOwnerOperatedTruck) {
         ownerOperatorOrders++;
-        ownerOperatorSettlement += Number(o.settle_amount) || 0;
-        ownerOperatorProfit += Number(o.owner_profit) || 0;
+        ownerOperatorSettlement += money.settle;
+        ownerOperatorProfit += ownerProfit;
       } else {
         companyDriverOrders++;
         companyDriverRevenue += rev;
@@ -1402,7 +1474,13 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
 
   // HTML helpers
   const safe = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const fmt = (n) => `$${(Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  // Amounts above are already in `displayCurrency` — label them with it instead of a bare "$".
+  const fmt = (n) => new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: displayCurrency,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(Number(n) || 0);
   const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '—';
 
   const companyName = req.tenant?.settings?.customizations?.branding?.companyName || req.tenant?.name || 'Company';

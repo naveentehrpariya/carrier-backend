@@ -26,7 +26,11 @@ const trailerSchema = new mongoose.Schema({
   toObject: { virtuals: true }
 });
 
-trailerSchema.index({ tenantId: 1, plateNumber: 1 }, { unique: true });
+// Unique only among live trailers — a soft-deleted trailer must not block re-adding the same plate.
+trailerSchema.index(
+  { tenantId: 1, plateNumber: 1 },
+  { unique: true, partialFilterExpression: { deletedAt: null } }
+);
 trailerSchema.index({ tenantId: 1, type: 1 });
 trailerSchema.index({ tenantId: 1, createdAt: -1 });
 

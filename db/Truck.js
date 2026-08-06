@@ -30,7 +30,11 @@ const truckSchema = new mongoose.Schema({
   toObject: { virtuals: true }
 });
 
-truckSchema.index({ tenantId: 1, plateNumber: 1 }, { unique: true });
+// Unique only among live trucks — a soft-deleted truck must not block re-adding the same plate.
+truckSchema.index(
+  { tenantId: 1, plateNumber: 1 },
+  { unique: true, partialFilterExpression: { deletedAt: null } }
+);
 truckSchema.index({ tenantId: 1, vin: 1 });
 truckSchema.index({ tenantId: 1, createdAt: -1 });
 truckSchema.index({ tenantId: 1, ownerOperator: 1 });

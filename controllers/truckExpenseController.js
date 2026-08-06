@@ -4,6 +4,8 @@ const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const { logActivity } = require('../utils/activityLogger');
+const { normalizeCurrency } = require('../utils/fx');
+const { createOrderFxConverter, resolveDisplayCurrency } = require('../utils/orderMoney');
 
 function normalizeCompanyId(req) {
   const raw = req.user?.company?._id || req.user?.company;
@@ -105,13 +107,22 @@ exports.getExpenses = catchAsync(async (req, res, next) => {
       date: { $gte: start, $lte: end }
     }).sort({ date: -1 }).lean();
 
-    const totalExpenses = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
+    // Convert each expense once from the currency it was entered in.
+    const displayCurrency = resolveDisplayCurrency(req);
+    const fx = createOrderFxConverter(tenantId, displayCurrency);
+    await fx.prime(expenses.map((e) => e.date));
+    let totalExpenses = 0;
+    for (const e of expenses) {
+      e.amountConverted = fx.convert(Number(e.amount || 0), e.currency || 'USD', e.date);
+      totalExpenses += e.amountConverted;
+    }
 
     res.json({
       status: true,
       truck: { _id: truck._id, plateNumber: truck.plateNumber, unitNumber: truck.unitNumber },
       expenses,
       totalExpenses,
+      currency: displayCurrency.toLowerCase(),
       insuranceMonthly: truck.insuranceMonthly || 0,
       parkingMonthly: truck.parkingMonthly || 0
     });
@@ -137,7 +148,7 @@ exports.addExpense = catchAsync(async (req, res, next) => {
     const truck = await Truck.findOne(truckFilter).lean();
     if (!truck) return res.status(404).json({ status: false, message: 'Truck not found' });
 
-    const { type, amount, paid_by, description, date } = req.body;
+    const { type, amount, paid_by, description, date, currency } = req.body;
     if (!type || amount == null || !date) {
       return res.status(400).json({ status: false, message: 'type, amount and date are required' });
     }
@@ -152,6 +163,8 @@ exports.addExpense = catchAsync(async (req, res, next) => {
       truck: truckId,
       type,
       amount: Number(amount),
+      // Snapshot the currency the amount was typed in — reports convert from it, never guess.
+      currency: normalizeCurrency(currency, 'USD'),
       paid_by: paid_by || 'owner',
       description: description || '',
       date: expenseDate,
@@ -183,10 +196,11 @@ exports.updateExpense = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'Invalid id' });
     }
 
-    const { type, amount, paid_by, description, date } = req.body;
+    const { type, amount, paid_by, description, date, currency } = req.body;
     const update = {};
     if (type) update.type = type;
     if (amount != null) update.amount = Number(amount);
+    if (currency) update.currency = normalizeCurrency(currency, 'USD');
     if (paid_by) update.paid_by = paid_by;
     if (description != null) update.description = description;
     if (date) update.date = new Date(date);
@@ -259,20 +273,26 @@ exports.getTruckProfitSummary = catchAsync(async (req, res, next) => {
       },
       {
         $group: {
-          _id: '$type',
-          total: { $sum: '$amount' }
+          _id: { type: '$type', currency: '$currency' },
+          total: { $sum: '$amount' },
+          lastDate: { $max: '$date' }
         }
       }
     ]);
 
+    const displayCurrency = resolveDisplayCurrency(req);
+    const fx = createOrderFxConverter(tenantId, displayCurrency);
+    await fx.prime(agg.map((row) => row.lastDate));
     const byType = {};
     let totalExpenses = 0;
     for (const row of agg) {
-      byType[row._id] = row.total;
-      totalExpenses += row.total;
+      const converted = fx.convert(Number(row.total || 0), row._id?.currency || 'USD', row.lastDate);
+      const type = row._id?.type;
+      byType[type] = Number(byType[type] || 0) + converted;
+      totalExpenses += converted;
     }
 
-    res.json({ status: true, totalExpenses, byType });
+    res.json({ status: true, totalExpenses, byType, currency: displayCurrency.toLowerCase() });
   } catch (err) {
     JSONerror(res, err, next);
   }

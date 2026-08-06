@@ -9,6 +9,9 @@ const truckExpenseSchema = new mongoose.Schema({
   truck: { type: mongoose.Schema.Types.ObjectId, ref: 'trucks', required: true, index: true },
   type: { type: String, enum: EXPENSE_TYPES, required: true },
   amount: { type: Number, required: true, min: 0 },
+  // Currency the amount was entered in. Legacy rows have none and are read as USD, which is how
+  // they were always displayed. Reports convert from this once into the display currency.
+  currency: { type: String, enum: ['USD', 'CAD', 'INR'], default: 'USD', uppercase: true },
   paid_by: { type: String, enum: PAID_BY, default: 'owner' },
   description: { type: String, default: '' },
   date: { type: Date, required: true },
