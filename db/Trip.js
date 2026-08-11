@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { KM_PER_MI } = require('../utils/distance');
 
 const tripSchema = new mongoose.Schema({
     tenantId: { 
@@ -66,12 +67,42 @@ tripSchema.pre('save', function(next) {
         this.totalDistance = miles;
     }
     // Compute kilometers
-    this.total_km = Number(this.totalDistance || miles) * 1.60934;
+    this.total_km = Number(this.totalDistance || miles) * KM_PER_MI;
     // Driver pay based on miles rate
     this.total_driver_pay = miles * Number(this.rate_per_mile || 0);
     this.updatedAt = Date.now();
     next();
 });
+
+// `total_km` and `total_driver_pay` are derived columns, and the hook above only fires on .save().
+// Every update path that goes through the query API (updateTrip's findOneAndUpdate, migrations,
+// any future patch) skipped it, so a trip whose miles or rate changed kept the OLD pay — which is
+// what Order View prints. Recompute here too, from the merged (update ∪ stored) values.
+async function recomputeDerived(next) {
+    try {
+        const update = this.getUpdate();
+        if (!update) return next();
+        const target = update.$set ? update.$set : update;
+        const touched = ['miles', 'totalDistance', 'rate_per_mile'].some((k) => k in target);
+        if (!touched) return next();
+
+        const current = await this.model.findOne(this.getQuery())
+            .select('miles totalDistance rate_per_mile').lean();
+        const miles = Number(target.miles ?? current?.miles ?? 0) || 0;
+        const distance = Number(target.totalDistance ?? current?.totalDistance ?? 0) || miles;
+        const rate = Number(target.rate_per_mile ?? current?.rate_per_mile ?? 0) || 0;
+
+        target.total_km = distance * KM_PER_MI;
+        target.total_driver_pay = miles * rate;
+        this.setUpdate(update);
+        next();
+    } catch (err) {
+        next(err);
+    }
+}
+// Not registered for updateMany: one recomputed value cannot be correct for many different docs.
+tripSchema.pre('findOneAndUpdate', recomputeDerived);
+tripSchema.pre('updateOne', recomputeDerived);
 
 const Trip = mongoose.model('trips', tripSchema);
 module.exports = Trip;

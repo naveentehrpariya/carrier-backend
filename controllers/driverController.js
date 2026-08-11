@@ -37,13 +37,18 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       emails = [], phones = []
     } = req.body;
 
-    if (!name || !email || !phone || !country || !address) {
+    const trimmedName = String(name || '').trim();
+    const trimmedEmail = String(email || '').trim().toLowerCase();
+    const trimmedPhone = String(phone || '').trim();
+    const trimmedCountry = String(country || '').trim();
+    const trimmedAddress = String(address || '').trim();
+
+    if (!trimmedName || !trimmedEmail || !trimmedPhone || !trimmedCountry || !trimmedAddress) {
       return res.status(400).json({ status: false, message: 'Missing required fields' });
     }
 
-    const addCompanyId = req.user?.company?._id || req.user?.company || null;
     const isEmailUsed = await User.findOne(
-      { email, tenantId, ...(addCompanyId ? { company: addCompanyId } : {}) },
+      { email: trimmedEmail },
       null,
       { includeInactive: true }
     );
@@ -52,7 +57,7 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     }
 
     const corporateID = await createCorporateId();
-    const hashedPassword = await bcrypt.hash(password || Math.random().toString(36).slice(2), 12);
+    const plainPassword = password || Math.random().toString(36).slice(2);
 
     let companyId = req.user?.company?._id || req.user?.company || null;
     if (!companyId) {
@@ -62,17 +67,17 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     }
 
     const user = await User.create({
-      name,
-      email,
+      name: trimmedName,
+      email: trimmedEmail,
       corporateID,
       created_by: req.user?._id,
-      password: hashedPassword,
-      country,
-      phone,
-      address,
-      state,
-      city,
-      zipcode,
+      password: plainPassword,
+      country: trimmedCountry,
+      phone: trimmedPhone,
+      address: trimmedAddress,
+      state: state ? String(state).trim() : undefined,
+      city: city ? String(city).trim() : undefined,
+      zipcode: zipcode ? String(zipcode).trim() : undefined,
       permissions: ['driver'],
       company: companyId,
       position: 'Driver',
@@ -81,15 +86,17 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     });
 
     const normalizedEmails = [];
-    if (email) normalizedEmails.push({ email, is_primary: true });
+    if (trimmedEmail) normalizedEmails.push({ email: trimmedEmail, is_primary: true });
     (Array.isArray(emails) ? emails : []).forEach(e => {
-      if (e && e !== email) normalizedEmails.push({ email: e, is_primary: false });
+      const cleanE = String(e || '').trim().toLowerCase();
+      if (cleanE && cleanE !== trimmedEmail) normalizedEmails.push({ email: cleanE, is_primary: false });
     });
 
     const normalizedPhones = [];
-    if (phone) normalizedPhones.push({ phone, is_primary: true });
+    if (trimmedPhone) normalizedPhones.push({ phone: trimmedPhone, is_primary: true });
     (Array.isArray(phones) ? phones : []).forEach(p => {
-      if (p && p !== phone) normalizedPhones.push({ phone: p, is_primary: false });
+      const cleanP = String(p || '').trim();
+      if (cleanP && cleanP !== trimmedPhone) normalizedPhones.push({ phone: cleanP, is_primary: false });
     });
 
     const profile = await DriverProfile.create({
@@ -144,26 +151,45 @@ exports.editDriver = catchAsync(async (req, res, next) => {
       emails = [], phones = []
     } = req.body;
 
-    const user = await User.findOneAndUpdate(
-      { _id: id, tenantId },
-      { name, email, country, phone, address, state, city, zipcode },
-      { new: true }
-    );
+    const trimmedName = name ? String(name).trim() : undefined;
+    const trimmedEmail = email ? String(email).trim().toLowerCase() : undefined;
+    const trimmedPhone = phone ? String(phone).trim() : undefined;
+    const trimmedCountry = country ? String(country).trim() : undefined;
+    const trimmedAddress = address ? String(address).trim() : undefined;
+    const trimmedState = state !== undefined ? String(state).trim() : undefined;
+    const trimmedCity = city !== undefined ? String(city).trim() : undefined;
+    const trimmedZipcode = zipcode !== undefined ? String(zipcode).trim() : undefined;
 
-    if (!user) {
+    const existedUser = await User.findOne({ _id: id, tenantId }, null, { includeInactive: true });
+    if (!existedUser) {
       return res.status(404).json({ status: false, message: 'Driver not found' });
     }
 
+    if (trimmedEmail && trimmedEmail !== existedUser.email) {
+      const emailExists = await User.findOne({ email: trimmedEmail }, null, { includeInactive: true });
+      if (emailExists) {
+        return res.json({ status: false, message: 'Your given email address is already used.' });
+      }
+    }
+
+    const user = await User.findOneAndUpdate(
+      { _id: id, tenantId },
+      { name: trimmedName, email: trimmedEmail, country: trimmedCountry, phone: trimmedPhone, address: trimmedAddress, state: trimmedState, city: trimmedCity, zipcode: trimmedZipcode },
+      { new: true }
+    );
+
     const normalizedEmails = [];
-    if (email) normalizedEmails.push({ email, is_primary: true });
+    if (trimmedEmail) normalizedEmails.push({ email: trimmedEmail, is_primary: true });
     emails.forEach(e => {
-      if (e && e !== email) normalizedEmails.push({ email: e, is_primary: false });
+      const cleanE = String(e || '').trim().toLowerCase();
+      if (cleanE && cleanE !== trimmedEmail) normalizedEmails.push({ email: cleanE, is_primary: false });
     });
 
     const normalizedPhones = [];
-    if (phone) normalizedPhones.push({ phone, is_primary: true });
+    if (trimmedPhone) normalizedPhones.push({ phone: trimmedPhone, is_primary: true });
     phones.forEach(p => {
-      if (p && p !== phone) normalizedPhones.push({ phone: p, is_primary: false });
+      const cleanP = String(p || '').trim();
+      if (cleanP && cleanP !== trimmedPhone) normalizedPhones.push({ phone: cleanP, is_primary: false });
     });
 
     const profile = await DriverProfile.findOneAndUpdate(

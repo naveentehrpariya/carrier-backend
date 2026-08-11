@@ -78,8 +78,22 @@ exports.globalSearch = async (req, res) => {
       orderQuery.order_type = 'none';
     }
 
-    const orderTokenAnd = tokenRegexes.map((r) => ({ $or: [{ company_name: r }, { customer_order_no: r }] }));
-    const orderOr = [{ company_name: regex }, { customer_order_no: regex }];
+    // Text fields an order can be found by: its own numbers, the customer's order
+    // number, the order-level reference, per-stop reference numbers and the
+    // pickup/delivery addresses.
+    const ORDER_TEXT_FIELDS = [
+      'company_name',
+      'customer_order_no',
+      'shipping_details.reference',
+      'shipping_details.locations.referenceNo',
+      'shipping_details.locations.location',
+      'shipping_details.locations.address',
+      'shipping_details.locations.city',
+    ];
+    const orderFieldsMatching = (r) => ORDER_TEXT_FIELDS.map((f) => ({ [f]: r }));
+
+    const orderTokenAnd = tokenRegexes.map((r) => ({ $or: orderFieldsMatching(r) }));
+    const orderOr = orderFieldsMatching(regex);
     if (Number.isFinite(qSerial)) orderOr.push({ serial_no: qSerial });
 
     const carrierOr = tokenRegexes.map((r) => ({ $or: [{ name: r }, { email: r }, { phone: r }, { mc_code: r }, { carrierID: r }] }));
@@ -117,7 +131,7 @@ exports.globalSearch = async (req, res) => {
 
     const [orders, customers, carriers, trucks, trailers, drivers] = await Promise.all([
       Order.find(orderQuery)
-        .select('_id serial_no customer_order_no company_name order_type total_amount order_status createdAt')
+        .select('_id serial_no customer_order_no company_name order_type total_amount order_status createdAt shipping_details')
         .sort({ createdAt: -1 })
         .limit(limit)
         .lean(),

@@ -24,16 +24,24 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
   }
   const companyId = req.user?.company?._id || req.user?.company || null;
 
+  const trimmedName = String(name || '').trim();
+  const trimmedEmail = String(email || '').trim().toLowerCase();
+  const trimmedPhone = String(phone || '').trim();
+  const trimmedCountry = String(country || '').trim();
+  const trimmedAddress = String(address || '').trim();
+  const trimmedSecondaryEmail = secondary_email ? String(secondary_email).trim().toLowerCase() : undefined;
+  const trimmedSecondaryPhone = secondary_phone ? String(secondary_phone).trim() : undefined;
+
   const existingCustomer = await Customer.findOne({
     tenantId,
     ...(companyId ? { company: companyId } : {}),
-    $or: [{ phone }, { email }]
+    $or: [{ phone: trimmedPhone }, { email: trimmedEmail }]
   });
 
   if (existingCustomer) {
     return res.status(200).json({
       status: false,
-      message: existingCustomer.phone === phone 
+      message: existingCustomer.phone === trimmedPhone 
         ? "Phone number exists. Please use a different phone number." 
         : "Email address already exists. Please use a different email.",
     });
@@ -64,11 +72,11 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
     }));
   } else {
     // Fallback to legacy fields for backward compatibility
-    if (email) {
-      emailsArray.push({ email, is_primary: true, created_at: new Date() });
+    if (trimmedEmail) {
+      emailsArray.push({ email: trimmedEmail, is_primary: true, created_at: new Date() });
     }
-    if (secondary_email) {
-      emailsArray.push({ email: secondary_email, is_primary: false, created_at: new Date() });
+    if (trimmedSecondaryEmail) {
+      emailsArray.push({ email: trimmedSecondaryEmail, is_primary: false, created_at: new Date() });
     }
   }
 
@@ -78,20 +86,20 @@ exports.addCustomer = catchAsync(async (req, res, next) => {
    ? assigned_to.filter(Boolean)
    : assigned_to ? [assigned_to] : [];
  const result = await Customer.create({
-   name: name,
-   email: email,
-   secondary_email: secondary_email,
-   secondary_phone: secondary_phone,
+   name: trimmedName,
+   email: trimmedEmail,
+   secondary_email: trimmedSecondaryEmail,
+   secondary_phone: trimmedSecondaryPhone,
    emails: emailsArray,
    customerCode: newCustomerNo,
-   phone: phone,
-   address: address,
-   country: country,
-   state: state,
-   city: city,
+   phone: trimmedPhone,
+   address: trimmedAddress,
+   country: trimmedCountry,
+   state: state ? String(state).trim() : undefined,
+   city: city ? String(city).trim() : undefined,
    tenantId,
    company: companyId,
-   zipcode: zipcode,
+   zipcode: zipcode ? String(zipcode).trim() : undefined,
    assigned_to: assignedToArray,
    created_by:req.user._id,
  });
@@ -220,12 +228,48 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
   if (!tenantIdUpd) {
     return res.status(400).send({ status: false, message: 'Tenant context missing.' });
   }
+
+  const trimmedName = name ? String(name).trim() : undefined;
+  const trimmedEmail = email ? String(email).trim().toLowerCase() : undefined;
+  const trimmedPhone = phone ? String(phone).trim() : undefined;
+  const trimmedCountry = country ? String(country).trim() : undefined;
+  const trimmedAddress = address ? String(address).trim() : undefined;
+  const trimmedState = state !== undefined ? String(state).trim() : undefined;
+  const trimmedCity = city !== undefined ? String(city).trim() : undefined;
+  const trimmedZipcode = zipcode !== undefined ? String(zipcode).trim() : undefined;
+  const trimmedSecondaryEmail = secondary_email ? String(secondary_email).trim().toLowerCase() : undefined;
+  const trimmedSecondaryPhone = secondary_phone ? String(secondary_phone).trim() : undefined;
+
   if (mc_code) {
-    const existingCustomer = await Customer.findOne({ mc_code: mc_code, _id: { $ne: req.params.id }, tenantId: tenantIdUpd });
+    const trimmedMc = String(mc_code).trim();
+    const existingCustomer = await Customer.findOne({ mc_code: trimmedMc, _id: { $ne: req.params.id }, tenantId: tenantIdUpd });
     if (existingCustomer) {
       return res.status(200).send({
         status: false,
         message: "MC Code must be unique. This MC Code is already in use.",
+      });
+    }
+  }
+
+  if (trimmedEmail || trimmedPhone) {
+    const companyId = req.user?.company?._id || req.user?.company || null;
+    const query = {
+      _id: { $ne: req.params.id },
+      tenantId: tenantIdUpd,
+      ...(companyId ? { company: companyId } : {})
+    };
+    const orCond = [];
+    if (trimmedEmail) orCond.push({ email: trimmedEmail });
+    if (trimmedPhone) orCond.push({ phone: trimmedPhone });
+    query.$or = orCond;
+
+    const existingCustomer = await Customer.findOne(query);
+    if (existingCustomer) {
+      return res.status(200).json({
+        status: false,
+        message: existingCustomer.phone === trimmedPhone 
+          ? "Phone number exists. Please use a different phone number." 
+          : "Email address already exists. Please use a different email.",
       });
     }
   }
@@ -242,11 +286,11 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
     }));
   } else {
     // Fallback to legacy fields for backward compatibility
-    if (email) {
-      emailsArray.push({ email, is_primary: true, created_at: new Date() });
+    if (trimmedEmail) {
+      emailsArray.push({ email: trimmedEmail, is_primary: true, created_at: new Date() });
     }
-    if (secondary_email) {
-      emailsArray.push({ email: secondary_email, is_primary: false, created_at: new Date() });
+    if (trimmedSecondaryEmail) {
+      emailsArray.push({ email: trimmedSecondaryEmail, is_primary: false, created_at: new Date() });
     }
   }
 
@@ -264,19 +308,19 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
     ? assigned_to.filter(Boolean)
     : assigned_to ? [assigned_to] : [];
   const updatedUser = await Customer.findOneAndUpdate(updateQuery, {
-    name: name,
-    email: email,
-    secondary_email: secondary_email,
-    secondary_phone: secondary_phone,
+    name: trimmedName,
+    email: trimmedEmail,
+    secondary_email: trimmedSecondaryEmail,
+    secondary_phone: trimmedSecondaryPhone,
     emails: emailsArray,
-    mc_code: mc_code,
-    phone: phone,
-    address: address,
-    country: country,
-    state: state,
-    city: city,
+    mc_code: mc_code ? String(mc_code).trim() : undefined,
+    phone: trimmedPhone,
+    address: trimmedAddress,
+    country: trimmedCountry,
+    state: trimmedState,
+    city: trimmedCity,
     assigned_to: assignedToArrayUpd,
-    zipcode: zipcode,
+    zipcode: trimmedZipcode,
     created_by:req.user._id,
   }, {
     new: true, 

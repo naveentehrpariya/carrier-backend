@@ -11,6 +11,7 @@ const {
   totalDistanceMeters,
   totalDurationSeconds,
 } = require('./routeCountry');
+const { resolveStops } = require('./geocodeAddress');
 
 const DEFAULT_POLICY = 'domestic_only';
 const VALID_POLICIES = ['domestic_only', 'fastest'];
@@ -77,13 +78,7 @@ async function callDirections(params) {
  *   'auto_domestic' — an alternative that stays inside the country was chosen
  *   'auto_corridor' — every alternative crossed, so domestic corridor waypoints were forced
  */
-async function resolveRouteDistance({ origin, destination, waypoints = [], tenantId, policy, optimizeWaypoints = false }) {
-  const apiKey = getGoogleApiKey();
-  if (!apiKey) return { ok: false, error: 'Google API key not configured' };
-  if (!origin || !destination) return { ok: false, error: 'Origin and destination are required' };
-
-  const activePolicy = policy ? normalizePolicy(policy) : await getRoutePolicy(tenantId);
-
+async function routeOnce({ origin, destination, waypoints = [], apiKey, activePolicy, optimizeWaypoints = false }) {
   const first = await callDirections({
     origin,
     destination,
@@ -149,6 +144,74 @@ async function resolveRouteDistance({ origin, destination, waypoints = [], tenan
 
   // No domestic option at all — return the fastest, flagged, so the UI can warn the dispatcher.
   return finish(best, 'auto_fastest');
+}
+
+// ZERO_RESULTS means every stop WAS found — there is simply no driving route between them. That is
+// almost always one stop that geocoded into the wrong place (a facility name matching a town on
+// another continent), and the whole-route error names nothing. Walk the stops in pairs to find the
+// break, and hand back where each stop actually landed so the dispatcher can see the wrong one.
+async function diagnoseUnroutable(stops, apiKey) {
+  for (let i = 0; i < stops.length - 1; i += 1) {
+    const a = stops[i];
+    const b = stops[i + 1];
+    if (!a?.ok || !b?.ok) continue;
+    const leg = await callDirections({ origin: a.query, destination: b.query, waypoints: [], apiKey });
+    if (leg.error) {
+      return {
+        from: { typed: a.typed, resolvedTo: a.formatted },
+        to: { typed: b.typed, resolvedTo: b.formatted },
+        status: leg.error,
+      };
+    }
+  }
+  return null;
+}
+
+async function resolveRouteDistance({ origin, destination, waypoints = [], tenantId, policy, optimizeWaypoints = false }) {
+  const apiKey = getGoogleApiKey();
+  if (!apiKey) return { ok: false, error: 'Google API key not configured' };
+  if (!origin || !destination) return { ok: false, error: 'Origin and destination are required' };
+
+  const activePolicy = policy ? normalizePolicy(policy) : await getRoutePolicy(tenantId);
+  const args = { origin, destination, waypoints, apiKey, activePolicy, optimizeWaypoints };
+
+  const direct = await routeOnce(args);
+  if (direct.ok) return { ...direct, approximatedStops: [] };
+
+  // Directions failed on the typed text. That is usually one stop Google has no place for — a client
+  // facility name, a yard, a new location — not a bad lane. Geocode each stop down to something
+  // placeable and route by coordinates instead of blocking the order. The typed address is untouched;
+  // the caller gets `approximatedStops` so the UI can flag it and the dispatcher can type the miles.
+  const stops = [origin, ...waypoints, destination];
+  const resolution = await resolveStops(stops, apiKey);
+  if (!resolution.ok) {
+    return { ok: false, error: direct.error, policy: activePolicy, unresolved: resolution.unresolved };
+  }
+
+  const queries = resolution.queries;
+  const retry = await routeOnce({
+    ...args,
+    origin: queries[0],
+    destination: queries[queries.length - 1],
+    waypoints: queries.slice(1, -1),
+  });
+  if (!retry.ok) {
+    // Every stop resolved and the route still fails — find the pair that breaks and report where
+    // each of those two stops actually landed.
+    const brokenPair = await diagnoseUnroutable(resolution.stops, apiKey);
+    return {
+      ok: false,
+      error: direct.error,
+      policy: activePolicy,
+      unresolved: resolution.unresolved,
+      brokenPair,
+      resolvedStops: resolution.stops
+        .filter((s) => s.ok)
+        .map((s) => ({ typed: s.typed, resolvedTo: s.formatted, approximate: s.approximate })),
+    };
+  }
+
+  return { ...retry, approximatedStops: resolution.approximated };
 }
 
 module.exports = {

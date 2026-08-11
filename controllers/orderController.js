@@ -10,11 +10,13 @@ const PaymentLogs = require("../db/PaymentLogs");
 const Trip = require("../db/Trip");
 const Truck = require("../db/Truck");
 const OwnerOperatorFinancialRecord = require("../db/OwnerOperatorFinancialRecord");
+const DriverSalary = require("../db/DriverSalary");
 const ConversionRate = require("../db/ConversionRate");
 const { syncOwnerFinancialRecords, resolveOrderOwnerFields } = require("../utils/ownerSettlement");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity } = require("../utils/activityLogger");
 const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn } = require("../utils/orderMoney");
+const { kmToMiles } = require("../utils/distance");
 
 const DISTANCE_SOURCES = ['auto_fastest', 'auto_domestic', 'auto_corridor', 'manual'];
 const normalizeDistanceSource = (value) =>
@@ -165,6 +167,45 @@ function applyOrderOwnershipScope(req, criteria) {
 function normalizeCompanyId(req) {
    const raw = req.user?.company?._id || req.user?.company;
    return raw ? String(raw) : null;
+}
+
+/**
+ * Order search — one definition, used by every order listing endpoint.
+ *
+ * Matches customer order no, our own serial no, the order-level reference,
+ * per-stop reference numbers and pickup/delivery addresses. A numeric term is
+ * still matched exactly against serial_no, but no longer *exclusively*: a load
+ * whose reference or postal code is all digits has to be findable too.
+ *
+ * Returns an $or array (or null). Callers must push it onto $and — assigning it
+ * to queryObj.$or would clobber the deletedAt filter and leak deleted orders.
+ */
+function buildOrderSearchOr(search) {
+   const value = String(search || '').trim();
+   if (value.length < 2) return null;
+   const safe = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+   const rx = { $regex: safe, $options: 'i' };
+   const or = [
+      { customer_order_no: rx },
+      { company_name: rx },
+      { 'shipping_details.reference': rx },
+      { 'shipping_details.locations.referenceNo': rx },
+      { 'shipping_details.locations.location': rx },
+      { 'shipping_details.locations.address': rx },
+      { 'shipping_details.locations.city': rx },
+   ];
+   if (!isNaN(value) && value !== '') {
+      or.unshift({ serial_no: parseInt(value, 10) });
+   }
+   return or;
+}
+
+function applyOrderSearch(queryObj, search) {
+   const or = buildOrderSearchOr(search);
+   if (!or) return queryObj;
+   queryObj.$and = queryObj.$and || [];
+   queryObj.$and.push({ $or: or });
+   return queryObj;
 }
 
 async function CreatePaymentLog(user, order, status, method, type, approval, tenantId, company) {
@@ -334,6 +375,105 @@ async function syncOwnerOperatorFinancialRecords({ tenantId, companyId, userId, 
    await syncOwnerFinancialRecords({ tenantId, companyId, userId, order, trips, truckMap });
 }
 
+// A stop may be saved without an address on purpose: dispatch often books a load before the
+// shipper confirms the exact facility. The order is allowed through; what is NOT allowed is an
+// address that was typed and then silently dropped (see GetLocation) or one that cannot be
+// routed (see carrierController.getDistance).
+
+/* ── Money sanity ───────────────────────────────────────────────────────────────
+   A minus sign in a rate box used to sail straight through to the database: order #1107 carries
+   `total_amount: -1160` from a single `Line Haul -1160 x 1` line, and every report that sums it
+   is wrong by that much. Nothing about an order is ever negative — revenue, cost, settlement and
+   the line items behind them are all amounts owed, not adjustments.                            */
+/* A delivery cannot happen before its pickup. Dates are stored as `YYYY-MM-DD` strings, which
+   compare correctly as strings — no timezone to get wrong. Only the order's first pickup and last
+   delivery are compared: multi-stop runs legitimately interleave. */
+function findBackwardsDates(shippingDetails) {
+   const problems = [];
+   (Array.isArray(shippingDetails) ? shippingDetails : []).forEach((block) => {
+      const locs = Array.isArray(block?.locations) ? block.locations : [];
+      const kind = (l) => l?.type || l?.location_type;
+      const firstPickup = locs.find((l) => kind(l) === 'pickup' && l?.date);
+      const lastDelivery = [...locs].reverse().find((l) => kind(l) === 'delivery' && l?.date);
+      if (firstPickup && lastDelivery && String(lastDelivery.date) < String(firstPickup.date)) {
+         problems.push(`Delivery is dated ${lastDelivery.date}, before the pickup on ${firstPickup.date}.`);
+      }
+   });
+   return problems;
+}
+
+/* Pull every leg back inside the order's current stop list after the stops were edited.
+   One leg (the common case) is simply stretched over the whole route, exactly as create_order
+   builds it. Several legs are clamped and their order preserved; a leg squeezed out entirely by
+   the edit is soft-deleted rather than left pointing at nothing. */
+async function resyncTripStopIndexes(tenantId, order) {
+   const locs = order?.shipping_details?.[0]?.locations || [];
+   const last = locs.length - 1;
+   const legs = await Trip.find({ tenantId, order: order._id, deletedAt: null }).sort({ trip_no: 1 });
+   if (legs.length === 0) return;
+
+   if (last < 1) {
+      // Fewer than two stops left — there is no route for a leg to describe.
+      await Trip.updateMany({ tenantId, order: order._id, deletedAt: null }, { deletedAt: Date.now() });
+      return;
+   }
+
+   if (legs.length === 1) {
+      const leg = legs[0];
+      if (leg.start_stop_index !== 0 || leg.end_stop_index !== last) {
+         leg.start_stop_index = 0;
+         leg.end_stop_index = last;
+         await leg.save();
+      }
+      return;
+   }
+
+   let cursor = 0;
+   for (const leg of legs) {
+      const start = Math.min(Math.max(Number(leg.start_stop_index || 0), cursor), last);
+      const end = Math.min(Math.max(Number(leg.end_stop_index || 0), start), last);
+      if (start >= last && leg !== legs[legs.length - 1]) {
+         leg.deletedAt = Date.now();
+         await leg.save();
+         continue;
+      }
+      if (start !== leg.start_stop_index || end !== leg.end_stop_index) {
+         leg.start_stop_index = start;
+         leg.end_stop_index = end;
+         await leg.save();
+      }
+      cursor = end;
+   }
+   // The last surviving leg must always reach the final stop, or part of the route belongs to nobody.
+   const surviving = await Trip.find({ tenantId, order: order._id, deletedAt: null }).sort({ trip_no: 1 });
+   const tail = surviving[surviving.length - 1];
+   if (tail && tail.end_stop_index !== last) {
+      tail.end_stop_index = last;
+      await tail.save();
+   }
+}
+
+function findNegativeMoney({ revenue_items, carrier_revenue_items, total_amount, carrier_amount, settle_amount }) {
+   const bad = [];
+   const checkItems = (items, label) => {
+      (Array.isArray(items) ? items : []).forEach((item, i) => {
+         const rate = Number(item?.rate);
+         const qty = Number(item?.quantity);
+         const name = item?.revenue_item || item?.name || `line ${i + 1}`;
+         if (Number.isFinite(rate) && rate < 0) bad.push(`${label} "${name}" has a negative rate (${rate})`);
+         if (Number.isFinite(qty) && qty < 0) bad.push(`${label} "${name}" has a negative quantity (${qty})`);
+      });
+   };
+   checkItems(revenue_items, 'Customer revenue');
+   checkItems(carrier_revenue_items, 'Carrier revenue');
+   [['total_amount', total_amount], ['carrier_amount', carrier_amount], ['settle_amount', settle_amount]]
+      .forEach(([field, value]) => {
+         const n = Number(value);
+         if (Number.isFinite(n) && n < 0) bad.push(`${field.replace(/_/g, ' ')} is negative (${n})`);
+      });
+   return bad;
+}
+
 exports.create_order = catchAsync(async (req, res, next) => {
    try {
       const tenantId = getTenantId(req);
@@ -378,6 +518,37 @@ exports.create_order = catchAsync(async (req, res, next) => {
 
          order_status,
        } = req.body;
+
+      const negatives = findNegativeMoney({ revenue_items, carrier_revenue_items, total_amount, carrier_amount, settle_amount });
+      if (negatives.length > 0) {
+         return res.status(400).json({ status: false, code: 'negative_amount', message: negatives[0], problems: negatives });
+      }
+
+      const badDates = findBackwardsDates(shipping_details);
+      if (badDates.length > 0) {
+         return res.status(400).json({ status: false, code: 'dates_backwards', message: badDates[0], problems: badDates });
+      }
+
+      // The same reference on the same customer is usually a double-submit or two dispatchers
+      // entering one load — prod has 28 such pairs. It is occasionally legitimate (a split
+      // shipment), so this warns and lets the user confirm rather than blocking.
+      const reference = String(shipping_details?.[0]?.reference || '').trim();
+      if (reference && customer && !req.body?.confirm_duplicate) {
+         const twins = await Order.find({
+            tenantId,
+            customer,
+            'shipping_details.reference': reference,
+            $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+         }).select('serial_no createdAt').sort({ createdAt: -1 }).limit(5).lean();
+         if (twins.length > 0) {
+            return res.status(409).json({
+               status: false,
+               code: 'duplicate_reference',
+               message: `This customer already has reference "${reference}" on order #${twins.map((t) => t.serial_no).join(', #')}.`,
+               duplicates: twins.map((t) => ({ serial_no: t.serial_no, createdAt: t.createdAt })),
+            });
+         }
+      }
 
       const inputCurrency = normalizeCurrency(revenue_currency, BASE_ORDER_CURRENCY);
       const fxToBase = await resolveMonthlyRateToBase({
@@ -562,8 +733,11 @@ exports.create_order = catchAsync(async (req, res, next) => {
                carrier: order.order_type === 'outsourcing' ? order.carrier : null,
                start_location: `${startLoc.location || startLoc.address || ''}${startLoc.city ? `, ${startLoc.city}` : ''}`,
                end_location: `${endLoc.location || endLoc.address || ''}${endLoc.city ? `, ${endLoc.city}` : ''}`,
-               miles: Number(order.totalDistance) || 0,
-               totalDistance: Number(order.totalDistance) || 0,
+               // order.totalDistance is KM. Storing it under `miles` (and labelling the unit 'mi')
+               // put a 60%-inflated number on every single-leg order — harmless for pay, which
+               // re-derives from the order, but wrong on every screen that reads the trip directly.
+               miles: kmToMiles(order.totalDistance),
+               totalDistance: kmToMiles(order.totalDistance),
                distance_unit: 'mi',
                rate_per_mile: 0,
                created_by: req.user._id
@@ -620,6 +794,33 @@ exports.update_order = catchAsync(async (req, res, next) => {
       const updateData = {};
       for (const key of ALLOWED_UPDATE_FIELDS) {
          if (key in req.body) updateData[key] = req.body[key];
+      }
+
+      // Same rule on edit as on create — see findNegativeMoney.
+      const negatives = findNegativeMoney(updateData);
+      if (negatives.length > 0) {
+         return res.status(400).json({ status: false, code: 'negative_amount', message: negatives[0], problems: negatives });
+      }
+
+      // A stop cannot arrive before the stop it is picked up from.
+      const badDates = findBackwardsDates(updateData.shipping_details);
+      if (badDates.length > 0) {
+         return res.status(400).json({ status: false, code: 'dates_backwards', message: badDates[0], problems: badDates });
+      }
+
+      // Changing the currency of an order that already holds typed amounts silently reinterprets
+      // every one of them — CA$1,000 becomes US$1,000 with no conversion and no trace. The edit
+      // form always echoes the saved currency back, so a change here is either a mistake or a
+      // deliberate act that needs its own flow. Drop it and keep the order's own currency.
+      if ('revenue_currency' in updateData) {
+         const existing = await Order.findOne({ _id: req.params.id, tenantId })
+            .select('input_currency revenue_currency input_total_amount').lean();
+         const current = String(existing?.input_currency || existing?.revenue_currency || '').toLowerCase();
+         const incoming = String(updateData.revenue_currency || '').toLowerCase();
+         const hasTypedAmounts = Number(existing?.input_total_amount || 0) > 0;
+         if (current && incoming && current !== incoming && hasTypedAmounts) {
+            delete updateData.revenue_currency;
+         }
       }
 
       const criteria = { _id: req.params.id, tenantId };
@@ -750,6 +951,15 @@ exports.update_order = catchAsync(async (req, res, next) => {
          new: true,
          runValidators: true,
       });
+
+      // A leg addresses its stops by POSITION (`start_stop_index` / `end_stop_index`). Editing the
+      // order's stops used to leave those numbers untouched, so deleting a stop silently pointed a
+      // leg at a different stop — or past the end, where `extractLocMeta` returns nothing and the
+      // route reads blank. Prod carried two such legs (#1424, #1053).
+      if ('shipping_details' in updateData) {
+         await resyncTripStopIndexes(tenantId, order);
+      }
+
       if (order.isMixedOwner) {
          // Revenue/settle may have changed — re-derive each owner leg's share from the trips.
          const { trips, truckMap } = await loadOrderTripsAndTrucks(tenantId, order._id);
@@ -797,6 +1007,359 @@ exports.update_order = catchAsync(async (req, res, next) => {
          error: error.message
       });
    }
+});
+
+/* ── Convert an order between regular and outsourcing ───────────────────────────
+   A load booked on our own truck sometimes has to go to an outside carrier (or the reverse).
+   `order_type` is deliberately NOT in ALLOWED_UPDATE_FIELDS — flipping it on its own would leave
+   the old type's money and assignments behind: a carrier cost with no carrier, an owner settlement
+   for a load we no longer run, driver pay for a trip that never happened.
+
+   So conversion is its own endpoint with three parts:
+     1. refuse when the order has already produced money or work that cannot be un-done,
+     2. demand the new type's required fields up front,
+     3. clear the old type's fields in the same write.                                        */
+
+// Everything that makes an order un-convertible, checked together so the user gets the full list
+// rather than one blocker at a time.
+async function conversionBlockers(order, tenantId) {
+   const blockers = [];
+   if (order.lock) blockers.push('The order is locked. Unlock it first.');
+
+   if (String(order.customer_payment_status || 'pending') !== 'pending') {
+      blockers.push(`The customer payment is already "${order.customer_payment_status}".`);
+   }
+   if (order.order_type === 'outsourcing' && String(order.carrier_payment_status || 'pending') !== 'pending') {
+      blockers.push(`The carrier payment is already "${order.carrier_payment_status}".`);
+   }
+
+   const [tripCount, settledRows, salaryRows] = await Promise.all([
+      Trip.countDocuments({ tenantId, order: order._id, deletedAt: null }),
+      OwnerOperatorFinancialRecord.countDocuments({
+         tenantId, order: order._id, paymentStatus: { $ne: 'pending' },
+      }),
+      DriverSalary.countDocuments({ tenantId, 'orderBreakdown.order': order._id }),
+   ]);
+   // Every order is born with ONE default leg covering the whole route (see create_order), so a
+   // single leg is not planning work — it is rewritten to the new type below. More than one means
+   // a dispatcher built a real split, and converting would silently throw that away.
+   if (tripCount > 1) {
+      blockers.push(`This order is split into ${tripCount} legs. Merge them back to one in Trip Planning first.`);
+   }
+   if (settledRows > 0) {
+      blockers.push('An owner operator has already been paid for this order.');
+   }
+   if (salaryRows > 0) {
+      blockers.push('This order is already on a generated driver payslip.');
+   }
+   return blockers;
+}
+
+// Preflight: the modal asks this the moment it opens, so a dispatcher sees "this order cannot be
+// converted, here is why" before filling anything in — not after pressing the button.
+exports.convert_order_check = catchAsync(async (req, res) => {
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: 'Tenant context is required.' });
+   }
+   const criteria = { _id: req.params.id, tenantId };
+   applyOrderOwnershipScope(req, criteria);
+   const order = await Order.findOne(criteria).select(
+      'order_type lock customer_payment_status carrier_payment_status serial_no'
+   );
+   if (!order) {
+      return res.status(404).json({ status: false, message: 'Order not found.' });
+   }
+
+   const target = order.order_type === 'regular' ? 'outsourcing' : 'regular';
+   const blockers = await conversionBlockers(order, tenantId);
+
+   const allowed = Array.isArray(req.allowedOrderTypes) ? req.allowedOrderTypes : null;
+   if (allowed && allowed.length > 0 && !allowed.includes(target)) {
+      blockers.push(`Your plan or permissions do not include ${target} orders.`);
+   }
+
+   res.json({ status: true, from: order.order_type, target, canConvert: blockers.length === 0, blockers });
+});
+
+exports.convert_order_type = catchAsync(async (req, res) => {
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: 'Tenant context is required.' });
+   }
+
+   const target = String(req.body?.target || '').toLowerCase();
+   if (!['regular', 'outsourcing'].includes(target)) {
+      return res.status(400).json({ status: false, message: 'Choose either regular or outsourcing.' });
+   }
+
+   const criteria = { _id: req.params.id, tenantId };
+   applyOrderOwnershipScope(req, criteria);
+   const order = await Order.findOne(criteria);
+   if (!order) {
+      return res.status(404).json({ status: false, message: 'Order not found.' });
+   }
+   if (order.order_type === target) {
+      return res.status(400).json({ status: false, message: `This order is already ${target}.` });
+   }
+
+   // The module the order is moving INTO has to be one this tenant and this user may use —
+   // otherwise conversion becomes a way around the plan and the permission checks on create.
+   const allowed = Array.isArray(req.allowedOrderTypes) ? req.allowedOrderTypes : null;
+   if (allowed && allowed.length > 0 && !allowed.includes(target)) {
+      return res.status(403).json({
+         status: false,
+         message: `Your plan or permissions do not include ${target} orders.`,
+      });
+   }
+
+   const blockers = await conversionBlockers(order, tenantId);
+   if (blockers.length > 0) {
+      return res.status(400).json({ status: false, code: 'conversion_blocked', message: blockers[0], blockers });
+   }
+
+   // Amounts are typed in the order's own currency; store both the typed value and the base one,
+   // exactly like create/update do. Never re-stamp the currency here.
+   const fxToBase = Number(order.fx_to_usd || 1);
+   const missing = [];
+   const update = { order_type: target };
+
+   if (target === 'outsourcing') {
+      const carrier = req.body?.carrier;
+      const items = Array.isArray(req.body?.carrier_revenue_items) ? req.body.carrier_revenue_items : [];
+      // The carrier cost is the sum of its line items, exactly as on the add-order form; a bare
+      // `carrier_amount` is accepted for callers that have no line items to give.
+      const itemsTotal = items.reduce((sum, i) => sum + (Number(i?.rate) || 0) * (Number(i?.quantity) || 0), 0);
+      const carrierAmount = itemsTotal > 0 ? itemsTotal : Number(req.body?.carrier_amount);
+
+      // `carrier` and `carrier_amount` are required by the Order schema for an outsourcing order,
+      // so these two stay mandatory here — everything else mirrors what add-order lets you skip.
+      if (!carrier) missing.push('carrier');
+      if (!Number.isFinite(carrierAmount) || carrierAmount <= 0) missing.push('carrier_amount');
+      if (missing.length > 0) {
+         return res.status(400).json({
+            status: false, code: 'fields_required', missing,
+            message: 'An outsourcing order needs a carrier and what the carrier is paid.',
+         });
+      }
+      update.carrier = carrier;
+      update.input_carrier_amount = carrierAmount;
+      update.carrier_amount = convertToBase(carrierAmount, fxToBase);
+      // Line item rates are stored in base currency, the same as revenue_items on create/update.
+      update.carrier_revenue_items = normalizeRevenueItemsToBase(items, fxToBase);
+
+      // Drop everything that only means something on our own truck.
+      Object.assign(update, {
+         truck: null, trailer: null, driver: null, drivers: [],
+         isOwnerOperatedTruck: false, ownerOperator: null, ownerOperators: [], isMixedOwner: false,
+         settle_amount: 0, input_settle_amount: 0, owner_profit: 0,
+         driver_assignment_mode: 'company_driver',
+      });
+   } else {
+      // Nothing here is mandatory — the add-order form lets a fleet order be saved with no truck,
+      // no driver and no settle amount, and conversion must not be stricter than creation. The
+      // "needs attention" panel is what surfaces an order still missing them.
+      const truckId = req.body?.truck || null;
+      const driverList = Array.isArray(req.body?.drivers) ? req.body.drivers.filter(Boolean) : [];
+      const primaryDriver = req.body?.driver || driverList[0] || null;
+
+      const truck = truckId
+         ? await Truck.findOne({ _id: truckId, tenantId }).select('ownerOperated ownerOperator').lean()
+         : null;
+      if (truckId && !truck) {
+         return res.status(400).json({ status: false, message: 'That truck was not found for this tenant.' });
+      }
+
+      const ownerOperated = !!(truck?.ownerOperated && truck?.ownerOperator);
+      const settleAmount = Number(req.body?.settle_amount);
+
+      const drivers = driverList.length > 0 ? driverList : (primaryDriver ? [primaryDriver] : []);
+      update.truck = truckId;
+      update.trailer = req.body?.trailer || null;
+      update.driver = primaryDriver;
+      update.drivers = drivers;
+      update.isOwnerOperatedTruck = ownerOperated;
+      update.ownerOperator = ownerOperated ? truck.ownerOperator : null;
+      update.ownerOperators = ownerOperated ? [truck.ownerOperator] : [];
+      update.isMixedOwner = false;
+      // A settle amount only means anything on an owner's truck, and may be left blank for now.
+      const settle = ownerOperated && Number.isFinite(settleAmount) && settleAmount > 0 ? settleAmount : 0;
+      update.input_settle_amount = settle;
+      update.settle_amount = convertToBase(settle, fxToBase);
+      update.owner_profit = ownerOperated
+         ? Number(order.total_amount || 0) - Number(update.settle_amount || 0)
+         : 0;
+      update.driver_assignment_mode = ownerOperated && !primaryDriver ? 'owner_driver' : 'company_driver';
+
+      // Drop everything that only means something when an outside carrier runs the load.
+      Object.assign(update, {
+         carrier: null, carrier_amount: 0, input_carrier_amount: 0, carrier_revenue_items: [],
+         carrier_payment_status: 'pending', carrier_payment_date: null, carrier_payment_method: null,
+      });
+   }
+
+   const saved = await Order.findOneAndUpdate(criteria, update, { new: true, runValidators: true });
+
+   // The order's single default leg still describes the old type — point it at the new one, the
+   // same way create_order would have built it. (A real multi-leg split was blocked above.)
+   await Trip.updateMany(
+      { tenantId, order: order._id, deletedAt: null },
+      target === 'outsourcing'
+         ? { carrier: update.carrier, truck: null, trailer: null, driver: null, drivers: [], rate_per_mile: 0, total_driver_pay: 0, settle_amount: null }
+         : { carrier: null, truck: update.truck, trailer: update.trailer, driver: update.driver, drivers: update.drivers }
+   );
+
+   // Settlement ledger rows belong to the type we just left.
+   await OwnerOperatorFinancialRecord.deleteMany({ tenantId, order: order._id });
+
+   logActivity(req, {
+      action: 'UPDATE',
+      module: 'order',
+      description: `Converted order #${order.serial_no} from ${order.order_type} to ${target}`,
+      resourceId: order._id,
+      resourceName: `#${order.serial_no}`,
+      details: { from: order.order_type, to: target },
+   });
+
+   res.json({ status: true, order: saved, message: `Order is now ${target}.` });
+});
+
+/* ── Orders that need attention ─────────────────────────────────────────────────
+   One place that answers "which orders are not finished, and what is wrong with them".
+   Every rule below is something a human has to fix — nothing here is derivable, and nothing
+   here is a style preference. Levels: 'error' = the order's money is wrong or missing,
+   'warn' = it is incomplete, 'info' = it has been sitting too long.
+
+   Deliberately NOT flagged: an owner-operated leg with no driver of ours (the owner's own
+   driver runs it — see the Trip Planning notes), and a stop that is a relay marker.        */
+const ATTENTION_RULES = [
+   // Route — these feed distance, which feeds driver pay → owner settlement → truck gross
+   { code: 'blank_stop', group: 'data', level: 'error', label: 'Stop has no address',
+     test: (o) => (o.shipping_details || []).some((b) => (b.locations || []).some((l) =>
+        (l?.type || l?.location_type) !== 'relay' && !String(l?.location || l?.address || '').trim())) },
+   { code: 'no_distance', group: 'data', level: 'error', label: 'No distance',
+     test: (o) => Number(o.totalDistance || 0) <= 0 },
+
+   // Money
+   { code: 'no_revenue', group: 'data', level: 'error', label: 'No customer amount',
+     test: (o) => Number(o.total_amount || 0) <= 0 && Number(o.input_total_amount || 0) <= 0 },
+   { code: 'owner_no_settle', group: 'data', level: 'error', label: 'Owner truck, nothing to settle',
+     test: (o) => o.order_type === 'regular' && o.isOwnerOperatedTruck
+        && Number(o.settle_amount || 0) <= 0 && Number(o.input_settle_amount || 0) <= 0 },
+   { code: 'carrier_no_cost', group: 'data', level: 'warn', label: 'No carrier cost',
+     test: (o) => o.order_type === 'outsourcing' && Number(o.carrier_amount || 0) <= 0 },
+   { code: 'loss_making', group: 'data', level: 'warn', label: 'Cost above revenue',
+     test: (o) => o.order_type === 'outsourcing'
+        && Number(o.carrier_amount || 0) > 0 && Number(o.total_amount || 0) > 0
+        && Number(o.carrier_amount) > Number(o.total_amount) },
+
+   // Assignment
+   { code: 'no_carrier', group: 'data', level: 'error', label: 'No carrier',
+     test: (o) => o.order_type === 'outsourcing' && !o.carrier },
+   { code: 'no_truck', group: 'data', level: 'warn', label: 'No truck',
+     test: (o) => o.order_type === 'regular' && !o.truck },
+   { code: 'no_driver', group: 'data', level: 'warn', label: 'No driver',
+     test: (o) => o.order_type === 'regular' && !o.isOwnerOperatedTruck
+        && !o.driver && !(Array.isArray(o.drivers) && o.drivers.length > 0) },
+
+   // Paperwork and ageing — `_docCount` and `_ageDays` are stamped on the row before testing
+   { code: 'no_documents', group: 'followup', level: 'warn', label: 'No documents',
+     test: (o) => Number(o._docCount || 0) === 0 },
+   { code: 'customer_unpaid', group: 'followup', level: 'warn', label: 'Customer not paid',
+     test: (o) => o._ageDays > 30 && String(o.customer_payment_status || 'pending') === 'pending' },
+   { code: 'carrier_unpaid', group: 'followup', level: 'warn', label: 'Carrier not paid',
+     test: (o) => o.order_type === 'outsourcing' && o._ageDays > 30
+        && String(o.carrier_payment_status || 'pending') === 'pending' },
+   { code: 'stale_status', group: 'followup', level: 'info', label: 'Still "added"',
+     test: (o) => o._ageDays > 30 && String(o.order_status || 'added') === 'added' },
+];
+
+exports.orders_needing_attention = catchAsync(async (req, res) => {
+   const tenantId = getTenantId(req);
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: 'Tenant context is required.' });
+   }
+
+   const criteria = {
+      tenantId,
+      $or: [{ deletedAt: null }, { deletedAt: '' }, { deletedAt: { $exists: false } }],
+   };
+   if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+      criteria.order_type = { $in: req.allowedOrderTypes };
+   }
+   applyOrderOwnershipScope(req, criteria);
+   const companyId = normalizeCompanyId(req);
+   if (companyId) {
+      criteria.$and = (criteria.$and || []).concat([{
+         $or: [{ company: companyId }, { company: null }, { company: { $exists: false } }],
+      }]);
+   }
+
+   const orders = await Order.find(criteria)
+      .select('serial_no order_type customer carrier createdAt totalDistance total_amount input_total_amount '
+         + 'settle_amount input_settle_amount carrier_amount input_currency revenue_currency isOwnerOperatedTruck '
+         + 'driver drivers truck order_status customer_payment_status carrier_payment_status shipping_details created_by')
+      .populate('customer', 'name')
+      .populate('created_by', 'name')
+      .sort({ createdAt: -1 })
+      .lean();
+
+   // One grouped query for the file counts — never a lookup per order.
+   const ids = orders.map((o) => o._id);
+   const docCounts = new Map();
+   if (ids.length > 0) {
+      const grouped = await Files.aggregate([
+         { $match: { order: { $in: ids } } },
+         { $group: { _id: '$order', n: { $sum: 1 } } },
+      ]);
+      grouped.forEach((g) => docCounts.set(String(g._id), g.n));
+   }
+
+   const now = Date.now();
+   const counts = {};
+   const flagged = [];
+   orders.forEach((o) => {
+      o._docCount = docCounts.get(String(o._id)) || 0;
+      o._ageDays = Math.floor((now - new Date(o.createdAt || now).getTime()) / 86400000);
+      const issues = ATTENTION_RULES.filter((r) => {
+         try { return r.test(o); } catch { return false; }
+      }).map(({ code, group, level, label }) => ({ code, group, level, label }));
+      if (issues.length === 0) return;
+      issues.forEach((i) => { counts[i.code] = (counts[i.code] || 0) + 1; });
+      flagged.push({
+         _id: o._id,
+         serial_no: o.serial_no,
+         order_type: o.order_type,
+         customer: o.customer?.name || '',
+         created_by: o.created_by?.name || '',
+         createdAt: o.createdAt,
+         ageDays: o._ageDays,
+         totalDistance: Number(o.totalDistance || 0),
+         amount: Number(o.input_total_amount || 0) || Number(o.total_amount || 0),
+         currency: String(o.input_currency || o.revenue_currency || 'usd').toUpperCase(),
+         issues,
+      });
+   });
+
+   // Worst first: blockers, then how many things are wrong, then oldest.
+   const rank = (row) => (row.issues.some((i) => i.level === 'error') ? 0 : row.issues.some((i) => i.level === 'warn') ? 1 : 2);
+   flagged.sort((a, b) => rank(a) - rank(b) || b.issues.length - a.issues.length || new Date(a.createdAt) - new Date(b.createdAt));
+
+   // `data` issues are wrong or missing information — someone must go and fix them.
+   // `followup` issues (no documents, unpaid, still "added") are ordinary business state on most
+   // orders; counting them in the headline made 691 of 691 orders "need attention", which is the
+   // same as flagging none. They ship in the payload but the banner only counts the data group.
+   const needsFixing = flagged.filter((f) => f.issues.some((i) => i.group === 'data'));
+
+   res.json({
+      status: true,
+      total: needsFixing.length,
+      followupTotal: flagged.length - needsFixing.length,
+      scanned: orders.length,
+      errors: needsFixing.filter((f) => f.issues.some((i) => i.level === 'error')).length,
+      counts,
+      orders: flagged,
+   });
 });
 
 exports.order_listing = catchAsync(async (req, res, next) => {
@@ -932,20 +1495,7 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       }
    }
 
-   if (search && search.length > 1) {
-      const searchValue = search.trim();
-      if (!isNaN(searchValue)) {
-         // Numeric: match by serial number
-         queryObj.serial_no = parseInt(searchValue);
-      } else {
-         // Non-numeric: search customer order number or company name
-         const safeSearch = searchValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-         queryObj.$or = [
-            { customer_order_no: { $regex: safeSearch, $options: 'i' } },
-            { company_name: { $regex: safeSearch, $options: 'i' } },
-         ];
-      }
-   }
+   applyOrderSearch(queryObj, search);
 
    // Restrict listing to order types the user is allowed to access
    if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
@@ -1102,7 +1652,7 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
             * {
                box-sizing: border-box;
             }
-            div, table, tr, thead, tbody, section, article {
+            tr, thead, tbody, .no-break, .avoid-break {
                page-break-inside: avoid !important;
                break-inside: avoid !important;
                orphans: 4;
@@ -1180,10 +1730,7 @@ exports.order_listing_account = catchAsync(async (req, res) => {
             ]
          });
       }
-      if (search && search.length >1) {
-         const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // escape regex
-         queryObj.customer_order_no = { $regex: new RegExp(safeSearch, 'i') };
-      }
+      applyOrderSearch(queryObj, search);
 
       // Restrict to allowed order types
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
@@ -1770,11 +2317,23 @@ exports.deleteOrder = catchAsync(async (req, res) => {
          message: "Order not found."
        });
    }
-   order.deletedAt = Date.now();
+   const deletedAt = Date.now();
+   order.deletedAt = deletedAt;
    await order.save();
+
+   // A deleted order's legs used to stay alive: they still carried a driver, miles and a rate, so
+   // driver logs, trip aggregates and driver pay kept counting a load that was cancelled. Prod had
+   // 15 such legs holding 2,216 miles. The files go with them — nothing should hang off a deleted
+   // order. (Soft delete, like everything else here, so a mistaken delete stays recoverable.)
+   const [legs, files] = await Promise.all([
+      Trip.updateMany({ tenantId, order: order._id, deletedAt: null }, { deletedAt }),
+      Files.updateMany({ order: order._id, deletedAt: null }, { deletedAt }),
+   ]);
+
    logActivity(req, {
       action: 'DELETE',
       module: 'order',
+      details: { legsRemoved: legs.modifiedCount, filesRemoved: files.modifiedCount },
       description: `Deleted order #${order.serial_no}`,
       resourceId: order._id,
       resourceName: `Order #${order.serial_no}`,
@@ -2174,21 +2733,7 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
    }
 
    // Sanitize search parameter
-   if (search && search.length > 1) {
-      const searchValue = search.trim();
-      const safeSearch = searchValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      if (!isNaN(searchValue)) {
-         queryObj.serial_no = parseInt(searchValue);
-      } else {
-         queryObj.$and = queryObj.$and || [];
-         queryObj.$and.push({
-            $or: [
-               { customer_order_no: { $regex: safeSearch, $options: 'i' } },
-               { company_name: { $regex: safeSearch, $options: 'i' } }
-            ]
-         });
-      }
-   }
+   applyOrderSearch(queryObj, search);
 
    // Set default sort to serial_no descending if not provided
    if (!req.query.sort) {
@@ -2238,7 +2783,9 @@ exports.all_payments_status = catchAsync(async (req, res, next) => {
          queryObj.customer_payment_status = status;
       }
    }
-    
+
+   applyOrderSearch(queryObj, search);
+
    // Set default sort to serial_no descending if not provided
    if (!req.query.sort) {
       req.query.sort = '-serial_no';

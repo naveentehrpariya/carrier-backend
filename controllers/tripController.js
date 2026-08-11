@@ -8,7 +8,7 @@ const IgnoredEmptyMove = require('../db/IgnoredEmptyMove');
 const EmptyMoveNote = require('../db/EmptyMoveNote');
 const mongoose = require('mongoose');
 const { logActivity } = require('../utils/activityLogger');
-const { MI_PER_KM, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
+const { MI_PER_KM, KM_PER_MI, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { resolveOrderOwnerFields, syncOwnerFinancialRecords } = require('../utils/ownerSettlement');
 const { createOrderFxConverter, resolveDisplayCurrency, pickOrderAmount } = require('../utils/orderMoney');
 const { resolveRouteDistance } = require('../utils/routeDistance');
@@ -417,14 +417,36 @@ function normalizeCompanyId(req) {
     return new mongoose.Types.ObjectId(s);
 }
 
-function buildTripLogItem(trip) {
+// Raw distance per order across ALL its trips — the denominator every per-trip share is taken
+// against. Raw/raw is unit-agnostic, so it holds whether the stored value is km or miles.
+async function buildOrderRawTotals(tenantId, trips) {
+    const orderIds = [...new Set(trips.map((t) => String(t.order?._id || t.order)).filter(Boolean))];
+    if (!orderIds.length) return new Map();
+    const all = await Trip.find({ tenantId, deletedAt: null, order: { $in: orderIds } })
+        .select('order totalDistance miles total_km').lean();
+    const totals = new Map();
+    all.forEach((t) => {
+        const oid = String(t.order);
+        const raw = Math.max(Number(t.totalDistance || t.miles || t.total_km || 0), 0);
+        totals.set(oid, Number(totals.get(oid) || 0) + raw);
+    });
+    return totals;
+}
+
+// `rawTotals` (from buildOrderRawTotals) turns the stored distance into REAL miles the same way
+// the payslip does. Without it this read `trip.miles` straight — a legacy/KM-mislabeled value —
+// and then divided it by order.totalDistance, which is KM: miles/km is not a share of anything,
+// so the revenue split came out ~38% low. Both numbers now come from the one shared derivation.
+function buildTripLogItem(trip, rawTotals = null) {
     const order = trip.order;
     const startMeta = extractLocMeta(order, trip.start_stop_index);
     const endMeta = extractLocMeta(order, trip.end_stop_index);
-    const miles = Number(trip.miles || 0);
-    const orderTotalDistance = Number(order?.totalDistance || 0);
+    const orderId = String(order?._id || trip.order || '');
+    const raw = Math.max(Number(trip.totalDistance || trip.miles || trip.total_km || 0), 0);
+    const denom = Number(rawTotals?.get(orderId) || 0) || raw;
+    const miles = deriveTripMiles(trip, Number(order?.totalDistance || 0), denom);
     const orderTotalAmount = Number(order?.total_amount || 0);
-    const gross = orderTotalDistance > 0 ? (orderTotalAmount * miles) / orderTotalDistance : 0;
+    const gross = denom > 0 ? (orderTotalAmount * raw) / denom : 0;
     return {
         type: 'trip',
         tripId: trip._id,
@@ -447,11 +469,11 @@ function buildTripLogItem(trip) {
     };
 }
 
-function withEmptyMoves(trips) {
+function withEmptyMoves(trips, rawTotals = null) {
     const items = [];
     let prev = null;
     for (const t of trips) {
-        const cur = buildTripLogItem(t);
+        const cur = buildTripLogItem(t, rawTotals);
         if (
             prev &&
             prev.type === 'trip' &&
@@ -513,7 +535,10 @@ exports.getTruckTripLogs = async (req, res) => {
         const notesMap = new Map(emptyNotes.map(m => [`${m.after_trip}_${m.before_trip}`, m.note]));
 
         const wantEmptyMiles = String(includeEmptyMiles || '').toLowerCase() === '1' || String(includeEmptyMiles || '').toLowerCase() === 'true';
-        let logs = wantEmptyMiles ? withEmptyMoves(scoped) : scoped.map(buildTripLogItem);
+        const rawTotals = await buildOrderRawTotals(tenantId, scoped);
+        let logs = wantEmptyMiles
+            ? withEmptyMoves(scoped, rawTotals)
+            : scoped.map((t) => buildTripLogItem(t, rawTotals));
 
         if (wantEmptyMiles) {
             await enrichEmptyMiles(logs, 25, tenantId);
@@ -584,7 +609,10 @@ exports.getDriverTripLogs = async (req, res) => {
         const notesMap = new Map(emptyNotes.map(m => [`${m.after_trip}_${m.before_trip}`, m.note]));
 
         const wantEmptyMiles = String(includeEmptyMiles || '').toLowerCase() === '1' || String(includeEmptyMiles || '').toLowerCase() === 'true';
-        let logs = wantEmptyMiles ? withEmptyMoves(scoped) : scoped.map(buildTripLogItem);
+        const rawTotals = await buildOrderRawTotals(tenantId, scoped);
+        let logs = wantEmptyMiles
+            ? withEmptyMoves(scoped, rawTotals)
+            : scoped.map((t) => buildTripLogItem(t, rawTotals));
 
         if (wantEmptyMiles) {
             await enrichEmptyMiles(logs, 25, tenantId);
@@ -692,14 +720,15 @@ exports.getTruckTripSummary = async (req, res) => {
         const notesMap = new Map(emptyNotes.map(m => [`${m.after_trip}_${m.before_trip}`, m.note]));
 
         // Extract empty moves
-        const logs = withEmptyMoves(scoped);
+        const rawTotals = await buildOrderRawTotals(tenantId, scoped);
+        const logs = withEmptyMoves(scoped, rawTotals);
         await enrichEmptyMiles(logs, 25, tenantId);
         
         const emptyTrips = logs.filter(l => l.type === 'empty' && !ignoredSet.has(`${l.after_trip_id}_${l.before_trip_id}`)).map((e, idx) => ({
             _id: `empty_${idx}`,
             type: 'empty',
             miles: Number(e.miles || 0),
-            km: Number(e.miles || 0) * 1.60934,
+            km: Number(e.miles || 0) * KM_PER_MI,
             trips: 1,
             orderSerial: 'Empty Move',
             from_location: e.from_location,
@@ -712,39 +741,27 @@ exports.getTruckTripSummary = async (req, res) => {
         const emptyTripsTotalMiles = emptyTrips.reduce((acc, e) => acc + e.miles, 0);
         const emptyTripsTotalKm = emptyTrips.reduce((acc, e) => acc + e.km, 0);
 
-        const summary = await Trip.aggregate([
-            { $match: match },
-            { $group: {
-                _id: null,
-                totalTrips: { $sum: 1 },
-                totalMiles: { $sum: { $ifNull: ['$miles', 0] } },
-                totalKm: { $sum: { $ifNull: ['$total_km', 0] } }
-            } }
-        ]);
-        
-        const byOrder = await Trip.aggregate([
-            { $match: match },
-            { $group: {
-                _id: '$order',
-                miles: { $sum: { $ifNull: ['$miles', 0] } },
-                km: { $sum: { $ifNull: ['$total_km', 0] } },
-                trips: { $sum: 1 }
-            } },
-            {
-                $lookup: {
-                    from: 'orders',
-                    localField: '_id',
-                    foreignField: '_id',
-                    as: 'orderDoc'
-                }
-            },
-            { $unwind: { path: '$orderDoc', preserveNullAndEmptyArrays: true } },
-            { $addFields: { orderSerial: '$orderDoc.serial_no', type: 'trip' } },
-            { $project: { orderDoc: 0 } },
-            { $sort: { trips: -1 } }
-        ]);
-        
-        const finalSummary = summary[0] || { totalTrips: 0, totalMiles: 0, totalKm: 0 };
+        // Real miles, not the raw stored value. Summing `$miles` in Mongo skipped the one shared
+        // derivation (order KM × this trip's share) — legacy rows hold KM under a "miles" name and
+        // pre-fix splits hold an inflated pair-sum, so this total disagreed with the payslip and
+        // with Trucks Gross Earning. `$total_km` is likewise stale; km comes from the real miles.
+        const tripLogs = logs.filter((l) => l.type === 'trip');
+        const byOrderMap = new Map();
+        let totalTrips = 0, totalMiles = 0;
+        tripLogs.forEach((l) => {
+            const oid = String(l.orderId || '');
+            const miles = Number(l.miles || 0);
+            totalTrips += 1;
+            totalMiles += miles;
+            const cur = byOrderMap.get(oid) || { _id: l.orderId, orderSerial: l.orderSerial, miles: 0, km: 0, trips: 0, type: 'trip' };
+            cur.miles += miles;
+            cur.km += miles * KM_PER_MI;
+            cur.trips += 1;
+            byOrderMap.set(oid, cur);
+        });
+        const byOrder = Array.from(byOrderMap.values()).sort((a, b) => b.trips - a.trips);
+
+        const finalSummary = { totalTrips, totalMiles, totalKm: totalMiles * KM_PER_MI };
         finalSummary.totalMiles += emptyTripsTotalMiles;
         finalSummary.totalKm += emptyTripsTotalKm;
         

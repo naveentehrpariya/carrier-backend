@@ -6,7 +6,7 @@ const logger = require("../utils/logger");
 const axios = require("axios");
 const { checkCarrierLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity } = require("../utils/activityLogger");
-const { resolveRouteDistance } = require("../utils/routeDistance");
+const { resolveRouteDistance, getGoogleApiKey } = require("../utils/routeDistance");
 
 exports.addCarrier = catchAsync(async (req, res, next) => {
   const isAdmin = req.user?.is_admin === 1 || Number(req.user?.role) === 3;
@@ -20,13 +20,36 @@ exports.addCarrier = catchAsync(async (req, res, next) => {
   if (!tenantId) {
     return res.status(400).json({ status: false, message: "Tenant context is required." });
   }
+
+  const trimmedName = String(name || '').trim();
+  const trimmedEmail = email ? String(email).trim().toLowerCase() : undefined;
+  const trimmedPhone = phone ? String(phone).trim() : undefined;
+  const trimmedLocation = location ? String(location).trim() : undefined;
+  const trimmedCountry = country ? String(country).trim() : undefined;
+  const trimmedState = state ? String(state).trim() : undefined;
+  const trimmedCity = city ? String(city).trim() : undefined;
+  const trimmedZipcode = zipcode ? String(zipcode).trim() : undefined;
+  const trimmedSecondaryEmail = secondary_email ? String(secondary_email).trim().toLowerCase() : undefined;
+  const trimmedSecondaryPhone = secondary_phone ? String(secondary_phone).trim() : undefined;
+  const trimmedMc = mc_code ? String(mc_code).trim() : undefined;
+
   const companyId = req.user?.company?._id || req.user?.company || null;
-  const existingCarrier = await Carrier.findOne({ tenantId, ...(companyId ? { company: companyId } : {}), mc_code });
-    if (existingCarrier) {
+  const existingCarrier = await Carrier.findOne({ tenantId, ...(companyId ? { company: companyId } : {}), mc_code: trimmedMc });
+  if (existingCarrier) {
     return res.status(200).json({
       status: false,
-      message:"MC code already exists. Please use a different MC code." 
+      message: "MC code already exists. Please use a different MC code." 
     });
+  }
+
+  if (trimmedEmail) {
+    const existingEmail = await Carrier.findOne({ tenantId, ...(companyId ? { company: companyId } : {}), email: trimmedEmail });
+    if (existingEmail) {
+      return res.status(200).json({
+        status: false,
+        message: "Email already exists. Please use a different email address."
+      });
+    }
   }
 
   let carrierID;
@@ -51,29 +74,29 @@ exports.addCarrier = catchAsync(async (req, res, next) => {
     }));
   } else {
     // Fallback to legacy fields for backward compatibility
-    if (email) {
-      emailsArray.push({ email, is_primary: true, created_at: new Date() });
+    if (trimmedEmail) {
+      emailsArray.push({ email: trimmedEmail, is_primary: true, created_at: new Date() });
     }
-    if (secondary_email) {
-      emailsArray.push({ email: secondary_email, is_primary: false, created_at: new Date() });
+    if (trimmedSecondaryEmail) {
+      emailsArray.push({ email: trimmedSecondaryEmail, is_primary: false, created_at: new Date() });
     }
   }
 
   const result = await Carrier.create({
-    name: name,
-    email: email,
-    secondary_email: secondary_email,
-    secondary_phone: secondary_phone,
+    name: trimmedName,
+    email: trimmedEmail,
+    secondary_email: trimmedSecondaryEmail,
+    secondary_phone: trimmedSecondaryPhone,
     emails: emailsArray,
-    location: location,
-    phone: phone,
+    location: trimmedLocation,
+    phone: trimmedPhone,
     carrierID: carrierID,
-    country: country,
-    state: state,
-    city: city,
-    zipcode: zipcode,
+    country: trimmedCountry,
+    state: trimmedState,
+    city: trimmedCity,
+    zipcode: trimmedZipcode,
     created_by: req.user._id,
-    mc_code: mc_code,
+    mc_code: trimmedMc,
     company: companyId,
     tenantId,
   });
@@ -202,12 +225,41 @@ exports.updateCarrier = catchAsync(async (req, res, next) => {
     if (!tenantIdChk) {
       return res.status(400).json({ status: false, message: 'Tenant context missing.' });
     }
-    if (mc_code) {
-      const existingCarrier = await Carrier.findOne({ mc_code: mc_code, _id: {$ne: req.params.id }, tenantId: tenantIdChk });
+
+    const trimmedName = name ? String(name).trim() : undefined;
+    const trimmedEmail = email ? String(email).trim().toLowerCase() : undefined;
+    const trimmedPhone = phone ? String(phone).trim() : undefined;
+    const trimmedLocation = location ? String(location).trim() : undefined;
+    const trimmedCountry = country ? String(country).trim() : undefined;
+    const trimmedState = state !== undefined ? String(state).trim() : undefined;
+    const trimmedCity = city !== undefined ? String(city).trim() : undefined;
+    const trimmedZipcode = zipcode !== undefined ? String(zipcode).trim() : undefined;
+    const trimmedSecondaryEmail = secondary_email ? String(secondary_email).trim().toLowerCase() : undefined;
+    const trimmedSecondaryPhone = secondary_phone ? String(secondary_phone).trim() : undefined;
+    const trimmedMc = mc_code ? String(mc_code).trim() : undefined;
+
+    if (trimmedMc) {
+      const existingCarrier = await Carrier.findOne({ mc_code: trimmedMc, _id: {$ne: req.params.id }, tenantId: tenantIdChk });
       if (existingCarrier) {
         return res.status(200).send({
           status: false,
           message: "MC Code must be unique. This MC Code is already in use.",
+        });
+      }
+    }
+
+    if (trimmedEmail) {
+      const companyId = req.user?.company?._id || req.user?.company || null;
+      const existingEmail = await Carrier.findOne({
+        email: trimmedEmail,
+        _id: { $ne: req.params.id },
+        tenantId: tenantIdChk,
+        ...(companyId ? { company: companyId } : {})
+      });
+      if (existingEmail) {
+        return res.status(200).send({
+          status: false,
+          message: "Email must be unique. This email is already in use.",
         });
       }
     }
@@ -224,26 +276,26 @@ exports.updateCarrier = catchAsync(async (req, res, next) => {
       }));
     } else {
       // Fallback to legacy fields for backward compatibility
-      if (email) {
-        emailsArray.push({ email, is_primary: true, created_at: new Date() });
+      if (trimmedEmail) {
+        emailsArray.push({ email: trimmedEmail, is_primary: true, created_at: new Date() });
       }
-      if (secondary_email) {
-        emailsArray.push({ email: secondary_email, is_primary: false, created_at: new Date() });
+      if (trimmedSecondaryEmail) {
+        emailsArray.push({ email: trimmedSecondaryEmail, is_primary: false, created_at: new Date() });
       }
     }
     // Build update object with processed emails
     const updateData = {
-        name: name,
-        email: email,
-        location: location,
-        phone: phone,
-        country: country,
-        state: state,
-        city: city,
-        zipcode: zipcode,
-        mc_code: mc_code,
-        secondary_email: secondary_email,
-        secondary_phone: secondary_phone
+        name: trimmedName,
+        email: trimmedEmail,
+        location: trimmedLocation,
+        phone: trimmedPhone,
+        country: trimmedCountry,
+        state: trimmedState,
+        city: trimmedCity,
+        zipcode: trimmedZipcode,
+        mc_code: trimmedMc,
+        secondary_email: trimmedSecondaryEmail,
+        secondary_phone: trimmedSecondaryPhone
     };
 
     // Include emails array if it was processed
@@ -309,6 +361,29 @@ exports.carrierDetail = catchAsync(async (req, res, next) => {
   });
 });
 
+// Google's Directions API answers NOT_FOUND / ZERO_RESULTS for the whole route without saying which
+// stop it choked on. When routing fails we geocode each stop once to name the bad one, so the
+// dispatcher is told which address to fix instead of a bare "NOT_FOUND". Failure path only.
+async function findUnresolvableAddresses(locations) {
+  const key = getGoogleApiKey();
+  if (!key) return [];
+  const results = await Promise.all(
+    (locations || []).map(async (address) => {
+      try {
+        const resp = await axios.get('https://maps.googleapis.com/maps/api/geocode/json', {
+          params: { address, key },
+          timeout: 10000,
+        });
+        const ok = resp?.data?.status === 'OK' && Array.isArray(resp.data.results) && resp.data.results.length > 0;
+        return ok ? null : address;
+      } catch {
+        return null; // a network blip is not proof the address is bad
+      }
+    })
+  );
+  return results.filter(Boolean);
+}
+
 exports.getDistance = async (req, res) => {
   const locations = req.body.locations;
 
@@ -336,9 +411,31 @@ exports.getDistance = async (req, res) => {
     });
 
     if (!result.ok) {
+      // resolveRouteDistance already geocoded every stop on its fallback path — reuse that answer
+      // instead of paying for the same calls again.
+      const unresolved = Array.isArray(result.unresolved) && result.unresolved.length
+        ? result.unresolved
+        : await findUnresolvableAddresses(locations);
+      // Three different failures, three different messages. "ZERO_RESULTS" on its own tells the
+      // dispatcher nothing: every stop was found, one of them just landed somewhere no truck can
+      // drive to from the others — so name the pair and where each one actually landed.
+      const pair = result.brokenPair;
+      let msg;
+      if (unresolved.length > 0) {
+        msg = `Google could not find ${unresolved.length === 1 ? 'this address' : 'these addresses'}: ${unresolved.join(' | ')}`;
+      } else if (pair) {
+        msg = `No driving route between "${pair.from.typed}" (found as ${pair.from.resolvedTo}) and "${pair.to.typed}" (found as ${pair.to.resolvedTo}). One of these two addresses is landing in the wrong place — make it more specific.`;
+      } else {
+        msg = result.error === 'ZERO_RESULTS'
+          ? 'Every stop was found, but Google cannot build a driving route between them. Check that each address is in the right city/country.'
+          : (result.error || 'No route found between these stops.');
+      }
       return res.status(200).json({
         status: false,
-        msg: result.error || "No route found between given locations.",
+        msg,
+        unresolved,
+        brokenPair: pair || null,
+        resolvedStops: result.resolvedStops || [],
       });
     }
 
@@ -360,11 +457,18 @@ exports.getDistance = async (req, res) => {
       routePolicy: result.policy,
       distanceSource: result.source,
       corridorUsed: result.corridorUsed,
+      // Stops Google could not place from the typed text — routed from a reduced form (street+city,
+      // or the postal code). Shown as a warning so the dispatcher can accept it or type the miles.
+      approximatedStops: result.approximatedStops || [],
     });
   } catch (error) {
+    const unresolved = await findUnresolvableAddresses(locations);
     res.status(200).json({
       status: false,
-      msg: error.response?.data?.error_message || error.message || "Failed to fetch route info"
+      msg: unresolved.length > 0
+        ? `Google could not find ${unresolved.length === 1 ? 'this address' : 'these addresses'}: ${unresolved.join(' | ')}`
+        : (error.response?.data?.error_message || error.message || "Failed to fetch route info"),
+      unresolved,
     });
   }
 };

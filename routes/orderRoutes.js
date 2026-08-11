@@ -60,6 +60,9 @@ router.get('/subscription/status', validateToken, catchAsync(async (req, res) =>
 router.route('/order/add').post(validateToken, resolveTenant, requireActiveSubscription, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
 router.route('/order/update/:id').put(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.update_order);
 router.route('/order/listings').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_listing);
+router.route('/order/needs-attention').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.orders_needing_attention);
+router.route('/order/convert-check/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.convert_order_check);
+router.route('/order/convert-type/:id').post(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.convert_order_type);
 router.route('/order/detail/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_detail);
 router.route('/order/generate-pdf').post(validateToken, optionalTenant, orderController.generatePdfFromHtml);
 router.route('/order_docs/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_docs);

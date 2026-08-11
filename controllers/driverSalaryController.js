@@ -454,7 +454,7 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
     // rateUsed is the driver's contracted per-mile rate, stated in the currency it was agreed in —
     // showing it in `cur` would print a converted number the driver never signed off on.
     const rateCur = normalizeCurrency(salary.rateCurrency, 'USD');
-    const fmtRate = (n) => `${rateCur} ${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const fmtRate = (n) => `${rateCur} ${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}`;
     const rows = (salary.orderBreakdown || []).map((b) => `
       <tr>
         <td>#${safe(b.serial_no ?? '—')}</td>

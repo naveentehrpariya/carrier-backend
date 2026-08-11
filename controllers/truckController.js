@@ -7,6 +7,8 @@ const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
 const { logActivity } = require('../utils/activityLogger');
+const Order = require('../db/Order');
+const { deriveTripMiles } = require('../utils/distance');
 
 function normalizeCompanyId(req) {
   const raw = req.user?.company?._id || req.user?.company;
@@ -102,7 +104,6 @@ exports.trucks_listing = catchAsync(async (req, res, next) => {
           {
             $group: {
               _id: '$truck',
-              totalMiles: { $sum: { $ifNull: ['$miles', 0] } },
               lastTripAt: { $first: '$createdAt' },
               lastLocation: { $first: '$end_location' },
               lastOrder: { $first: '$order' },
@@ -123,6 +124,37 @@ exports.trucks_listing = catchAsync(async (req, res, next) => {
         ])
       : [];
 
+    // Real miles per truck. `$sum: '$miles'` looked right but summed the raw stored value: legacy
+    // rows hold KM under that name, so a truck's odometer on this list ran ~60% high and disagreed
+    // with the payslip, the trip logs and Trucks Gross Earning. deriveTripMiles is the one source.
+    const milesByTruck = new Map();
+    if (truckIds.length) {
+      const truckTrips = await Trip.find({ tenantId, deletedAt: null, truck: { $in: truckIds } })
+        .select('truck order totalDistance miles total_km').lean();
+      const orderIds = [...new Set(truckTrips.map((t) => String(t.order)).filter(Boolean))];
+      // Denominator must span ALL trips of each order, including ones on other trucks.
+      const siblingTrips = orderIds.length
+        ? await Trip.find({ tenantId, deletedAt: null, order: { $in: orderIds } })
+            .select('order totalDistance miles total_km').lean()
+        : [];
+      const orderRows = orderIds.length
+        ? await Order.find({ tenantId, _id: { $in: orderIds } }).select('_id totalDistance').lean()
+        : [];
+      const orderKm = new Map(orderRows.map((o) => [String(o._id), Number(o?.totalDistance || 0)]));
+      const rawTotal = new Map();
+      siblingTrips.forEach((t) => {
+        const oid = String(t.order);
+        const raw = Math.max(Number(t.totalDistance || t.miles || t.total_km || 0), 0);
+        rawTotal.set(oid, Number(rawTotal.get(oid) || 0) + raw);
+      });
+      truckTrips.forEach((t) => {
+        const oid = String(t.order);
+        const real = deriveTripMiles(t, orderKm.get(oid), rawTotal.get(oid));
+        const key = String(t.truck);
+        milesByTruck.set(key, Number(milesByTruck.get(key) || 0) + Number(real || 0));
+      });
+    }
+
     const map = new Map((tripAgg || []).map((r) => [String(r._id), r]));
     const merged = (trucks || []).map((t) => {
       const r = map.get(String(t._id));
@@ -131,7 +163,7 @@ exports.trucks_listing = catchAsync(async (req, res, next) => {
         lastLocation: r?.lastLocation || '',
         lastTripAt: r?.lastTripAt || null,
         lastOrderSerial: r?.lastOrderSerial || null,
-        totalMiles: Number(r?.totalMiles || 0)
+        totalMiles: Number(milesByTruck.get(String(t._id)) || 0)
       };
     });
 
@@ -151,6 +183,36 @@ exports.removeTruck = catchAsync(async (req, res, next) => {
     if (companyId) {
       filter.company = companyId;
     }
+    // A truck still carrying live work leaves dangling references behind: prod has 3 legs pointing
+    // at trucks that were removed, and those legs then show no unit number anywhere. Say what the
+    // truck is still on and let the user confirm — the removal itself stays allowed.
+    if (!req.query?.force) {
+      const truck = await Truck.findOne(filter).select('_id').lean();
+      if (!truck) {
+        return res.status(404).json({ status: false, message: 'Truck not found' });
+      }
+      const [legCount, orderCount] = await Promise.all([
+        Trip.countDocuments({ tenantId, truck: truck._id, deletedAt: null }),
+        Order.countDocuments({
+          tenantId,
+          truck: truck._id,
+          $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+        }),
+      ]);
+      if (legCount > 0 || orderCount > 0) {
+        const parts = [];
+        if (orderCount > 0) parts.push(`${orderCount} order${orderCount === 1 ? '' : 's'}`);
+        if (legCount > 0) parts.push(`${legCount} leg${legCount === 1 ? '' : 's'}`);
+        return res.status(409).json({
+          status: false,
+          code: 'truck_in_use',
+          orders: orderCount,
+          legs: legCount,
+          message: `This truck is still on ${parts.join(' and ')}. Removing it leaves them with no truck.`,
+        });
+      }
+    }
+
     const updated = await Truck.findOneAndUpdate(filter, { deletedAt: new Date() }, { new: true });
     if (!updated) {
       return res.status(404).json({ status: false, message: 'Truck not found' });

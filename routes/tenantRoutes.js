@@ -232,6 +232,7 @@ router.get('/subscription/status', validateToken, catchAsyncStatus(async (req, r
 router.post('/order/add', validateToken, requireActiveSubscription, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
 router.put('/order/update/:id', validateToken, resolveAllowedModulesMiddleware, orderController.update_order);
 router.get('/order/listings', validateToken, resolveAllowedModulesMiddleware, orderController.order_listing);
+router.get('/order/needs-attention', validateToken, resolveAllowedModulesMiddleware, orderController.orders_needing_attention);
 router.get('/order/detail/:id', validateToken, resolveAllowedModulesMiddleware, orderController.order_detail);
 router.get('/order_docs/:id', validateToken, resolveAllowedModulesMiddleware, orderController.order_docs);
 router.get('/lock-order/:id', validateToken, resolveAllowedModulesMiddleware, orderController.lockOrder);

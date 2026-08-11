@@ -51,6 +51,12 @@ exports.getDeductions = catchAsync(async (req, res, next) => {
     const totalAdditions = additions.reduce((s, d) => s + Number(d.amount || 0), 0);
     const totalDeductions = deductionItems.reduce((s, d) => s + Number(d.amount || 0), 0);
 
+    // Every row carries the currency it was entered in (DriverDeduction.currency). These totals add
+    // the raw amounts, which is only meaningful while all the rows share one currency — normally
+    // true, since the currency is snapshotted from the driver's locked rate currency. Report what
+    // was actually summed so the UI can never present two currencies as one number.
+    const currencies = [...new Set(deductions.map((d) => String(d.currency || 'USD').toUpperCase()))];
+
     res.json({
       status: true,
       deductions,
@@ -60,6 +66,9 @@ exports.getDeductions = catchAsync(async (req, res, next) => {
       totalCityPay,
       totalAdditions,
       totalDeductions,
+      currency: currencies[0] || 'USD',
+      currencies,
+      mixedCurrency: currencies.length > 1,
       netAdjustment: totalCityPay + totalAdditions - totalDeductions
     });
   } catch (err) {

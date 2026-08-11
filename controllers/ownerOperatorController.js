@@ -543,7 +543,7 @@ exports.ownerOperatorDetail = catchAsync(async (req, res, next) => {
         },
       ],
     })
-      .select('serial_no order_status order_type total_amount settle_amount owner_profit input_total_amount input_currency revenue_currency createdAt pickup_date delivery_date customer truck shipping_details')
+      .select('serial_no order_status order_type total_amount settle_amount owner_profit input_total_amount input_settle_amount input_currency revenue_currency createdAt pickup_date delivery_date customer truck shipping_details')
       .populate('customer', 'name company_name')
       .populate('truck', 'make model truckNumber unitNumber plateNumber')
       .sort({ createdAt: -1 })
@@ -841,6 +841,11 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
           driverRateType,
           driverMiles: Number(ded?.miles || 0),
           driverAvgRate,
+          // The currency `originalDriverAvgRate` is actually denominated in. Printing only the
+          // converted, 2-decimal rate makes the row fail its own arithmetic (0.55 × 1095.76 is
+          // not 599.29) — the real rate is 0.3900 USD. Show the source, like every other money
+          // field on this statement.
+          driverRateCurrency: deductionSourceCurrency,
         };
       });
 
@@ -2135,13 +2140,46 @@ exports.reportingOverview = catchAsync(async (req, res, next) => {
             $group: {
               _id: '$truck',
               trips: { $sum: 1 },
-              miles: { $sum: { $ifNull: ['$miles', 0] } },
+              tripIds: { $push: '$_id' },
             },
           },
           { $sort: { trips: -1 } },
         ])
       : [];
-    const truckUtilization = utilAgg.map((x) => ({ truckId: x._id, trips: x.trips, miles: x.miles }));
+    // Miles are derived, never summed raw: `$sum: '$miles'` mixes legacy KM rows with real-mile
+    // rows, so truck utilization read higher than the payslip the same trips produced.
+    const utilTripIds = utilAgg.flatMap((x) => x.tripIds || []);
+    const utilMiles = new Map();
+    if (utilTripIds.length) {
+      const utilTrips = await Trip.find({ _id: { $in: utilTripIds } })
+        .select('truck order totalDistance miles total_km').lean();
+      const utilOrderIds = [...new Set(utilTrips.map((t) => String(t.order)).filter(Boolean))];
+      const siblings = utilOrderIds.length
+        ? await Trip.find({ tenantId, deletedAt: null, order: { $in: utilOrderIds } })
+            .select('order totalDistance miles total_km').lean()
+        : [];
+      const utilOrders = utilOrderIds.length
+        ? await Order.find({ tenantId, _id: { $in: utilOrderIds } }).select('_id totalDistance').lean()
+        : [];
+      const kmByOrder = new Map(utilOrders.map((o) => [String(o._id), Number(o?.totalDistance || 0)]));
+      const rawByOrder = new Map();
+      siblings.forEach((t) => {
+        const oid = String(t.order);
+        const raw = Math.max(Number(t.totalDistance || t.miles || t.total_km || 0), 0);
+        rawByOrder.set(oid, Number(rawByOrder.get(oid) || 0) + raw);
+      });
+      utilTrips.forEach((t) => {
+        const oid = String(t.order);
+        const real = deriveTripMiles(t, kmByOrder.get(oid), rawByOrder.get(oid));
+        const key = String(t.truck);
+        utilMiles.set(key, Number(utilMiles.get(key) || 0) + Number(real || 0));
+      });
+    }
+    const truckUtilization = utilAgg.map((x) => ({
+      truckId: x._id,
+      trips: x.trips,
+      miles: Number(utilMiles.get(String(x._id)) || 0),
+    }));
 
     const totalDriverDeduction = ownerPerformance.reduce((acc, x) => acc + Number(x.driverDeduction || 0), 0);
     const totalFinalPayable = ownerPerformance.reduce((acc, x) => acc + Number(x.finalPayable || 0), 0);
@@ -2272,6 +2310,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
         driverRateType,
         driverMiles: Number(ded?.miles || 0),
         driverAvgRate,
+        driverRateCurrency: deductionSourceCurrency,
       };
     });
     const salaryCurrency = normalizeCurrency(salaryDoc?.currency, targetCurrency);
