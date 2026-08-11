@@ -3,7 +3,7 @@ const Truck = require('../db/Truck');
 const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
-const { logActivity } = require('../utils/activityLogger');
+const { logActivity, logChange } = require('../utils/activityLogger');
 const { normalizeCurrency } = require('../utils/fx');
 const { createOrderFxConverter, resolveDisplayCurrency } = require('../utils/orderMoney');
 
@@ -172,12 +172,17 @@ exports.addExpense = catchAsync(async (req, res, next) => {
       createdBy: req.user?._id
     });
 
-    logActivity(req, {
-      action: 'CREATE',
+    logChange(req, {
+      model: 'TruckExpense',
       module: 'fleet',
-      description: `Added ${type} expense $${amount} for truck ${truck.unitNumber || truck.plateNumber}`,
+      action: 'CREATE',
+      after: expense.toObject(),
+      // Currency belongs in the sentence: TruckExpense.currency is a per-row snapshot and a bare
+      // "$" on a CAD row reads as USD in the trail.
+      description: `Added ${type} expense ${expense.currency} ${amount} for truck ${truck.unitNumber || truck.plateNumber}`,
       resourceId: expense._id,
-      resourceName: truck.unitNumber || truck.plateNumber
+      resourceName: truck.unitNumber || truck.plateNumber,
+      details: { truck: String(truckId) },
     });
 
     res.status(201).json({ status: true, message: 'Expense added', expense });
@@ -205,6 +210,10 @@ exports.updateExpense = catchAsync(async (req, res, next) => {
     if (description != null) update.description = description;
     if (date) update.date = new Date(date);
 
+    const beforeExpense = await TruckExpense.findOne(
+      { _id: expenseId, truck: truckId, tenantId, deletedAt: null }
+    ).lean();
+
     const expense = await TruckExpense.findOneAndUpdate(
       { _id: expenseId, truck: truckId, tenantId, deletedAt: null },
       update,
@@ -212,6 +221,18 @@ exports.updateExpense = catchAsync(async (req, res, next) => {
     );
 
     if (!expense) return res.status(404).json({ status: false, message: 'Expense not found' });
+
+    // Expenses subtract from truck profit; editing one moves a reported figure.
+    logChange(req, {
+      model: 'TruckExpense',
+      module: 'fleet',
+      before: beforeExpense,
+      after: expense.toObject(),
+      resourceId: expense._id,
+      description: `Updated ${expense.type} expense on truck`,
+      details: { truck: String(truckId) },
+    });
+
     res.json({ status: true, message: 'Expense updated', expense });
   } catch (err) {
     JSONerror(res, err, next);
@@ -235,6 +256,19 @@ exports.deleteExpense = catchAsync(async (req, res, next) => {
     );
 
     if (!expense) return res.status(404).json({ status: false, message: 'Expense not found' });
+
+    // Removing an expense raises reported truck profit — keep the row's own numbers.
+    logChange(req, {
+      model: 'TruckExpense',
+      module: 'fleet',
+      action: 'DELETE',
+      before: expense.toObject(),
+      resourceId: expense._id,
+      description: `Deleted ${expense.type} expense ${expense.currency} ${expense.amount} on truck`,
+      details: { truck: String(truckId) },
+      critical: true,
+    });
+
     res.json({ status: true, message: 'Expense deleted' });
   } catch (err) {
     JSONerror(res, err, next);

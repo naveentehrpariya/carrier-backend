@@ -183,6 +183,17 @@ const landingLogin = catchAsync(async (req, res, next) => {
 
     const isPasswordValid = await user.checkPassword(password, user.password);
     if (!isPasswordValid) {
+      // A wrong password against a real account is the one failure worth recording: it is how a
+      // guessing attempt shows up. The account is known here, so the entry can be tenant-scoped.
+      // Nothing from the attempt (including the submitted password) is stored.
+      logActivity(req, {
+        action: 'LOGIN_FAILED',
+        module: 'auth',
+        tenantId: user.tenantId,
+        description: `Failed login for "${user.email}" — wrong password`,
+        resourceId: user._id,
+        resourceName: user.name,
+      });
       return next(new AppError('Invalid email or password', 401));
     }
 

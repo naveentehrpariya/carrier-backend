@@ -7,7 +7,7 @@ const TruckExpense = require('../db/TruckExpense');
 const IgnoredEmptyMove = require('../db/IgnoredEmptyMove');
 const EmptyMoveNote = require('../db/EmptyMoveNote');
 const mongoose = require('mongoose');
-const { logActivity } = require('../utils/activityLogger');
+const { logActivity, logChange } = require('../utils/activityLogger');
 const { MI_PER_KM, KM_PER_MI, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { resolveOrderOwnerFields, syncOwnerFinancialRecords } = require('../utils/ownerSettlement');
 const { createOrderFxConverter, resolveDisplayCurrency, pickOrderAmount } = require('../utils/orderMoney');
@@ -302,13 +302,37 @@ exports.splitOrder = async (req, res) => {
             });
         }
 
-        logActivity(req, {
-            action: 'UPDATE',
+        // A split rewrites every leg at once, so a per-document diff would be unreadable. Record
+        // the resulting allocation instead — miles, rate and settle per leg is exactly what a
+        // payslip is later built from, and what a disputed settlement is checked against.
+        logChange(req, {
+            model: 'Order',
             module: 'order',
-            description: `Split order into ${createdTrips.length} trip(s) (Order ID: ${orderId})`,
+            action: 'UPDATE',
+            before: null,
+            after: {
+                _id: orderId,
+                settle_amount: order.settle_amount,
+                isMixedOwner: order.isMixedOwner,
+                ownerOperators: order.ownerOperators,
+            },
+            description: `Split order #${order.serial_no} into ${createdTrips.length} leg(s)`,
             resourceId: orderId,
             resourceName: `Order #${order.serial_no}`,
-            details: { tripCount: createdTrips.length },
+            details: {
+                tripCount: createdTrips.length,
+                legs: createdTrips.map((t) => ({
+                    trip_no: t.trip_no,
+                    miles: t.miles,
+                    rate_per_mile: t.rate_per_mile,
+                    rate_currency: t.rate_currency,
+                    total_driver_pay: t.total_driver_pay,
+                    settle_amount: t.settle_amount,
+                    truck: t.truck ? String(t.truck) : null,
+                    drivers: (t.drivers || []).map(String),
+                })),
+            },
+            critical: true,
         });
         res.json({
             status: true,
@@ -333,9 +357,55 @@ exports.getOrderTrips = async (req, res) => {
             .populate('truck', 'unitNumber plateNumber')
             .populate('trailer', 'unitNumber plateNumber')
             .populate('carrier', 'name mc_code phone email')
-            .sort({ trip_no: 1 });
+            .sort({ trip_no: 1 })
+            .lean();
 
-        res.json({ status: true, trips });
+        // `total_driver_pay` / `miles` on the row are snapshots taken when the split was saved. What
+        // the driver is actually paid comes from the live engine: real miles derived from the order's
+        // KM, times the driver's CURRENT rate in their own locked currency. Send both so Order View
+        // can print the number that matches the payslip instead of a stale one.
+        const order = await Order.findOne({ _id: orderId, tenantId }).select('totalDistance').lean();
+        const rawTotal = trips.reduce(
+            (a, t) => a + Math.max(Number(t.totalDistance || t.miles || t.total_km || 0), 0), 0);
+        const driverIds = [...new Set(trips.flatMap((t) => {
+            const list = Array.isArray(t.drivers) && t.drivers.length > 0 ? t.drivers : (t.driver ? [t.driver] : []);
+            return list.map((d) => String(d?._id || d));
+        }).filter(Boolean))];
+        const profiles = driverIds.length
+            ? await DriverProfile.find({ tenantId, user: { $in: driverIds } })
+                .select('user rateCurrency ratePerMile ratePerMileSolo ratePerMileTeam').lean()
+            : [];
+        const profileByDriver = new Map(profiles.map((p) => [String(p.user), p]));
+
+        const enriched = trips.map((t) => {
+            const list = Array.isArray(t.drivers) && t.drivers.length > 0 ? t.drivers : (t.driver ? [t.driver] : []);
+            const ids = list.map((d) => String(d?._id || d)).filter(Boolean);
+            const realMiles = deriveTripMiles(t, Number(order?.totalDistance || 0), rawTotal);
+            const count = Math.max(ids.length, 1);
+            const isTeam = ids.length > 1;
+            // A legacy trip carries no rate_currency; it predates the field and was USD.
+            const snapshotCurrency = String(t.rate_currency || 'USD').toUpperCase();
+            let pay = 0;
+            const currencies = new Set();
+            ids.forEach((id) => {
+                const profile = profileByDriver.get(id);
+                const profileCurrency = getDriverRateCurrency(profile);
+                const usable = snapshotCurrency === profileCurrency;
+                const rate = pickDriverRate(profile, isTeam, usable ? t.rate_per_mile : 0);
+                pay += (realMiles / count) * rate;
+                currencies.add(profileCurrency);
+            });
+            return {
+                ...t,
+                real_miles: realMiles,
+                driver_pay_current: Number(pay.toFixed(2)),
+                // Save is blocked on a trip whose drivers don't share a pay currency, so one code
+                // describes the whole row.
+                driver_pay_currency: [...currencies][0] || snapshotCurrency,
+            };
+        });
+
+        res.json({ status: true, trips: enriched });
     } catch (error) {
         res.status(500).json({ status: false, message: 'Server error fetching trips' });
     }
@@ -347,6 +417,10 @@ exports.updateTrip = async (req, res) => {
         const tenantId = req.user.tenantId;
         const updateData = req.body;
 
+        // A leg carries miles, rate and settle amount — the three inputs to driver pay and owner
+        // settlement. Read it as it stood so the trail can show what moved.
+        const beforeTrip = await Trip.findOne({ _id: tripId, tenantId }).lean();
+
         const trip = await Trip.findOneAndUpdate(
             { _id: tripId, tenantId },
             { ...updateData, updatedAt: Date.now() },
@@ -357,12 +431,15 @@ exports.updateTrip = async (req, res) => {
             return res.status(404).json({ status: false, message: 'Trip not found' });
         }
 
-        logActivity(req, {
-            action: 'UPDATE',
+        logChange(req, {
+            model: 'Trip',
             module: 'order',
-            description: `Updated trip #${trip.trip_no} (Trip ID: ${tripId})`,
+            before: beforeTrip,
+            after: trip.toObject(),
+            description: `Updated leg #${trip.trip_no} (Trip ID: ${tripId})`,
             resourceId: tripId,
             resourceName: `Trip #${trip.trip_no}`,
+            details: { order: trip.order ? String(trip.order) : null },
         });
         res.json({ status: true, message: 'Trip updated successfully', trip });
     } catch (error) {

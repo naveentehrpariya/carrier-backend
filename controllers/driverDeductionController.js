@@ -3,7 +3,7 @@ const DriverProfile = require('../db/DriverProfile');
 const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
-const { logActivity } = require('../utils/activityLogger');
+const { logActivity, logChange } = require('../utils/activityLogger');
 const { getDriverRateCurrency } = require('../utils/distance');
 
 function normalizeCompanyId(req) {
@@ -136,11 +136,17 @@ exports.addDeduction = catchAsync(async (req, res, next) => {
       createdBy: req.user?._id
     });
 
-    logActivity(req, {
-      action: 'CREATE',
+    logChange(req, {
+      model: 'DriverDeduction',
       module: 'drivers',
-      description: `Added ${direction === 'add' ? 'addition' : 'deduction'} (${type}) $${finalAmount} for driver`,
-      resourceId: deduction._id
+      action: 'CREATE',
+      after: deduction.toObject(),
+      resourceId: deduction._id,
+      resourceName: `${type} ${rowCurrency} ${finalAmount}`,
+      // The currency belongs in the sentence — a bare "$" on a CAD row is how a payslip dispute
+      // starts. Row currency is the driver's locked rateCurrency.
+      description: `Added ${direction === 'add' ? 'addition' : 'deduction'} (${type}) ${rowCurrency} ${finalAmount} for driver`,
+      details: { driver: String(driverId) },
     });
 
     res.status(201).json({ status: true, message: 'Entry saved', deduction });
@@ -171,6 +177,10 @@ exports.updateDeduction = catchAsync(async (req, res, next) => {
       update.amount = Number(amount);
     }
 
+    const beforeDeduction = await DriverDeduction.findOne(
+      { _id: deductionId, driver: driverId, tenantId, deletedAt: null }
+    ).lean();
+
     const deduction = await DriverDeduction.findOneAndUpdate(
       { _id: deductionId, driver: driverId, tenantId, deletedAt: null },
       update,
@@ -178,6 +188,19 @@ exports.updateDeduction = catchAsync(async (req, res, next) => {
     );
 
     if (!deduction) return res.status(404).json({ status: false, message: 'Entry not found' });
+
+    // Editing a deduction changes a payslip that may already have been issued.
+    logChange(req, {
+      model: 'DriverDeduction',
+      module: 'drivers',
+      before: beforeDeduction,
+      after: deduction.toObject(),
+      resourceId: deduction._id,
+      resourceName: `${deduction.type} ${deduction.currency} ${deduction.amount}`,
+      description: `Updated driver ${deduction.direction === 'add' ? 'addition' : 'deduction'} (${deduction.type})`,
+      details: { driver: String(driverId) },
+    });
+
     res.json({ status: true, message: 'Entry updated', deduction });
   } catch (err) {
     JSONerror(res, err, next);
@@ -197,6 +220,20 @@ exports.deleteDeduction = catchAsync(async (req, res, next) => {
     );
 
     if (!deduction) return res.status(404).json({ status: false, message: 'Entry not found' });
+
+    // A removed deduction raises the driver's pay. Keep the row's own numbers.
+    logChange(req, {
+      model: 'DriverDeduction',
+      module: 'drivers',
+      action: 'DELETE',
+      before: deduction.toObject(),
+      resourceId: deduction._id,
+      resourceName: `${deduction.type} ${deduction.currency} ${deduction.amount}`,
+      description: `Deleted driver ${deduction.direction === 'add' ? 'addition' : 'deduction'} (${deduction.type}) ${deduction.currency} ${deduction.amount}`,
+      details: { driver: String(driverId) },
+      critical: true,
+    });
+
     res.json({ status: true, message: 'Entry deleted' });
   } catch (err) {
     JSONerror(res, err, next);

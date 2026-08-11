@@ -4,7 +4,7 @@ const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
 const bcrypt = require('bcrypt');
-const { logActivity } = require('../utils/activityLogger');
+const { logActivity, logChange } = require('../utils/activityLogger');
 const { normalizeCurrency } = require('../utils/fx');
 
 const createCorporateId = async () => {
@@ -165,6 +165,10 @@ exports.editDriver = catchAsync(async (req, res, next) => {
       return res.status(404).json({ status: false, message: 'Driver not found' });
     }
 
+    // Rate values feed every trip's pay, every owner settlement and every truck gross. A silent
+    // edit here changes what future work is worth with nothing else recording the old number.
+    const beforeProfile = await DriverProfile.findOne({ user: id, tenantId }).lean();
+
     if (trimmedEmail && trimmedEmail !== existedUser.email) {
       const emailExists = await User.findOne({ email: trimmedEmail }, null, { includeInactive: true });
       if (emailExists) {
@@ -214,12 +218,15 @@ exports.editDriver = catchAsync(async (req, res, next) => {
       { new: true, upsert: true }
     );
 
-    logActivity(req, {
-      action: 'UPDATE',
+    logChange(req, {
+      model: 'DriverProfile',
       module: 'employee',
-      description: `Updated driver "${user.name}"`,
+      before: beforeProfile,
+      after: profile.toObject ? profile.toObject() : profile,
       resourceId: user._id,
       resourceName: user.name,
+      description: `Updated driver "${user.name}"`,
+      details: { userId: String(user._id) },
     });
     return res.json({
       status: true,

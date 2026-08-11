@@ -32,6 +32,9 @@ const {
   getActivityLogs,
   getActivitySummary,
   getLogUsers,
+  getResourceHistory,
+  verifyActivityChain,
+  exportActivityLogs,
 } = require('../controllers/activityLogController');
 
 const { validateToken, emulateEmployee, stopEmployeeEmulation } = require('../controllers/multiTenantAuthController');
@@ -71,10 +74,15 @@ router.get('/integrations', getIntegrations);
 router.post('/integrations', configureIntegration);
 router.delete('/integrations/:id', removeIntegration);
 
-// Activity Logs Routes
+// Activity Logs / Audit Trail Routes
+// Static segments are declared before '/activity-logs' itself only for readability —
+// Express matches on the full path, so order is not load-bearing here.
 router.get('/activity-logs', getActivityLogs);
 router.get('/activity-logs/summary', getActivitySummary);
 router.get('/activity-logs/users', getLogUsers);
+router.get('/activity-logs/verify', verifyActivityChain);
+router.get('/activity-logs/export', exportActivityLogs);
+router.get('/activity-logs/resource/:module/:id', getResourceHistory);
 
 // Reports Routes
 router.get('/reports/orders', getOrdersReport);

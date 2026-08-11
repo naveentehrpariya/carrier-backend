@@ -14,7 +14,7 @@ const DriverSalary = require("../db/DriverSalary");
 const ConversionRate = require("../db/ConversionRate");
 const { syncOwnerFinancialRecords, resolveOrderOwnerFields } = require("../utils/ownerSettlement");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
-const { logActivity } = require("../utils/activityLogger");
+const { logActivity, logChange } = require("../utils/activityLogger");
 const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn } = require("../utils/orderMoney");
 const { kmToMiles } = require("../utils/distance");
 
@@ -747,9 +747,13 @@ exports.create_order = catchAsync(async (req, res, next) => {
       } catch (tripErr) {
          console.error('Default trip creation failed:', tripErr);
       }
-      logActivity(req, {
-         action: 'CREATE',
+      // Snapshot the order as booked. Every later diff on this order is read against this row,
+      // so "what was it originally" never depends on anyone's memory.
+      logChange(req, {
+         model: 'Order',
          module: 'order',
+         action: 'CREATE',
+         after: order.toObject(),
          description: `Created order #${order.serial_no}`,
          resourceId: order._id,
          resourceName: `Order #${order.serial_no}`,
@@ -812,9 +816,12 @@ exports.update_order = catchAsync(async (req, res, next) => {
       // every one of them — CA$1,000 becomes US$1,000 with no conversion and no trace. The edit
       // form always echoes the saved currency back, so a change here is either a mistake or a
       // deliberate act that needs its own flow. Drop it and keep the order's own currency.
+      // The audit trail needs the order exactly as it stood before this write — without it a log
+      // can only say "the order was updated", which answers nothing when a report and a payslip
+      // disagree. Read once here and reuse it for the currency guard below.
+      const existing = await Order.findOne({ _id: req.params.id, tenantId }).lean();
+
       if ('revenue_currency' in updateData) {
-         const existing = await Order.findOne({ _id: req.params.id, tenantId })
-            .select('input_currency revenue_currency input_total_amount').lean();
          const current = String(existing?.input_currency || existing?.revenue_currency || '').toLowerCase();
          const incoming = String(updateData.revenue_currency || '').toLowerCase();
          const hasTypedAmounts = Number(existing?.input_total_amount || 0) > 0;
@@ -988,12 +995,16 @@ exports.update_order = catchAsync(async (req, res, next) => {
             type: { $in: ['SETTLEMENT', 'OWNER_PROFIT', 'DRIVER_DEDUCTION'] }
          });
       }
-      logActivity(req, {
-         action: 'UPDATE',
+      // Field-level trail: which numbers moved, from what to what. `logChange` writes nothing
+      // when no audited field actually changed, so a no-op save does not bury the real edits.
+      logChange(req, {
+         model: 'Order',
          module: 'order',
-         description: `Updated order #${order.serial_no}`,
+         before: existing,
+         after: order.toObject(),
          resourceId: order._id,
          resourceName: `Order #${order.serial_no}`,
+         description: `Updated order #${order.serial_no}`,
       });
       res.status(200).json({
          status: true,
@@ -1212,13 +1223,18 @@ exports.convert_order_type = catchAsync(async (req, res) => {
    // Settlement ledger rows belong to the type we just left.
    await OwnerOperatorFinancialRecord.deleteMany({ tenantId, order: order._id });
 
-   logActivity(req, {
-      action: 'UPDATE',
+   // Conversion clears one side's money and fills the other's — exactly the change a reader of the
+   // trail needs the before/after for.
+   logChange(req, {
+      model: 'Order',
       module: 'order',
-      description: `Converted order #${order.serial_no} from ${order.order_type} to ${target}`,
+      before: typeof order.toObject === 'function' ? order.toObject() : order,
+      after: saved && typeof saved.toObject === 'function' ? saved.toObject() : saved,
       resourceId: order._id,
       resourceName: `#${order.serial_no}`,
+      description: `Converted order #${order.serial_no} from ${order.order_type} to ${target}`,
       details: { from: order.order_type, to: target },
+      critical: true,
    });
 
    res.json({ status: true, order: saved, message: `Order is now ${target}.` });
@@ -1699,6 +1715,18 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       });
 
       const safeFilename = filename ? filename.replace(/[^a-z0-9-_.]+/gi, '_') : 'document.pdf';
+
+      // Who took a copy of a customer-facing money document out of the system. Rate confirmations
+      // and invoices leave the building; the trail should say who sent one and from where.
+      logActivity(req, {
+         action: 'DOWNLOAD',
+         module: 'order',
+         description: `Downloaded ${docType || 'document'} "${safeFilename}"`,
+         resourceId: req.body?.orderId || null,
+         resourceName: safeFilename,
+         details: { docType: docType || 'document', filename: safeFilename },
+      });
+
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
       return res.status(200).send(Buffer.from(pdfBuffer));
@@ -1804,6 +1832,9 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
       applyOrderOwnershipScope(req, criteria);
+      // Payment state before the write — "who marked this paid, and when" is the single most
+      // asked question when a receivables report and the bank do not agree.
+      const beforePayment = await Order.findOne(criteria).lean();
       if(req.params.type === 'customer'){
             const update = {
                customer_payment_status : status,
@@ -1843,13 +1874,19 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
           message: "failed to update order information.",
         });
       }
-      logActivity(req, {
-         action: 'PAYMENT',
+      logChange(req, {
+         model: 'Order',
          module: 'order',
+         action: 'PAYMENT',
+         before: beforePayment,
+         after: order.toObject(),
+         // A payment entry is worth keeping even when the status is re-set to the same value —
+         // it records that someone touched the money, which is the point of the trail.
+         logUnchanged: true,
          description: `Updated ${req.params.type} payment status to "${status}" on order #${order.serial_no}`,
          resourceId: order._id,
          resourceName: `Order #${order.serial_no}`,
-         details: { paymentType: req.params.type, status, method },
+         details: { paymentType: req.params.type, status, method, notes: notes || '' },
       });
       res.send({
          status: true,
@@ -2317,6 +2354,10 @@ exports.deleteOrder = catchAsync(async (req, res) => {
          message: "Order not found."
        });
    }
+   // Snapshot before the delete — a removed order's own numbers are the first thing anyone asks
+   // for when a monthly total drops and nobody remembers why.
+   const beforeDelete = order.toObject();
+
    const deletedAt = Date.now();
    order.deletedAt = deletedAt;
    await order.save();
@@ -2330,13 +2371,16 @@ exports.deleteOrder = catchAsync(async (req, res) => {
       Files.updateMany({ order: order._id, deletedAt: null }, { deletedAt }),
    ]);
 
-   logActivity(req, {
-      action: 'DELETE',
+   logChange(req, {
+      model: 'Order',
       module: 'order',
+      action: 'DELETE',
+      before: beforeDelete,
       details: { legsRemoved: legs.modifiedCount, filesRemoved: files.modifiedCount },
       description: `Deleted order #${order.serial_no}`,
       resourceId: order._id,
       resourceName: `Order #${order.serial_no}`,
+      critical: Number(beforeDelete.total_amount || 0) > 0,
    });
    res.json({
       status: true,

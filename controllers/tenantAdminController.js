@@ -12,7 +12,7 @@ const SubscriptionPlan = require('../db/SubscriptionPlan');
 const SubscriptionHistory = require('../db/SubscriptionHistory');
 const bcrypt = require('bcrypt');
 const { getTenantUsageSummary } = require('../middlewares/planLimitsMiddleware');
-const { logActivity } = require('../utils/activityLogger');
+const { logActivity, logChange } = require('../utils/activityLogger');
 const { computeCyclePrice, priceMatrix, computeEndDate, effectiveStatus, isSubscriptionActive, currentOrderPeriod } = require('../utils/subscription');
 const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn, orderBaseCurrency, EXACT_AMOUNT_FIELDS } = require('../utils/orderMoney');
 
@@ -786,6 +786,10 @@ const updateUserModules = catchAsync(async (req, res, next) => {
   const orderModules = ['outsourcing', 'regular'].filter(m => filtered.includes(m));
   const isCustomized = orderModules.length > 0;
 
+  // Access changes decide who can see which customers, download which invoices and edit which
+  // money. Granting and then revoking a permission leaves no other trace once it is revoked.
+  const beforeUser = await User.findOne(criteria).select('permissions allowedModules role is_admin').lean();
+
   const user = await User.findOneAndUpdate(
     criteria,
     {
@@ -800,13 +804,15 @@ const updateUserModules = catchAsync(async (req, res, next) => {
     return next(new AppError('User not found', 404));
   }
 
-  logActivity(req, {
-    action: 'UPDATE',
+  logChange(req, {
+    model: 'Users',
     module: 'employee',
-    description: `Updated permissions for user "${user.name}"`,
+    before: beforeUser,
+    after: user.toObject(),
     resourceId: user._id,
     resourceName: user.name,
-    details: { permissions: filtered },
+    description: `Updated permissions for user "${user.name}"`,
+    critical: true,
   });
 
   res.json({
@@ -941,7 +947,10 @@ const updateUserRole = catchAsync(async (req, res, next) => {
   }
 
   const { role, position } = req.body;
-  
+
+  const beforeUser = await User.findOne({ _id: req.params.id, tenantId: req.tenantId })
+    .select('permissions allowedModules role is_admin isTenantAdmin').lean();
+
   const user = await User.findOneAndUpdate(
     { _id: req.params.id, tenantId: req.tenantId },
     { role: parseInt(role), position },
@@ -952,13 +961,16 @@ const updateUserRole = catchAsync(async (req, res, next) => {
     return next(new AppError('User not found', 404));
   }
 
-  logActivity(req, {
-    action: 'UPDATE',
+  logChange(req, {
+    model: 'Users',
     module: 'employee',
-    description: `Updated role for user "${user.name}" to role ${role}`,
+    before: beforeUser,
+    after: user.toObject(),
     resourceId: user._id,
     resourceName: user.name,
-    details: { role, position },
+    description: `Updated role for user "${user.name}" to role ${role}`,
+    details: { position },
+    critical: true,
   });
 
   res.json({
@@ -986,6 +998,9 @@ const removeUser = catchAsync(async (req, res, next) => {
     return next(new AppError('User not found', 404));
   }
 
+  // The delete mangles the email, so capture the real one before it is rewritten.
+  const beforeUser = user.toObject();
+
   const deletedAt = new Date();
   // Free the email so it can be re-used for a new user in this company
   if (user.email && !user.email.startsWith('deleted_')) {
@@ -995,12 +1010,15 @@ const removeUser = catchAsync(async (req, res, next) => {
   user.deletedAt = deletedAt;
   await user.save({ validateBeforeSave: false });
 
-  logActivity(req, {
-    action: 'DELETE',
+  logChange(req, {
+    model: 'Users',
     module: 'employee',
-    description: `Removed user "${user.name}" (${user.email})`,
+    action: 'DELETE',
+    before: beforeUser,
     resourceId: user._id,
     resourceName: user.name,
+    description: `Removed user "${beforeUser.name}" (${beforeUser.email})`,
+    critical: true,
   });
 
   res.json({
@@ -1762,6 +1780,15 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
     const pdfBuffer = await page.pdf({ format: 'A3', landscape: true, printBackground: true, margin: { top: '16px', bottom: '16px', left: '16px', right: '16px' } });
+
+    logActivity(req, {
+      action: 'EXPORT',
+      module: 'reports',
+      description: `Exported finance report (${type}, ${period}) as PDF`,
+      resourceName: `Finance_Report_${type}_${period}`,
+      details: { type, period },
+    });
+
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="Finance_Report_${type}_${period}.pdf"`);
     return res.status(200).send(Buffer.from(pdfBuffer));

@@ -15,7 +15,7 @@ const Truck = require('../db/Truck');
 const Trip = require('../db/Trip');
 const DriverProfile = require('../db/DriverProfile');
 const Users = require('../db/Users');
-const { logActivity } = require('../utils/activityLogger');
+const { logActivity, logChange } = require('../utils/activityLogger');
 const { MI_PER_KM, kmToMiles, normalizeTripMiles, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { SUPPORTED_CURRENCIES, normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount } = require('../utils/fx');
 const { legKey, buildOrderLegs, ownerOrderMatch } = require('../utils/ownerSettlement');
@@ -61,6 +61,22 @@ async function generateOwnerOperatorId(tenantId) {
 // input_currency, so payslips match the order list/detail screens. The driver deduction
 // has no input snapshot, so it stays in base USD (revenue_currency). Payable is recomputed
 // in the target currency because settle and deduction may convert from different sources.
+// The average per-mile rate to PRINT: the driver's own contracted rate, in the currency they are
+// paid in — not the USD-normalized figure, which is a derived number nobody agreed to. Falls back
+// to the USD weighting for legacy aggregates that carry no native breakdown.
+function resolveDriverAvgRate(ded, fallbackCurrency) {
+  const miles = Number(ded?.miles || 0);
+  const native = ded?.deductionByCurrency instanceof Map ? ded.deductionByCurrency : null;
+  if (miles > 0 && native && native.size === 1) {
+    const [cur, amt] = Array.from(native.entries())[0];
+    return { rate: Number(amt) / miles, currency: cur };
+  }
+  return {
+    rate: miles > 0 ? Number((ded?.weightedRateMiles || 0) / miles) : 0,
+    currency: fallbackCurrency,
+  };
+}
+
 function resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap) {
   const priceSourceCurrency = normalizeCurrency(o?.input_currency || o?.revenue_currency, targetCurrency);
   const deductionSourceCurrency = normalizeCurrency(o?.revenue_currency, targetCurrency);
@@ -92,7 +108,17 @@ function resolveOwnerOrderAmounts(o, ded, targetCurrency, fxRatesMap) {
   const orderPriceConversion = convertAmount(originalOrderPrice, priceSourceCurrency, targetCurrency, fxRatesMap);
   const settleAmountConversion = convertAmount(originalSettleAmount, settleSourceCurrency, targetCurrency, fxRatesMap);
   const ownerProfitConversion = convertAmount(originalOwnerProfit, ownerProfitSourceCurrency, targetCurrency, fxRatesMap);
-  const deductionConversion = convertAmount(originalDeduction, deductionSourceCurrency, targetCurrency, fxRatesMap);
+  // Convert the driver pay ONCE, from the currency it is owed in. Falling back to the USD column
+  // would convert twice (native → USD at build time, USD → target here) through FX pairs that are
+  // not exact reciprocals, which is how CA$602.67 of pay reached the statement as CA$601.05.
+  const nativeDeduction = ded?.deductionByCurrency instanceof Map ? ded.deductionByCurrency : null;
+  const deductionConversion = (nativeDeduction && nativeDeduction.size > 0)
+    ? {
+        value: Array.from(nativeDeduction.entries()).reduce(
+          (sum, [cur, amt]) => sum + Number(convertAmount(amt, cur, targetCurrency, fxRatesMap).value || 0), 0),
+        rate: null,
+      }
+    : convertAmount(originalDeduction, deductionSourceCurrency, targetCurrency, fxRatesMap);
   const orderPrice = Number(orderPriceConversion.value || 0);
   const settleAmount = Number(settleAmountConversion.value || 0);
   const ownerProfit = Number(ownerProfitConversion.value || 0);
@@ -215,7 +241,7 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     order: { $in: orderIds },
     deletedAt: null,
   })
-    .select('order miles totalDistance total_km distance_unit rate_per_mile drivers driver truck settle_amount')
+    .select('order miles totalDistance total_km distance_unit rate_per_mile rate_currency drivers driver truck settle_amount')
     .lean();
   const orderRows = await Order.find({
     tenantId,
@@ -288,7 +314,19 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     drivers: new Set(),
     miles: 0,
     weightedRateMiles: 0,
+    // Driver pay in the currency it is actually owed in, keyed by currency code. `deduction` above
+    // is the same money normalized to USD for the settlement math. The stored monthly FX pairs are
+    // NOT exact reciprocals (Aug 2026: USD→CAD 1.402359 × CAD→USD 0.711173 = 0.99732), so a
+    // CAD→USD→CAD round trip loses 0.27% — CA$602.67 of driver pay printed as CA$601.05. Keeping
+    // the native amount lets the display convert ONCE, or not at all when it's already the target.
+    deductionByCurrency: new Map(),
   });
+
+  const addNative = (agg, currency, amount) => {
+    if (!(Number(amount) > 0)) return;
+    const cur = normalizeCurrency(currency, 'USD');
+    agg.deductionByCurrency.set(cur, Number(agg.deductionByCurrency.get(cur) || 0) + Number(amount));
+  };
 
   const byOrder = new Map();
   const byTrip = new Map(); // tripId -> driver-pay aggregate for that single trip
@@ -305,14 +343,28 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     const miles = deriveTripMiles(trip, orderDistanceKm, orderRawTotal);
     let tripDeduction = 0;
     let tripWeightedRateMiles = 0;
+    const tripNative = new Map(); // currency -> driver pay in that currency
     list.forEach((driverId) => {
       const profile = profileMap.get(String(driverId));
-      // trip.rate_per_mile is snapshotted from this driver's profile, so it shares its currency.
-      const rate = rateToUsd(pickDriverRate(profile, isTeam, trip.rate_per_mile), profile, orderId);
+      // trip.rate_per_mile is snapshotted in trip.rate_currency. That is normally this driver's
+      // pay currency — but a driver moved to another currency later (the USD→CAD switch) leaves old
+      // trips stamped USD, and reading that number as CAD would underpay the deduction ~30%. When
+      // the snapshot's currency doesn't match the profile's, fall back to the profile's own rate.
+      // No rate_currency ⇒ legacy row, which predates the field and was always USD.
+      const snapshotCurrency = String(trip.rate_currency || 'USD').toUpperCase();
+      const overrideUsable = snapshotCurrency === getDriverRateCurrency(profile);
+      const nativeRate = pickDriverRate(profile, isTeam, overrideUsable ? trip.rate_per_mile : 0);
+      const nativeCurrency = normalizeCurrency(getDriverRateCurrency(profile), 'USD');
+      const rate = rateToUsd(nativeRate, profile, orderId);
       tripDeduction += (miles / count) * rate;
       tripWeightedRateMiles += (miles / count) * rate;
+      tripNative.set(
+        nativeCurrency,
+        Number(tripNative.get(nativeCurrency) || 0) + (miles / count) * nativeRate
+      );
     });
     const current = byOrder.get(orderId) || emptyAgg();
+    tripNative.forEach((amt, cur) => addNative(current, cur, amt));
     current.deduction += tripDeduction;
     current.miles += miles;
     current.weightedRateMiles += tripWeightedRateMiles;
@@ -322,6 +374,7 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     byOrder.set(orderId, current);
     byTrip.set(String(trip._id), {
       deduction: tripDeduction,
+      deductionByCurrency: tripNative,
       miles,
       weightedRateMiles: tripWeightedRateMiles,
       isTeam,
@@ -351,6 +404,7 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
         const t = byTrip.get(String(tripId));
         if (!t) return;
         agg.deduction += t.deduction;
+        (t.deductionByCurrency || new Map()).forEach((amt, cur) => addNative(agg, cur, amt));
         agg.miles += t.miles;
         agg.weightedRateMiles += t.weightedRateMiles;
         if (t.isTeam) agg.teamSegments += 1;
@@ -692,6 +746,15 @@ exports.saveMonthlyFxRates = catchAsync(async (req, res, next) => {
     }
 
     const target = normalizeCurrency(targetCurrency, req.tenant?.billing?.currency || 'USD');
+
+    // An FX row is the highest-leverage number in the system: it is read retroactively by every
+    // report, payslip and settlement that converts through that month. Changing one rewrites
+    // history everywhere at once, so the old rates are captured before the upsert.
+    const priorRows = await ConversionRate.find({
+      tenantId, month: range.month, year: range.year, targetCurrency: target,
+    }).lean();
+    const priorRates = Object.fromEntries(priorRows.map((r) => [r.sourceCurrency, r.rate]));
+
     const ops = Object.entries(rates).map(async ([sourceCurrency, rawRate]) => {
       const source = normalizeCurrency(sourceCurrency, target);
       if (source === target) return null;
@@ -715,6 +778,22 @@ exports.saveMonthlyFxRates = catchAsync(async (req, res, next) => {
     await Promise.all(ops);
 
     const fxMap = await getFxRatesMap(tenantId, range.month, range.year, target);
+
+    logChange(req, {
+      model: 'ConversionRate',
+      module: 'settings',
+      action: 'UPDATE',
+      before: { rates: priorRates },
+      after: { rates: Object.fromEntries(fxMap.entries()) },
+      fields: ['rates'],
+      resourceId: `fx-${range.year}-${range.month}-${target}`,
+      resourceName: `FX rates ${range.month}/${range.year} → ${target}`,
+      description: `Saved FX rates for ${range.month}/${range.year} (target ${target})`,
+      // Always worth an admin's attention, even when a rate is re-saved unchanged.
+      logUnchanged: true,
+      critical: true,
+    });
+
     return res.json({
       status: true,
       message: 'FX rates saved',
@@ -817,8 +896,10 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
         if ((ded?.soloSegments || 0) > 0 && (ded?.teamSegments || 0) > 0) driverRateType = 'mixed';
         else if ((ded?.teamSegments || 0) > 0) driverRateType = 'team';
         else if ((ded?.soloSegments || 0) > 0) driverRateType = 'solo';
-        const originalDriverAvgRate = Number(ded?.miles || 0) > 0 ? Number((ded?.weightedRateMiles || 0) / (ded?.miles || 1)) : 0;
-        const driverAvgRate = Number(convertAmount(originalDriverAvgRate, deductionSourceCurrency, targetCurrency, fxRatesMap).value || 0);
+        const avg = resolveDriverAvgRate(ded, deductionSourceCurrency);
+        const originalDriverAvgRate = avg.rate;
+        const driverRateCurrencyCode = avg.currency;
+        const driverAvgRate = Number(convertAmount(originalDriverAvgRate, driverRateCurrencyCode, targetCurrency, fxRatesMap).value || 0);
         return {
           order: o._id,
           serial_no: o.serial_no || null,
@@ -845,7 +926,7 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
           // converted, 2-decimal rate makes the row fail its own arithmetic (0.55 × 1095.76 is
           // not 599.29) — the real rate is 0.3900 USD. Show the source, like every other money
           // field on this statement.
-          driverRateCurrency: deductionSourceCurrency,
+          driverRateCurrency: driverRateCurrencyCode,
         };
       });
 
@@ -1576,6 +1657,16 @@ exports.salaryStatementPdf = catchAsync(async (req, res, next) => {
     });
 
     const safeOwner = String(owner?.fullName || 'owner').replace(/[^a-z0-9-_]+/gi, '_');
+
+    logActivity(req, {
+      action: 'DOWNLOAD',
+      module: 'payment',
+      description: `Downloaded owner operator statement for "${owner?.fullName || 'owner'}" (${range.month}/${range.year})`,
+      resourceId: owner?._id || null,
+      resourceName: owner?.fullName || 'owner',
+      details: { month: range.month, year: range.year },
+    });
+
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="OwnerOperator_Statement_${safeOwner}_${range.month}_${range.year}.pdf"`);
     return res.status(200).send(Buffer.from(pdfBuffer));
@@ -1629,6 +1720,7 @@ exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
     const tenantId = getTenantId(req);
     const salary = await OwnerOperatorSalary.findOne({ _id: req.params.id, tenantId });
     if (!salary) return res.status(404).json({ status: false, message: 'Salary record not found' });
+    const beforeSalary = salary.toObject();
     const amount = Number(req.body?.amount || 0);
     const notes = String(req.body?.notes || '').trim();
     if (amount <= 0) return res.status(400).json({ status: false, message: 'Payment amount should be greater than 0' });
@@ -1670,12 +1762,19 @@ exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
       createdBy: req.user?._id,
     });
 
-    logActivity(req, {
-      action: 'PAYMENT',
+    logChange(req, {
+      model: 'OwnerOperatorSalary',
       module: 'payment',
+      action: 'PAYMENT',
+      before: beforeSalary,
+      after: salary.toObject(),
+      logUnchanged: true,
       description: `Updated owner operator salary payment (${salary.month}/${salary.year})`,
       resourceId: salary._id,
-      details: { amount: convertedAmount, inputAmount: amount, inputCurrency, paidAmount: salary.paidAmount, dueAmount: salary.dueAmount },
+      resourceName: `Owner statement ${salary.month}/${salary.year}`,
+      // The typed amount and its currency are recorded next to the converted figure — the same
+      // rule as input_total_amount on an order: never keep only the converted number.
+      details: { amount: convertedAmount, inputAmount: amount, inputCurrency, notes },
     });
 
     return res.json({ status: true, salary, message: 'Salary payment updated' });
@@ -2275,8 +2374,10 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
       if ((ded?.soloSegments || 0) > 0 && (ded?.teamSegments || 0) > 0) driverRateType = 'mixed';
       else if ((ded?.teamSegments || 0) > 0) driverRateType = 'team';
       else if ((ded?.soloSegments || 0) > 0) driverRateType = 'solo';
-      const originalDriverAvgRate = Number(ded?.miles || 0) > 0 ? Number((ded?.weightedRateMiles || 0) / (ded?.miles || 1)) : 0;
-      const driverAvgRate = Number(convertAmount(originalDriverAvgRate, deductionSourceCurrency, targetCurrency, fxRatesMap).value || 0);
+      const avg = resolveDriverAvgRate(ded, deductionSourceCurrency);
+      const originalDriverAvgRate = avg.rate;
+      const driverRateCurrencyCode = avg.currency;
+      const driverAvgRate = Number(convertAmount(originalDriverAvgRate, driverRateCurrencyCode, targetCurrency, fxRatesMap).value || 0);
       const driverNames = Array.from(ded?.drivers || []).map((id) => driverNameMap2.get(String(id)) || '').filter(Boolean);
       return {
         order: o._id,
@@ -2310,7 +2411,7 @@ exports.reportingOwnerBreakdown = catchAsync(async (req, res, next) => {
         driverRateType,
         driverMiles: Number(ded?.miles || 0),
         driverAvgRate,
-        driverRateCurrency: deductionSourceCurrency,
+        driverRateCurrency: driverRateCurrencyCode,
       };
     });
     const salaryCurrency = normalizeCurrency(salaryDoc?.currency, targetCurrency);

@@ -12,7 +12,7 @@ const Users = require('../db/Users');
 const DriverProfile = require('../db/DriverProfile');
 const DriverDeduction = require('../db/DriverDeduction');
 const DriverSalary = require('../db/DriverSalary');
-const { logActivity } = require('../utils/activityLogger');
+const { logActivity, logChange } = require('../utils/activityLogger');
 const { MI_PER_KM, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount, missingFxSources } = require('../utils/fx');
 const { ensureMonthlyFxRates } = require('./ownerOperatorController');
@@ -64,7 +64,7 @@ async function computeDriverTripPay(tenantId, driverId, range) {
     tenantId, deletedAt: null,
     $or: [{ drivers: driverObjId }, { driver: driverObjId }],
   })
-    .select('order drivers driver totalDistance miles total_km distance_unit rate_per_mile')
+    .select('order drivers driver totalDistance miles total_km distance_unit rate_per_mile rate_currency')
     .lean();
 
   // Attribute pay to the ORDER's month (matches owner-operator cost attribution, so the same
@@ -106,7 +106,17 @@ async function computeDriverTripPay(tenantId, driverId, range) {
     const tripMiles = deriveTripMiles(t, orderKmMap.get(oid), orderRawTotal.get(oid));
     const myMiles = tripMiles / count;
     const myKm = myMiles / MI_PER_KM;
-    const rate = pickDriverRate(driverProfile, isTeam, t.rate_per_mile);
+    // `trip.rate_per_mile` is a snapshot taken in `trip.rate_currency`. A driver whose pay currency
+    // was switched later (the USD→CAD move) has old trips still stamped USD, and reading that 0.39
+    // as though it were CAD underpays them ~30%. When the snapshot's currency doesn't match the
+    // currency this payslip is computed in, drop the override and use the profile's current rate —
+    // which is exactly the converted equivalent of what they were promised.
+    // A trip with NO rate_currency is legacy: the field was added later and everything before it
+    // was USD. Defaulting to the driver's CURRENT currency instead would silently re-badge an old
+    // USD 0.39 snapshot as CAD 0.39 — the exact underpayment this guard exists to stop.
+    const tripRateCurrency = String(t.rate_currency || 'USD').toUpperCase();
+    const overrideUsable = tripRateCurrency === rateCurrency;
+    const rate = pickDriverRate(driverProfile, isTeam, overrideUsable ? t.rate_per_mile : 0);
     const myPay = myMiles * rate;
 
     totalTrips += 1; totalMiles += myMiles; totalKm += myKm; totalPay += myPay;
@@ -386,6 +396,10 @@ exports.updateDriverSalary = catchAsync(async (req, res, next) => {
     const salary = await DriverSalary.findOne({ _id: salaryId, tenantId, driver: driverId });
     if (!salary) return res.status(404).json({ status: false, message: 'Salary record not found' });
 
+    // A payslip is a settled figure. Manual adjustments and paid amounts are typed by hand with
+    // no other record, so the before-image is the only way to tell an entry from an edit.
+    const beforeSalary = salary.toObject();
+
     if (req.body?.manualDeduction !== undefined) salary.manualDeduction = Number(req.body.manualDeduction || 0);
     if (req.body?.manualAddition !== undefined) salary.manualAddition = Number(req.body.manualAddition || 0);
     if (req.body?.previousDueAdded !== undefined) salary.previousDueAdded = Number(req.body.previousDueAdded || 0);
@@ -400,6 +414,17 @@ exports.updateDriverSalary = catchAsync(async (req, res, next) => {
     salary.paymentStatus = salary.dueAmount === 0 && salary.finalPayable > 0
       ? 'paid' : (salary.paidAmount > 0 ? 'partial' : 'pending');
     await salary.save();
+
+    logChange(req, {
+      model: 'DriverSalary',
+      module: 'payroll',
+      before: beforeSalary,
+      after: salary.toObject(),
+      resourceId: salary._id,
+      resourceName: `Driver payslip ${salary.month}/${salary.year}`,
+      description: `Updated driver payslip ${salary.month}/${salary.year}`,
+      details: { driver: String(driverId), notes: req.body?.notes || '' },
+    });
 
     return res.json({ status: true, message: 'Salary updated', salary });
   } catch (err) {
@@ -538,6 +563,15 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
     const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true, margin: { top: 0, bottom: 0, left: 0, right: 0 } });
     await browser.close();
     browser = null;
+
+    logActivity(req, {
+      action: 'DOWNLOAD',
+      module: 'payroll',
+      description: `Downloaded driver payslip for "${driver.name}" (${range.month}/${range.year})`,
+      resourceId: driver._id,
+      resourceName: driver.name,
+      details: { month: range.month, year: range.year },
+    });
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="Driver_Statement_${safe(driver.name || 'driver')}_${range.month}_${range.year}.pdf"`);
