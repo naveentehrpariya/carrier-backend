@@ -14,6 +14,21 @@ const { currentOrderPeriod } = require('../utils/subscription');
 const MONTHLY_RESOURCES = new Set(['orders']);
 const RESOURCE_LABEL = { orders: 'order', users: 'user', customers: 'customer', carriers: 'carrier' };
 
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Resolve the plan a tenant is on. The name match is ANCHORED: a loose `{ name: { $regex: plan } }`
+// let the slug 'pro' match the plan named 'Professional', so a tenant could be metered against a
+// plan they never bought — and which of the two `findOne` returned was not deterministic.
+async function resolvePlanRecord(planRef) {
+  if (!planRef) return null;
+  if (typeof planRef === 'string') {
+    return SubscriptionPlan.findOne({
+      $or: [{ slug: planRef }, { name: new RegExp(`^${escapeRegex(planRef)}$`, 'i') }],
+    });
+  }
+  return SubscriptionPlan.findById(planRef);
+}
+
 // Build the count query + model + plan-limit key for a resource type.
 function resolveResource(resourceType, req, period) {
   const base = { tenantId: req.tenantId, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
@@ -53,20 +68,8 @@ const checkPlanLimits = (resourceType, additionalCount = 1) => {
       }
 
       // Get subscription plan limits - try multiple ways to find the plan
-      let plan = null;
-      if (tenant.subscription.plan) {
-        if (typeof tenant.subscription.plan === 'string') {
-          plan = await SubscriptionPlan.findOne({
-            $or: [
-              { slug: tenant.subscription.plan },
-              { name: { $regex: tenant.subscription.plan, $options: 'i' } }
-            ]
-          });
-        } else {
-          plan = await SubscriptionPlan.findById(tenant.subscription.plan);
-        }
-      }
-      
+      const plan = await resolvePlanRecord(tenant.subscription.plan);
+
       // Use plan limits if found, otherwise use subscription.planLimits, then tenant settings as final fallback
       const limits = plan?.limits || tenant.subscription.planLimits || {
         maxUsers: tenant.settings?.maxUsers || 10,
@@ -149,33 +152,26 @@ const getTenantUsageSummary = catchAsync(async (tenantId) => {
     throw new Error('Tenant ID required');
   }
 
-  const [tenant, userCount, orderCount, customerCount, carrierCount] = await Promise.all([
-    Tenant.findOne({ tenantId }),
-    User.countDocuments({ tenantId }),
-    Order.countDocuments({ tenantId }),
-    Customer.countDocuments({ tenantId }),
-    Carrier.countDocuments({ tenantId })
-  ]);
-
+  const tenant = await Tenant.findOne({ tenantId });
   if (!tenant) {
     throw new Error('Tenant not found');
   }
 
-  // Get subscription plan limits - try multiple ways to find the plan (consistent with checkPlanLimits)
-  let plan = null;
-  if (tenant.subscription.plan) {
-    if (typeof tenant.subscription.plan === 'string') {
-      plan = await SubscriptionPlan.findOne({
-        $or: [
-          { slug: tenant.subscription.plan },
-          { name: { $regex: tenant.subscription.plan, $options: 'i' } }
-        ]
-      });
-    } else {
-      plan = await SubscriptionPlan.findById(tenant.subscription.plan);
-    }
-  }
-  
+  // Count exactly what checkPlanLimits enforces, or this summary reports a different number than
+  // the gate: soft-deleted records excluded, and orders counted in the CURRENT MONTHLY window
+  // (maxOrders is per month, not lifetime).
+  const notDeleted = { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
+  const period = currentOrderPeriod(tenant);
+  const [userCount, orderCount, customerCount, carrierCount] = await Promise.all([
+    User.countDocuments({ tenantId, ...notDeleted, status: { $ne: 'inactive' } }),
+    Order.countDocuments({ tenantId, ...notDeleted, createdAt: { $gte: period.start, $lt: period.end } }),
+    Customer.countDocuments({ tenantId, ...notDeleted }),
+    Carrier.countDocuments({ tenantId, ...notDeleted })
+  ]);
+
+  // Get subscription plan limits (same resolution as checkPlanLimits)
+  const plan = await resolvePlanRecord(tenant.subscription.plan);
+
   // Use plan limits if found, otherwise use subscription.planLimits, then tenant settings as final fallback
   const limits = plan?.limits || tenant.subscription.planLimits || {
     maxUsers: tenant.settings?.maxUsers || 10,

@@ -13,6 +13,14 @@ const driverOrderBreakdownSchema = new mongoose.Schema(
     pay: { type: Number, default: 0 },             // converted to currency
     originalPay: { type: Number, default: 0 },     // in the salary's rateCurrency
     fxRate: { type: Number, default: 1 },
+    // Where this driver actually started and finished on this order. A driver is often on one leg
+    // of a split, so these are the LEG's endpoints, not the order's — the payslip has to show the
+    // run the driver was paid for. Snapshotted so a reissued payslip shows the same route even if
+    // the order's stops are edited later.
+    pickupLocation: { type: String, default: '' },
+    deliveryLocation: { type: String, default: '' },
+    pickupDate: { type: Date, default: null },
+    deliveryDate: { type: Date, default: null },
   },
   { _id: false }
 );
@@ -47,12 +55,22 @@ const driverSalarySchema = new mongoose.Schema(
     // Lifecycle (parity with owner)
     basePayable: { type: Number, default: 0 },     // tripPay + cityPay - deductionTotal
     previousDueAdded: { type: Number, default: 0 },
+    // Prior month's `owedAmount` carried in as a deduction. Without it a negative payslip
+    // was silently forgiven at month end.
+    previousOwedDeducted: { type: Number, default: 0 },
+    // DEPRECATED — a second, unexplained adjustment channel that sat beside the itemized
+    // DriverDeduction rows. Kept so old payslips still read, but no endpoint writes them:
+    // every addition/deduction is a DriverDeduction row with a type and a reason.
     manualDeduction: { type: Number, default: 0 },
     manualAddition: { type: Number, default: 0 },
     finalPayable: { type: Number, default: 0 },
     paidAmount: { type: Number, default: 0 },
     dueAmount: { type: Number, default: 0 },
-    paymentStatus: { type: String, enum: ['pending', 'partial', 'paid'], default: 'pending', index: true },
+    // finalPayable < 0: deductions exceeded earnings, so the DRIVER owes the company.
+    owedAmount: { type: Number, default: 0 },
+    // Already paid more than the (since reduced) payable. Reported, never hidden.
+    overpaidAmount: { type: Number, default: 0 },
+    paymentStatus: { type: String, enum: ['pending', 'partial', 'paid', 'owed'], default: 'pending', index: true },
 
     orderBreakdown: [driverOrderBreakdownSchema],
     generatedAt: { type: Date, default: Date.now },

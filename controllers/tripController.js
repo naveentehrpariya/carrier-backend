@@ -9,7 +9,7 @@ const EmptyMoveNote = require('../db/EmptyMoveNote');
 const mongoose = require('mongoose');
 const { logActivity, logChange } = require('../utils/activityLogger');
 const { MI_PER_KM, KM_PER_MI, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
-const { resolveOrderOwnerFields, syncOwnerFinancialRecords } = require('../utils/ownerSettlement');
+const { resolveOrderOwnerFields, syncOwnerFinancialRecords, resolveSettlePot } = require('../utils/ownerSettlement');
 const { createOrderFxConverter, resolveDisplayCurrency, pickOrderAmount } = require('../utils/orderMoney');
 const { resolveRouteDistance } = require('../utils/routeDistance');
 const driverSalaryController = require('./driverSalaryController');
@@ -203,6 +203,24 @@ exports.splitOrder = async (req, res) => {
                 total_km: Number(seg.total_km || 0),
                 settle_amount: normalizeSegmentSettle(seg.settle_amount),
             }));
+            // Typed leg amounts and the order's settle amount are two claims about the same money.
+            // When the legs claim MORE than the pot, allocateTripSettle clamps the remainder to 0,
+            // pays every override in full and the order's settle amount is then rewritten upward —
+            // the company pays out more than anyone approved. TripPlanning blocks this client-side;
+            // the API has to as well, or the guard is one curl away from being skipped.
+            const pot = resolveSettlePot(order, segTrips);
+            const allocated = Number(pot.overrideTotal || 0);
+            if (Number(pot.amount || 0) > 0 && allocated - Number(pot.amount) > 0.01) {
+                return res.status(400).json({
+                    status: false,
+                    code: 'settle_over_allocated',
+                    message: `Leg amounts add up to ${allocated.toFixed(2)} ${pot.currency}, which is more than this order's settle amount of ${Number(pot.amount).toFixed(2)} ${pot.currency}. Lower a leg amount, or raise the order's settle amount first.`,
+                    allocated: Math.round(allocated * 100) / 100,
+                    pot: Math.round(Number(pot.amount) * 100) / 100,
+                    currency: pot.currency,
+                });
+            }
+
             ownerFields = resolveOrderOwnerFields({ order, trips: segTrips, truckMap });
             // settlePot is the base-currency payout: it covers legacy orders too, which carry the
             // amount in settle_amount and leave input_settle_amount at 0.
@@ -742,6 +760,12 @@ exports.getDriverTripSummary = async (req, res) => {
             pay: b.pay,            // in tp.rateCurrency; frontend converts to display currency
             rateUsed: b.rateUsed,
             rateType: b.rateType,
+            // Where this driver's legs started and ended on the order — the same route the payslip
+            // PDF prints. Not the order's own pickup/delivery: a driver often runs only one leg.
+            pickupLocation: b.pickupLocation || '',
+            deliveryLocation: b.deliveryLocation || '',
+            pickupDate: b.pickupDate || null,
+            deliveryDate: b.deliveryDate || null,
         }));
 
         res.json({
@@ -901,7 +925,11 @@ exports.getTrucksGrossEarnings = async (req, res) => {
                 ? new mongoose.Types.ObjectId(String(companyIdRaw))
                 : null;
         const permissions = req.user?.permissions || [];
-        if (!(req.user?.is_admin === 1 || permissions.includes('orders') || permissions.includes('accounting'))) {
+        // `'orders'` is not a permission this app issues (see the valid list in CLAUDE.md), so that
+        // clause never matched — the gate was admin + accounting only, and a sub-admin who can do
+        // everything else was locked out of the truck earnings report.
+        if (!(req.user?.is_admin === 1 || Number(req.user?.role) === 3
+            || permissions.includes('accounting') || permissions.includes('subadmin'))) {
             return res.status(403).json({ status: false, message: 'Not authorized' });
         }
 
@@ -967,19 +995,28 @@ exports.getTrucksGrossEarnings = async (req, res) => {
                     }
                 },
                 {
+                    // Grouped by MONTH as well as currency. Summing a whole range into one bucket
+                    // and converting it at the latest expense's rate priced January's fuel at
+                    // March's FX — and made this list disagree with the per-truck detail below,
+                    // which has always converted each row at its own date.
                     $group: {
-                        _id: { truck: '$truck', currency: '$currency' },
+                        _id: {
+                            truck: '$truck',
+                            currency: '$currency',
+                            year: { $year: '$date' },
+                            month: { $month: '$date' }
+                        },
                         totalExpenses: { $sum: '$amount' },
-                        lastDate: { $max: '$date' }
+                        anyDate: { $min: '$date' }
                     }
                 }
             ])
             : [];
         const expenseMap = new Map();
-        await fx.prime(expenseAgg.map((e) => e.lastDate));
+        await fx.prime(expenseAgg.map((e) => e.anyDate));
         expenseAgg.forEach((e) => {
             const key = String(e._id?.truck);
-            const converted = fx.convert(Number(e.totalExpenses || 0), e._id?.currency || 'USD', e.lastDate);
+            const converted = fx.convert(Number(e.totalExpenses || 0), e._id?.currency || 'USD', e.anyDate);
             expenseMap.set(key, Number(expenseMap.get(key) || 0) + converted);
         });
 
@@ -1020,7 +1057,11 @@ exports.getTruckGrossEarningsDetail = async (req, res) => {
                 ? new mongoose.Types.ObjectId(String(companyIdRaw))
                 : null;
         const permissions = req.user?.permissions || [];
-        if (!(req.user?.is_admin === 1 || permissions.includes('orders') || permissions.includes('accounting'))) {
+        // `'orders'` is not a permission this app issues (see the valid list in CLAUDE.md), so that
+        // clause never matched — the gate was admin + accounting only, and a sub-admin who can do
+        // everything else was locked out of the truck earnings report.
+        if (!(req.user?.is_admin === 1 || Number(req.user?.role) === 3
+            || permissions.includes('accounting') || permissions.includes('subadmin'))) {
             return res.status(403).json({ status: false, message: 'Not authorized' });
         }
 
@@ -1112,7 +1153,12 @@ exports.getTruckGrossEarningsDetail = async (req, res) => {
             truck: new mongoose.Types.ObjectId(truckId),
             deletedAt: null,
             date: { $gte: start, $lte: end }
-        }).sort({ isFixed: -1, date: -1 }).lean();
+        })
+            // A driver-paid receipt is reimbursed on that driver's payslip — the breakdown has to
+            // name them, not just say "driver".
+            .populate('driver', 'name')
+            .sort({ isFixed: -1, date: -1 })
+            .lean();
 
         await fx.prime(expenseRows.map((e) => e.date));
         const expenseByType = {};
@@ -1179,8 +1225,9 @@ exports.deleteTrip = async (req, res) => {
         // Rebuild segments based on remaining relay points
         const segments = buildSegmentsFromOrder(order);
 
-        // Capture existing trips (except the deleted one) for assignment carry-over
-        const existing = await Trip.find({ order: order._id, tenantId }).lean();
+        // Capture existing trips (except the deleted one) for assignment carry-over. Soft-deleted
+        // legs are excluded — carrying one forward would resurrect a driver/rate that was removed.
+        const existing = await Trip.find({ order: order._id, tenantId, deletedAt: null }).lean();
 
         // Remove all remaining trips to re-number cleanly
         await Trip.deleteMany({ order: order._id, tenantId });
@@ -1207,13 +1254,23 @@ exports.deleteTrip = async (req, res) => {
             const seg = segments[i];
             const match = chooseAssignment(seg);
             const rate =  match?.rate_per_mile || 0;
+            // Carry the WHOLE crew, not just the primary driver. Dropping `drivers[]` turned a team
+            // leg into a solo one on the rebuild: the second driver vanished from their payslip and
+            // the surviving driver silently moved from the team rate to the solo rate.
+            const matchDrivers = Array.isArray(match?.drivers) ? match.drivers.filter(Boolean) : [];
+            const primaryDriver = match?.driver || matchDrivers[0] || null;
+            const driversArr = [...matchDrivers];
+            if (primaryDriver && !driversArr.some((d) => String(d) === String(primaryDriver))) {
+                driversArr.unshift(primaryDriver);
+            }
             const newTrip = new Trip({
                 tenantId,
                 order: order._id,
                 trip_no: i + 1,
                 start_stop_index: seg.start_stop_index,
                 end_stop_index: seg.end_stop_index,
-                driver: match?.driver || null,
+                driver: primaryDriver,
+                drivers: driversArr,
                 truck: match?.truck || null,
                 trailer: match?.trailer || null,
                 carrier: match?.carrier || null,
@@ -1225,12 +1282,57 @@ exports.deleteTrip = async (req, res) => {
                 rate_per_mile: rate,
                 // Carry the matched trip's pay currency with its rate — they are one snapshot.
                 rate_currency: match?.rate_currency || 'USD',
+                // The admin-typed per-leg settlement is money, not a display value: losing it here
+                // re-split the pot across the rebuilt legs and moved what the owner is paid.
+                settle_amount: normalizeSegmentSettle(match?.settle_amount),
                 notes: match?.notes,
                 instructions: match?.instructions,
                 created_by: req.user._id
             });
             await newTrip.save();
             createdTrips.push(newTrip);
+        }
+
+        // Rebuilding the legs changes who runs which miles, so the order's owner columns and the
+        // owner ledger have to be re-derived from the new legs — otherwise a mixed split keeps
+        // settling to the trucks it had before the relay was removed.
+        if (order.order_type === 'regular') {
+            const rebuiltTruckIds = [...new Set(createdTrips.map((t) => t.truck).filter(Boolean).map(String))];
+            const truckMap = new Map();
+            if (rebuiltTruckIds.length > 0) {
+                const trucksInUse = await Truck.find({ _id: { $in: rebuiltTruckIds }, tenantId })
+                    .select('ownerOperated ownerOperator')
+                    .lean();
+                trucksInUse.forEach((t) => truckMap.set(String(t._id), t));
+            }
+            const ownerFields = resolveOrderOwnerFields({ order, trips: createdTrips, truckMap });
+            order.isOwnerOperatedTruck = ownerFields.isOwnerOperatedTruck;
+            order.ownerOperator = ownerFields.ownerOperator;
+            order.ownerOperators = ownerFields.ownerOperators;
+            order.isMixedOwner = ownerFields.isMixedOwner;
+            order.settle_amount = ownerFields.settle_amount;
+            order.input_settle_amount = ownerFields.input_settle_amount;
+            order.owner_profit = ownerFields.owner_profit;
+            order.carrier_amount = ownerFields.carrier_amount;
+            await order.save();
+
+            // Freeze each owner leg's share back onto its trip (same reason as splitOrder).
+            if (ownerFields.tripSettle) {
+                for (const t of createdTrips) {
+                    if (!ownerFields.tripSettle.has(String(t._id))) continue;
+                    t.settle_amount = ownerFields.tripSettle.get(String(t._id));
+                    await t.save();
+                }
+            }
+
+            await syncOwnerFinancialRecords({
+                tenantId,
+                companyId: req.user?.company?._id || req.user?.company || null,
+                userId: req.user?._id,
+                order,
+                trips: createdTrips,
+                truckMap,
+            });
         }
 
         logActivity(req, {

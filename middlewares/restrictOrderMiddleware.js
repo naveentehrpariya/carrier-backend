@@ -2,7 +2,9 @@ const Order = require('../db/Order');
 const catchAsync = require('../utils/catchAsync');
 
 const restrictOrderMiddleware = catchAsync(async (req, res, next) => {
-   const tenantId = req.tenantId || (req.tenant && req.tenant._id);
+   // `Order.tenantId` is the String slug, not the Tenant document's ObjectId — falling back to
+   // `req.tenant._id` matched nothing and every update came back as a bogus "Order not found".
+   const tenantId = req.tenantId || (req.tenant && req.tenant.tenantId) || req.user?.tenantId;
    if (!tenantId) {
       return res.status(400).json({ status: false, message: 'Tenant context is required.' });
    }

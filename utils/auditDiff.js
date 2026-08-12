@@ -63,20 +63,37 @@ const AUDIT_FIELDS = {
     'cityHoursRate', 'rateCurrency',
   ],
   DriverSalary: [
-    'basePayable', 'previousDueAdded', 'manualDeduction', 'manualAddition',
-    'finalPayable', 'paidAmount', 'dueAmount', 'paymentStatus',
+    'basePayable', 'previousDueAdded', 'previousOwedDeducted',
+    'manualDeduction', 'manualAddition',
+    'finalPayable', 'paidAmount', 'dueAmount', 'owedAmount', 'overpaidAmount', 'paymentStatus',
     'soloRate', 'teamRate', 'cityRate', 'rateCurrency', 'currency',
-    'totalMiles', 'totalTripPay', 'deductionTotal',
+    'totalMiles', 'totalTripPay', 'deductionTotal', 'additionTotal',
   ],
-  DriverDeduction: ['amount', 'currency', 'type', 'direction', 'date', 'note'],
+  DriverDeduction: [
+    'amount', 'currency', 'type', 'direction', 'date', 'note', 'description',
+    'reference', 'recurring', 'autoSource', 'truckExpense', 'deletedAt',
+  ],
+  // One recorded payment against a driver payslip.
+  DriverPayment: [
+    'amount', 'currency', 'inputAmount', 'inputCurrency', 'fxRate', 'date', 'notes', 'method',
+  ],
   OwnerOperatorFinancialRecord: [
     'amount', 'settle_amount', 'deduction', 'status', 'currency', 'order',
   ],
   OwnerOperatorSalary: [
     'basePayable', 'finalPayable', 'paidAmount', 'dueAmount',
     'manualDeduction', 'manualAddition', 'paymentStatus', 'currency',
+    'previousDueAdded', 'previousOwedDeducted', 'owedAmount', 'overpaidAmount',
   ],
-  TruckExpense: ['amount', 'currency', 'category', 'date', 'truck', 'description'],
+  // One typed line of an owner's monthly additions/deductions. Every field here either
+  // moves money or explains why it moved.
+  OwnerAdjustment: [
+    'kind', 'category', 'amount', 'currency', 'amountInSalaryCurrency',
+    'salaryCurrency', 'fxRate', 'date', 'notes', 'reference', 'recurring', 'deletedAt',
+  ],
+  // `paid_by`/`driver` decide whether a driver gets reimbursed for this receipt, so they
+  // move money exactly like the amount does.
+  TruckExpense: ['amount', 'currency', 'category', 'type', 'date', 'truck', 'description', 'paid_by', 'driver', 'deletedAt'],
   // An FX row rewrites every historical report that converts through it.
   ConversionRate: ['rate', 'source', 'target', 'month', 'year'],
   Users: [

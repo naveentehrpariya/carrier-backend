@@ -4,8 +4,109 @@ const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const { logActivity, logChange } = require('../utils/activityLogger');
-const { normalizeCurrency } = require('../utils/fx');
+const { normalizeCurrency, convertAmount } = require('../utils/fx');
 const { createOrderFxConverter, resolveDisplayCurrency } = require('../utils/orderMoney');
+const DriverDeduction = require('../db/DriverDeduction');
+const DriverProfile = require('../db/DriverProfile');
+const DriverSalary = require('../db/DriverSalary');
+const Users = require('../db/Users');
+const { getDriverRateCurrency } = require('../utils/distance');
+
+const EXPENSE_LABELS = {
+  fuel: 'Fuel', toll: 'Toll', service: 'Service', insurance: 'Insurance', parking: 'Parking', other: 'Expense',
+};
+
+/**
+ * Keep a driver-paid truck expense in step with the reimbursement line on that driver's payslip.
+ *
+ * `paid_by` used to be stored and displayed and nothing else: a driver who fronted CA$400 for
+ * fuel saw it come off the truck's profit and got nothing back. A `paid_by: 'driver'` expense
+ * now writes one `DriverDeduction` addition, linked by `truckExpense` so it can never be paid
+ * twice, and removed with the expense.
+ *
+ * The expense stays a cost against the truck — it is one. Reimbursing the driver is a separate
+ * leg of the same transaction, not a reason to stop counting it.
+ *
+ * Returns `{ deduction, payslipPaid }`, or null when nothing is owed to a driver.
+ */
+async function syncExpenseReimbursement(req, tenantId, expense, truck) {
+  const linked = await DriverDeduction.findOne({ tenantId, truckExpense: expense._id, deletedAt: null });
+  const wantsReimbursement = expense.paid_by === 'driver' && expense.driver;
+
+  if (!wantsReimbursement) {
+    // Flipped back to owner-paid (or the driver was cleared) — retract the reimbursement.
+    if (linked) {
+      linked.deletedAt = new Date();
+      linked.updatedBy = req.user?._id || null;
+      await linked.save();
+    }
+    return null;
+  }
+
+  // The row must be denominated in the driver's locked pay currency: the payslip converts one
+  // consistent base, and mixing a CAD receipt into a USD-based ledger is how a payslip ends up
+  // treating 1 CAD as 1 USD.
+  const profile = await DriverProfile.findOne({ tenantId, user: expense.driver }).lean();
+  const rowCurrency = getDriverRateCurrency(profile);
+  const expenseCurrency = normalizeCurrency(expense.currency, 'USD');
+  const when = expense.date instanceof Date ? expense.date : new Date(expense.date);
+  let amount = Number(expense.amount || 0);
+  if (expenseCurrency !== rowCurrency) {
+    const { ensureMonthlyFxRates } = require('./ownerOperatorController');
+    const fxMap = await ensureMonthlyFxRates(
+      tenantId, when.getMonth() + 1, when.getFullYear(), rowCurrency, [expenseCurrency], req.user?._id
+    );
+    amount = Number(convertAmount(amount, expenseCurrency, rowCurrency, fxMap).value || 0);
+  }
+  amount = Math.round(amount * 100) / 100;
+
+  const truckLabel = truck?.unitNumber || truck?.plateNumber || 'truck';
+  const description = `${EXPENSE_LABELS[expense.type] || 'Expense'} paid for ${truckLabel}`
+    + (expense.description ? ` — ${expense.description}` : '');
+
+  if (linked) {
+    linked.driver = expense.driver;
+    linked.amount = amount;
+    linked.currency = rowCurrency;
+    linked.date = when;
+    linked.description = description;
+    linked.updatedAt = new Date();
+    linked.updatedBy = req.user?._id || null;
+    await linked.save();
+  } else {
+    await DriverDeduction.create({
+      tenantId,
+      company: expense.company || null,
+      driver: expense.driver,
+      type: 'reimbursement',
+      direction: 'add',
+      amount,
+      currency: rowCurrency,
+      description,
+      date: when,
+      autoSource: 'truck_expense',
+      truckExpense: expense._id,
+      createdBy: req.user?._id,
+      updatedBy: req.user?._id,
+    });
+  }
+
+  // Never block a fleet record because payroll moved first — but say so, because the driver's
+  // statement no longer matches the ledger until it is regenerated.
+  const salary = await DriverSalary.findOne({
+    tenantId, driver: expense.driver, month: when.getMonth() + 1, year: when.getFullYear(),
+  }).select('paidAmount paymentStatus month year').lean();
+  const payslipPaid = !!salary && (Number(salary.paidAmount || 0) > 0 || salary.paymentStatus === 'paid');
+
+  return {
+    amount,
+    currency: rowCurrency,
+    driver: String(expense.driver),
+    payslipPaid,
+    month: when.getMonth() + 1,
+    year: when.getFullYear(),
+  };
+}
 
 function normalizeCompanyId(req) {
   const raw = req.user?.company?._id || req.user?.company;
@@ -105,7 +206,12 @@ exports.getExpenses = catchAsync(async (req, res, next) => {
       truck: truckId,
       deletedAt: null,
       date: { $gte: start, $lte: end }
-    }).sort({ date: -1 }).lean();
+    })
+      // Who fronted the money — a driver-paid receipt is reimbursed on their payslip, so the
+      // list has to name them rather than just say "driver".
+      .populate('driver', 'name email')
+      .sort({ date: -1 })
+      .lean();
 
     // Convert each expense once from the currency it was entered in.
     const displayCurrency = resolveDisplayCurrency(req);
@@ -148,15 +254,28 @@ exports.addExpense = catchAsync(async (req, res, next) => {
     const truck = await Truck.findOne(truckFilter).lean();
     if (!truck) return res.status(404).json({ status: false, message: 'Truck not found' });
 
-    const { type, amount, paid_by, description, date, currency } = req.body;
+    const { type, amount, paid_by, description, date, currency, driver } = req.body;
     if (!type || amount == null || !date) {
       return res.status(400).json({ status: false, message: 'type, amount and date are required' });
     }
     if (Number(amount) < 0) {
       return res.status(400).json({ status: false, message: 'Amount cannot be negative' });
     }
+    const paidBy = paid_by || 'owner';
+    // "Paid by driver" with no driver names nobody to pay back, and the expense would just
+    // sit on the truck exactly like an owner-paid one — which is how it behaved before.
+    if (paidBy === 'driver' && !mongoose.Types.ObjectId.isValid(String(driver || ''))) {
+      return res.status(400).json({
+        status: false,
+        code: 'driver_required',
+        message: 'Choose which driver paid for this, so it can be reimbursed on their payslip.',
+      });
+    }
 
     const expenseDate = new Date(date);
+    if (Number.isNaN(expenseDate.getTime())) {
+      return res.status(400).json({ status: false, message: 'Enter a valid date' });
+    }
     const expense = await TruckExpense.create({
       tenantId,
       company: truck.company,
@@ -165,12 +284,15 @@ exports.addExpense = catchAsync(async (req, res, next) => {
       amount: Number(amount),
       // Snapshot the currency the amount was typed in — reports convert from it, never guess.
       currency: normalizeCurrency(currency, 'USD'),
-      paid_by: paid_by || 'owner',
+      paid_by: paidBy,
+      driver: paidBy === 'driver' ? driver : null,
       description: description || '',
       date: expenseDate,
       isFixed: false,
       createdBy: req.user?._id
     });
+
+    const reimbursement = await syncExpenseReimbursement(req, tenantId, expense, truck);
 
     logChange(req, {
       model: 'TruckExpense',
@@ -185,7 +307,14 @@ exports.addExpense = catchAsync(async (req, res, next) => {
       details: { truck: String(truckId) },
     });
 
-    res.status(201).json({ status: true, message: 'Expense added', expense });
+    res.status(201).json({
+      status: true,
+      message: reimbursement
+        ? 'Expense added and queued for reimbursement on the driver’s payslip'
+        : 'Expense added',
+      expense,
+      reimbursement,
+    });
   } catch (err) {
     JSONerror(res, err, next);
   }
@@ -201,18 +330,43 @@ exports.updateExpense = catchAsync(async (req, res, next) => {
       return res.status(400).json({ status: false, message: 'Invalid id' });
     }
 
-    const { type, amount, paid_by, description, date, currency } = req.body;
+    const { type, amount, paid_by, description, date, currency, driver } = req.body;
     const update = {};
     if (type) update.type = type;
-    if (amount != null) update.amount = Number(amount);
+    if (amount != null) {
+      if (!Number.isFinite(Number(amount)) || Number(amount) < 0) {
+        return res.status(400).json({ status: false, message: 'Amount cannot be negative' });
+      }
+      update.amount = Number(amount);
+    }
     if (currency) update.currency = normalizeCurrency(currency, 'USD');
     if (paid_by) update.paid_by = paid_by;
     if (description != null) update.description = description;
-    if (date) update.date = new Date(date);
+    if (date) {
+      const d = new Date(date);
+      if (Number.isNaN(d.getTime())) return res.status(400).json({ status: false, message: 'Enter a valid date' });
+      update.date = d;
+    }
 
     const beforeExpense = await TruckExpense.findOne(
       { _id: expenseId, truck: truckId, tenantId, deletedAt: null }
     ).lean();
+    if (!beforeExpense) return res.status(404).json({ status: false, message: 'Expense not found' });
+
+    // Same rule as create: driver-paid needs a driver, or nobody can be paid back. The check
+    // reads the resulting state, not just the payload — switching only `paid_by` on a row that
+    // never had a driver would otherwise slip through.
+    const nextPaidBy = paid_by || beforeExpense.paid_by;
+    const nextDriver = driver !== undefined ? driver : beforeExpense.driver;
+    if (nextPaidBy === 'driver' && !mongoose.Types.ObjectId.isValid(String(nextDriver || ''))) {
+      return res.status(400).json({
+        status: false,
+        code: 'driver_required',
+        message: 'Choose which driver paid for this, so it can be reimbursed on their payslip.',
+      });
+    }
+    if (driver !== undefined) update.driver = nextPaidBy === 'driver' ? driver : null;
+    else if (nextPaidBy !== 'driver') update.driver = null;
 
     const expense = await TruckExpense.findOneAndUpdate(
       { _id: expenseId, truck: truckId, tenantId, deletedAt: null },
@@ -221,6 +375,9 @@ exports.updateExpense = catchAsync(async (req, res, next) => {
     );
 
     if (!expense) return res.status(404).json({ status: false, message: 'Expense not found' });
+
+    const truck = await Truck.findOne({ _id: truckId, tenantId }).select('unitNumber plateNumber').lean();
+    const reimbursement = await syncExpenseReimbursement(req, tenantId, expense, truck);
 
     // Expenses subtract from truck profit; editing one moves a reported figure.
     logChange(req, {
@@ -233,7 +390,7 @@ exports.updateExpense = catchAsync(async (req, res, next) => {
       details: { truck: String(truckId) },
     });
 
-    res.json({ status: true, message: 'Expense updated', expense });
+    res.json({ status: true, message: 'Expense updated', expense, reimbursement });
   } catch (err) {
     JSONerror(res, err, next);
   }
@@ -257,6 +414,13 @@ exports.deleteExpense = catchAsync(async (req, res, next) => {
 
     if (!expense) return res.status(404).json({ status: false, message: 'Expense not found' });
 
+    // The reimbursement exists because the expense does. Retract it with the expense, or the
+    // driver keeps being paid back for a receipt that is no longer on the books.
+    const retracted = await DriverDeduction.updateMany(
+      { tenantId, truckExpense: expense._id, deletedAt: null },
+      { $set: { deletedAt: new Date(), updatedAt: new Date(), updatedBy: req.user?._id || null } }
+    );
+
     // Removing an expense raises reported truck profit — keep the row's own numbers.
     logChange(req, {
       model: 'TruckExpense',
@@ -265,11 +429,16 @@ exports.deleteExpense = catchAsync(async (req, res, next) => {
       before: expense.toObject(),
       resourceId: expense._id,
       description: `Deleted ${expense.type} expense ${expense.currency} ${expense.amount} on truck`,
-      details: { truck: String(truckId) },
+      details: { truck: String(truckId), reimbursementsRetracted: retracted?.modifiedCount || 0 },
       critical: true,
     });
 
-    res.json({ status: true, message: 'Expense deleted' });
+    res.json({
+      status: true,
+      message: retracted?.modifiedCount
+        ? 'Expense deleted and its driver reimbursement retracted'
+        : 'Expense deleted',
+    });
   } catch (err) {
     JSONerror(res, err, next);
   }

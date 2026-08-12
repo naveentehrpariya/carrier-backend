@@ -51,6 +51,31 @@ router
 router
   .route('/owner-operators/salary/adjust/:id')
   .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.updateSalaryAdjustments);
+// Itemized adjustment ledger — the source of truth for a payslip's additions/deductions.
+// Works before a payslip exists, so an advance can be recorded the day it is handed over.
+router
+  .route('/owner-operators/adjustments')
+  .get(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.listSalaryAdjustments)
+  .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.addSalaryAdjustment);
+router
+  .route('/owner-operators/adjustments/categories')
+  .get(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.adjustmentCategories);
+router
+  .route('/owner-operators/adjustments/update/:id')
+  .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.updateSalaryAdjustment);
+router
+  .route('/owner-operators/adjustments/remove/:id')
+  .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.removeSalaryAdjustment);
+
+router
+  .route('/owner-operators/salary/payment/update/:id')
+  .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.updateSalaryPaymentRecord);
+router
+  .route('/owner-operators/salary/payment/remove/:id')
+  .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.removeSalaryPaymentRecord);
+
+// Legacy aliases — kept so an older client can't reintroduce the scalar drift; both now
+// write through the ledger.
 router
   .route('/owner-operators/salary/expense/:id')
   .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.addSalaryExpense);

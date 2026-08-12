@@ -13,6 +13,12 @@ const truckExpenseSchema = new mongoose.Schema({
   // they were always displayed. Reports convert from this once into the display currency.
   currency: { type: String, enum: ['USD', 'CAD', 'INR'], default: 'USD', uppercase: true },
   paid_by: { type: String, enum: PAID_BY, default: 'owner' },
+  // Who fronted the money when `paid_by === 'driver'`. Required in that case: without it the
+  // expense says a driver paid out of pocket but not WHICH driver, so nobody can be paid back.
+  // A driver-paid expense creates a matching reimbursement line on that driver's payslip
+  // (DriverDeduction, direction 'add', autoSource 'truck_expense'); the expense is still a
+  // cost against the truck, because it is.
+  driver: { type: mongoose.Schema.Types.ObjectId, ref: 'users', default: null, index: true },
   description: { type: String, default: '' },
   date: { type: Date, required: true },
   // Month/year used to de-duplicate auto-generated fixed expenses

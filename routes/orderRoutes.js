@@ -67,7 +67,7 @@ router.route('/order/detail/:id').get(validateToken, optionalTenant, resolveAllo
 router.route('/order/generate-pdf').post(validateToken, optionalTenant, orderController.generatePdfFromHtml);
 router.route('/order_docs/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_docs);
 router.route('/lock-order/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.lockOrder);
-router.route('/delete-order/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.deleteOrder);
+router.route('/delete-order/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.deleteOrder);
 router.route('/account/order/listings').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_listing_account);
 router.route('/account/order/update/payment/:id/:type').post(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.updateOrderPaymentStatus);
 

@@ -151,12 +151,19 @@ exports.customers_listing = catchAsync(async (req, res) => {
 
   if (search && search.length >1) {
     const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const isNumber = !isNaN(search);
-    if (isNumber) {
-      queryObj.customerCode = { $regex: new RegExp(safeSearch, 'i') };
-    } else {
-      queryObj.name = { $regex: new RegExp(safeSearch, 'i') };
-    }
+    const searchRegex = new RegExp(safeSearch, 'i');
+    queryObj.$and = queryObj.$and || [];
+    queryObj.$and.push({
+      $or: [
+        { name: searchRegex },
+        { customerCode: searchRegex },
+        { email: searchRegex },
+        { secondary_email: searchRegex },
+        { 'emails.email': searchRegex },
+        { phone: searchRegex },
+        { secondary_phone: searchRegex }
+      ]
+    });
   }
 
   let Query = new APIFeatures(
@@ -304,6 +311,11 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
   if (req.user && !isAdminUpd) {
     updateQuery.assigned_to = req.user._id;
   }
+  // An ABSENT `assigned_to` means "leave the assignment alone", not "unassign everyone". Writing
+  // [] on every partial update silently widened visibility: an unassigned customer is shared with
+  // every `regular` user in the company (see the visibility table in CLAUDE.md). Sending an
+  // explicit empty array still unassigns — that is a deliberate act.
+  const assignedToProvided = typeof assigned_to !== 'undefined' && assigned_to !== null;
   const assignedToArrayUpd = Array.isArray(assigned_to)
     ? assigned_to.filter(Boolean)
     : assigned_to ? [assigned_to] : [];
@@ -319,9 +331,10 @@ exports.updateCustomer = catchAsync(async (req, res, next) => {
     country: trimmedCountry,
     state: trimmedState,
     city: trimmedCity,
-    assigned_to: assignedToArrayUpd,
+    ...(assignedToProvided ? { assigned_to: assignedToArrayUpd } : {}),
     zipcode: trimmedZipcode,
-    created_by:req.user._id,
+    // `created_by` is who created the record — deliberately NOT touched here. Overwriting it with
+    // the editor erased the original creator on every save; who edited is in the activity log.
   }, {
     new: true, 
     runValidators: true,

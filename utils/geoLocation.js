@@ -36,15 +36,26 @@ const PRIVATE_PATTERNS = [
 
 /**
  * Pull the client IP out of a request.
- * Trusts the FIRST entry of x-forwarded-for (the original client) — later
- * entries are our own proxies.
+ *
+ * Order matters, and `req.ip` is deliberately first: Express derives it from the
+ * `trust proxy` setting, so it is the one value that cannot be spoofed by the
+ * client. Reading `x-forwarded-for` directly would let anyone stamp any IP (and
+ * therefore any location) onto their own audit entries just by sending a header.
+ *
+ * REQUIRES `app.set('trust proxy', <n>)` in backend/index.js when the app runs
+ * behind nginx / a load balancer. Without it Express returns the socket peer —
+ * i.e. the proxy — and every audit entry records the proxy's IP and its location
+ * instead of the user's. Set it to the number of proxies in front of the app.
+ *
+ * The header fallbacks below only apply when `trust proxy` is unset; they are
+ * best-effort and are exactly the spoofable path described above.
  */
 function extractIp(req) {
   const forwarded = req?.headers?.['x-forwarded-for'];
   const raw =
+    req?.ip ||
     (typeof forwarded === 'string' ? forwarded.split(',')[0] : null) ||
     req?.headers?.['x-real-ip'] ||
-    req?.ip ||
     req?.connection?.remoteAddress ||
     req?.socket?.remoteAddress ||
     '';

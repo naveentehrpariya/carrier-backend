@@ -120,6 +120,28 @@ const editUser = catchAsync(async (req, res, next) => {
     });
   }
 
+  // Permission ceiling. This route is open to anyone holding `employees` or `subadmin`, and the
+  // payload sets `permissions` verbatim — so without a ceiling a staffer could grant themselves
+  // (or a peer) `subadmin`/`accounting`/`invoices` and walk into the audit trail, every customer
+  // and every invoice PDF. A non-admin may only assign permissions they already hold, and may
+  // never hand out `subadmin`.
+  if (!isFullAdmin && Array.isArray(req.body.permissions)) {
+    const ownPermissions = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
+    const requested = req.body.permissions.map((p) => String(p));
+    const previous = Array.isArray(existedUser.permissions) ? existedUser.permissions.map(String) : [];
+    // Only newly ADDED permissions need to clear the ceiling — leaving an existing one untouched
+    // (or removing it) is not an escalation.
+    const escalated = requested.filter(
+      (p) => !previous.includes(p) && (p === 'subadmin' || !ownPermissions.includes(p))
+    );
+    if (escalated.length > 0) {
+      return res.status(403).json({
+        status: false,
+        message: `You cannot grant permissions you do not hold yourself: ${escalated.join(', ')}.`
+      });
+    }
+  }
+
   if(req.body.email !== existedUser?.email){
     // Check if new email is already in use — GLOBAL check: login email must be
     // unique across all tenants (login resolves tenant from email).
@@ -543,15 +565,13 @@ const profile = catchAsync ( async (req, res) => {
     }
   }
 
-  // Find company for the current tenant context
-  const filter = {};
-  if (req.tenantId) {
-    filter.tenantId = req.tenantId;
-  } else if (req.user.tenantId) {
-    filter.tenantId = req.user.tenantId;
-  }
-  
-  const company = await Company.findOne(filter);
+  // Find company for the current tenant context. Never fall through to an unfiltered findOne():
+  // with no tenant resolved that returns whatever Company happens to sort first — another
+  // tenant's company, handed to this user as their own.
+  const companyTenantId = req.tenantId || req.user.tenantId || null;
+  const company = companyTenantId
+    ? await Company.findOne({ tenantId: companyTenantId })
+    : null;
   
   res.status(200).json({
     status: true,
@@ -560,7 +580,26 @@ const profile = catchAsync ( async (req, res) => {
   });
 });
 
+// The staff directory and personal employee documents are HR data, not general app data. Global
+// search already gates its employees section this way (hasStaffDirectoryAccess in
+// searchController); the direct endpoints did not, so any logged-in tenant user — a driver — could
+// page the whole directory and pull another employee's documents by id.
+const hasStaffDirectoryAccess = (user) => {
+  if (!user) return false;
+  if (Number(user.is_admin) === 1 || Number(user.role) === 3 || user.isTenantAdmin === true) return true;
+  const perms = Array.isArray(user.permissions) ? user.permissions : [];
+  return perms.includes('employees') || perms.includes('subadmin');
+};
+
 const employeesLisiting = catchAsync ( async (req, res) => {
+  if (!hasStaffDirectoryAccess(req.user)) {
+    return res.status(403).json({
+      status: false,
+      message: "You are not authorized to view the staff directory.",
+      lists: [],
+      totalDocuments: 0
+    });
+  }
   // Get tenant ID from request context (prefer req.tenantId from tenant resolver)
   const tenantId = req.tenantId || req.user?.tenantId;
   const validModules = ['outsourcing', 'regular'];
@@ -738,7 +777,14 @@ const employeeDetail = catchAsync ( async (req, res) => {
   // Remove sensitive information
   employee.password = undefined;
   employee.confirmPassword = undefined;
-  
+  employee.passwordResetToken = undefined;
+  employee.passwordResetExpires = undefined;
+  // This page is linked from order cards ("Added By", the driver on a leg), so it stays readable
+  // to ordinary staff — but a colleague's pay rate is not part of that. Compensation is HR-only.
+  if (!hasStaffDirectoryAccess(req.user) && String(req.user?._id || '') !== String(employeeId)) {
+    employee.staff_commision = undefined;
+  }
+
   res.status(200).json({
     status: true,
     employee: employee,
@@ -750,6 +796,11 @@ const employeesDocs = catchAsync ( async (req, res) => {
   const tenantId = req.tenantId || req.user?.tenantId;
   if (!tenantId) {
     return res.status(400).json({ status: false, message: "Tenant context is required.", documents: [] });
+  }
+  // Licences and personal files: HR, or the employee's own. Nobody else.
+  const isOwnDocs = String(req.user?._id || '') === String(employeeId);
+  if (!isOwnDocs && !hasStaffDirectoryAccess(req.user)) {
+    return res.status(403).json({ status: false, message: "You are not authorized to view these documents.", documents: [] });
   }
   const companyId = req.user?.company?._id || req.user?.company || null;
   

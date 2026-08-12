@@ -1380,6 +1380,7 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
  */
 const getFinanceReportPdf = catchAsync(async (req, res, next) => {
   const puppeteer = require('puppeteer');
+const { launchBrowser } = require('../utils/puppeteer');
 
   const { type = 'outsourcing', period = '30d', startDate, endDate } = req.query;
 
@@ -1776,7 +1777,7 @@ const getFinanceReportPdf = catchAsync(async (req, res, next) => {
 
   let browser = null;
   try {
-    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    browser = await launchBrowser();
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
     const pdfBuffer = await page.pdf({ format: 'A3', landscape: true, printBackground: true, margin: { top: '16px', bottom: '16px', left: '16px', right: '16px' } });

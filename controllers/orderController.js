@@ -9,6 +9,8 @@ const Charges = require("../db/Charges");
 const PaymentLogs = require("../db/PaymentLogs");
 const Trip = require("../db/Trip");
 const Truck = require("../db/Truck");
+const Users = require("../db/Users");
+const OwnerOperator = require("../db/OwnerOperator");
 const OwnerOperatorFinancialRecord = require("../db/OwnerOperatorFinancialRecord");
 const DriverSalary = require("../db/DriverSalary");
 const ConversionRate = require("../db/ConversionRate");
@@ -194,7 +196,9 @@ function buildOrderSearchOr(search) {
       { 'shipping_details.locations.address': rx },
       { 'shipping_details.locations.city': rx },
    ];
-   if (!isNaN(value) && value !== '') {
+   // Plain decimal digits only: `isNaN('0x10')` is false, so the old check turned "0x10" into
+   // serial_no 0 and searched for an order that does not exist.
+   if (/^\d+$/.test(value)) {
       or.unshift({ serial_no: parseInt(value, 10) });
    }
    return or;
@@ -1288,6 +1292,17 @@ const ATTENTION_RULES = [
         && String(o.carrier_payment_status || 'pending') === 'pending' },
    { code: 'stale_status', group: 'followup', level: 'info', label: 'Still "added"',
      test: (o) => o._ageDays > 30 && String(o.order_status || 'added') === 'added' },
+
+   // Dangling references. Deleting a truck, an owner operator or a driver leaves their id sitting
+   // on the order; the record vanishes from every list while the money on the order still points
+   // at it, so the owner statement or truck report can no longer be produced. `_deadRefs` is
+   // stamped on the row before testing.
+   { code: 'truck_gone', group: 'data', level: 'error', label: 'Truck was deleted',
+     test: (o) => o._deadRefs?.truck === true },
+   { code: 'owner_gone', group: 'data', level: 'error', label: 'Owner operator was deleted',
+     test: (o) => o._deadRefs?.owner === true },
+   { code: 'driver_gone', group: 'data', level: 'error', label: 'Driver was deleted',
+     test: (o) => o._deadRefs?.driver === true },
 ];
 
 exports.orders_needing_attention = catchAsync(async (req, res) => {
@@ -1314,7 +1329,7 @@ exports.orders_needing_attention = catchAsync(async (req, res) => {
    const orders = await Order.find(criteria)
       .select('serial_no order_type customer carrier createdAt totalDistance total_amount input_total_amount '
          + 'settle_amount input_settle_amount carrier_amount input_currency revenue_currency isOwnerOperatedTruck '
-         + 'driver drivers truck order_status customer_payment_status carrier_payment_status shipping_details created_by')
+         + 'driver drivers truck ownerOperator ownerOperators order_status customer_payment_status carrier_payment_status shipping_details created_by')
       .populate('customer', 'name')
       .populate('created_by', 'name')
       .sort({ createdAt: -1 })
@@ -1331,12 +1346,38 @@ exports.orders_needing_attention = catchAsync(async (req, res) => {
       grouped.forEach((g) => docCounts.set(String(g._id), g.n));
    }
 
+   // Which referenced trucks / owners / drivers are still alive. Three set lookups rather than a
+   // populate per order — the same reason the file counts are one grouped aggregate.
+   const idsOf = (pick) => [...new Set(orders.flatMap(pick).filter(Boolean).map(String))];
+   const truckIds = idsOf((o) => [o.truck]);
+   const ownerIds = idsOf((o) => [o.ownerOperator, ...(o.ownerOperators || [])]);
+   const driverIds = idsOf((o) => [o.driver, ...(o.drivers || [])]);
+   const liveIds = async (Model, list, extra = {}) => {
+      if (list.length === 0) return new Set();
+      const rows = await Model.find({
+         _id: { $in: list }, tenantId, ...extra,
+         $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }],
+      }, null, { includeInactive: true }).select('_id').lean();
+      return new Set(rows.map((r) => String(r._id)));
+   };
+   const [liveTrucks, liveOwners, liveDrivers] = await Promise.all([
+      liveIds(Truck, truckIds),
+      liveIds(OwnerOperator, ownerIds),
+      liveIds(Users, driverIds),
+   ]);
+
    const now = Date.now();
    const counts = {};
    const flagged = [];
    orders.forEach((o) => {
       o._docCount = docCounts.get(String(o._id)) || 0;
       o._ageDays = Math.floor((now - new Date(o.createdAt || now).getTime()) / 86400000);
+      const gone = (id, live) => Boolean(id) && !live.has(String(id));
+      o._deadRefs = {
+         truck: gone(o.truck, liveTrucks),
+         owner: [o.ownerOperator, ...(o.ownerOperators || [])].some((id) => gone(id, liveOwners)),
+         driver: [o.driver, ...(o.drivers || [])].some((id) => gone(id, liveDrivers)),
+      };
       const issues = ATTENTION_RULES.filter((r) => {
          try { return r.test(o); } catch { return false; }
       }).map(({ code, group, level, label }) => ({ code, group, level, label }));
@@ -1562,7 +1603,8 @@ exports.order_listing = catchAsync(async (req, res, next) => {
 });
 
 exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
-   const puppeteer = require('puppeteer');
+   // Chrome is resolved only through the shared helper — never puppeteer.launch() directly.
+   const { launchBrowser } = require('../utils/puppeteer');
    const fs = require('fs');
    const path = require('path');
    const axios = require('axios');
@@ -1695,12 +1737,38 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       </html>
       `;
 
-      browser = await puppeteer.launch({
-         headless: true,
-         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
+      browser = await launchBrowser({
+         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+                '--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
       });
       const page = await browser.newPage();
-      
+
+      // The HTML comes from the client, and this browser runs INSIDE our network with
+      // --no-sandbox --disable-web-security. Without this filter an `<img src="file:///etc/passwd">`
+      // or a fetch to the cloud metadata endpoint (169.254.169.254) is a read primitive posted
+      // straight into a PDF the caller downloads. Only http(s) to public hosts is allowed out.
+      await page.setRequestInterception(true);
+      page.on('request', (request) => {
+         const url = request.url();
+         if (url.startsWith('data:') || url === 'about:blank') return request.continue();
+         let parsed;
+         try {
+            parsed = new URL(url);
+         } catch (e) {
+            return request.abort();
+         }
+         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return request.abort();
+         const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+         const isPrivate =
+            host === 'localhost' || host.endsWith('.localhost') || host === '::1' ||
+            /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+            /^169\.254\./.test(host) || /^0\./.test(host) ||
+            /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+            /^(fc|fd)[0-9a-f]{2}:/.test(host) || /^fe80:/.test(host);
+         if (isPrivate) return request.abort();
+         return request.continue();
+      });
+
       // 1× scale keeps file size small; quality is still crisp at A4 print resolution
       await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 1 });
       await page.setContent(fullHtml, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
@@ -1744,10 +1812,15 @@ exports.order_listing_account = catchAsync(async (req, res) => {
       const { search } = req.query;
       const tenantId = getTenantId(req);
       const companyId = normalizeCompanyId(req);
+      // Hard-required, never conditional: `if (tenantId) …` runs the whole query with no tenant
+      // filter the moment it is falsy, and returns every tenant's orders on the accounting page.
+      if (!tenantId) {
+         return res.status(400).json({ status: false, message: "Tenant context is required.", orders: [] });
+      }
       const queryObj = {
+         tenantId,
          $or: [{ deletedAt: null }]
       };
-      if (tenantId) queryObj.tenantId = tenantId;
       if (companyId) {
          queryObj.$and = queryObj.$and || [];
          queryObj.$and.push({

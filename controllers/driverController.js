@@ -1,5 +1,6 @@
 const User = require('../db/Users');
 const DriverProfile = require('../db/DriverProfile');
+const Trip = require('../db/Trip');
 const catchAsync = require('../utils/catchAsync');
 const JSONerror = require('../utils/jsonErrorHandler');
 const logger = require('../utils/logger');
@@ -257,7 +258,12 @@ exports.driversLists = catchAsync(async (req, res, next) => {
     if (companyId) {
       filter.company = companyId;
     }
-    const users = await User.find(filter, null, { includeInactive: true })
+    // Users has a pre-find hook that hides `status !== 'active'` unless told otherwise. This list
+    // feeds every driver picker (add order, trip planning, convert, driver salary), so it must be
+    // active drivers only — an inactive driver must not be assignable to new work. The Drivers
+    // management page asks for the full list explicitly so it can still show and reactivate them.
+    const includeInactive = String(req.query.includeInactive || '') === 'true';
+    const users = await User.find(filter, null, { includeInactive })
       .select('name email status tenantId createdAt position phone country address corporateID created_by permissions')
       .sort({ createdAt: -1 })
       .lean();
@@ -294,6 +300,26 @@ exports.removeDriver = catchAsync(async (req, res, next) => {
     if (!user) {
       return res.status(404).json({ status: false, message: 'Driver not found' });
     }
+
+    // Legs keep the driver on them after the driver record is gone, and their pay is still computed
+    // from those legs — so the money stays real while the person disappears from every list. Prod
+    // carries 3 such legs. Deleting stays allowed; it just has to be a decision, not a surprise.
+    if (String(req.query.force || '') !== 'true') {
+      const legCount = await Trip.countDocuments({
+        tenantId,
+        deletedAt: null,
+        $or: [{ driver: user._id }, { drivers: user._id }],
+      });
+      if (legCount > 0) {
+        return res.status(409).json({
+          status: false,
+          code: 'driver_in_use',
+          legs: legCount,
+          message: `${user.name || 'This driver'} is still on ${legCount} leg${legCount === 1 ? '' : 's'}. Removing them leaves that pay attached to a driver who no longer exists.`,
+        });
+      }
+    }
+
     const deletedAt = new Date();
     // Free the email so the same address can be re-used for a new driver.
     // Compound unique index { tenantId, email } would otherwise block re-add.

@@ -36,6 +36,9 @@ const CHAIN_CAS_RETRIES = 40;
  */
 function canonicalize(value) {
   if (value === null || value === undefined) return 'null';
+  if (typeof value === 'object' && typeof value.toHexString === 'function') {
+    return JSON.stringify(value.toHexString());
+  }
   if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
   if (value instanceof Date) return JSON.stringify(value.toISOString());
   if (typeof value === 'object') {

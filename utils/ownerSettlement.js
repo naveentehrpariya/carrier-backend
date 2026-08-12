@@ -55,14 +55,21 @@ function resolveSettlePot(order, trips) {
     0
   );
   const hasInputSettle = inputSettle > 0;
-  const amount = hasInputSettle ? inputSettle : Number(order?.settle_amount || 0);
-  // An override is always typed in the order's input currency. The legacy `settle_amount` column is
-  // in base currency (revenue_currency), so only fall back to it when nothing was typed at trip level.
+  const baseAmount = Number(order?.settle_amount || 0);
+  const fx = Number(order?.fx_to_usd || 0) > 0 ? Number(order.fx_to_usd) : 1;
+  // A typed leg override is ALWAYS in the order's input currency, so the pot has to be expressed in
+  // that same currency — otherwise the two are added together as if they were one unit. A legacy
+  // order predates `input_settle_amount` and keeps its pot in the base column only; converting that
+  // back with the order's own FX snapshot is the only honest way to compare it with the overrides.
+  // Reading the base number as if it were already the input currency (and then re-applying fx_to_usd
+  // on the way out) inflated the owner's settlement by the whole FX rate.
+  const usesInputCurrency = hasInputSettle || overrideTotal > 0;
+  const amount = hasInputSettle ? inputSettle : (usesInputCurrency ? baseAmount / fx : baseAmount);
   const currency = normalizeCurrency(
-    hasInputSettle || overrideTotal > 0 ? (order?.input_currency || order?.revenue_currency) : (order?.revenue_currency || order?.input_currency),
+    usesInputCurrency ? (order?.input_currency || order?.revenue_currency) : (order?.revenue_currency || order?.input_currency),
     'USD'
   );
-  const fxToBase = (hasInputSettle || overrideTotal > 0) ? Number(order?.fx_to_usd || 1) : 1;
+  const fxToBase = usesInputCurrency ? fx : 1;
   return { amount, currency, fxToBase, overrideTotal };
 }
 

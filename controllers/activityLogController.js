@@ -187,11 +187,11 @@ exports.verifyActivityChain = catchAsync(async (req, res) => {
   let verified = 0;
   let legacy = 0;
   let expectedPrevHash = '';
-  let expectedSeq = null;
+  let expectedSeq = 1; // Start at 1 to detect gaps at the very beginning of the chain
 
   for (let entry = await cursor.next(); entry != null; entry = await cursor.next()) {
     totalEntries += 1;
-    if (expectedSeq !== null && entry.seq !== expectedSeq) {
+    if (entry.seq !== expectedSeq) {
       reportProblem({
         type: 'gap',
         expectedSeq,
@@ -230,6 +230,19 @@ exports.verifyActivityChain = catchAsync(async (req, res) => {
     }
 
     expectedPrevHash = entry.hash || '';
+  }
+
+  // Detect gaps at the end of the chain (deleted tail entries or a fully wiped log collection)
+  const targetEndSeq = state ? state.nextSeq : 1;
+  if (expectedSeq < targetEndSeq) {
+    reportProblem({
+      type: 'gap',
+      expectedSeq,
+      foundSeq: targetEndSeq,
+      missing: targetEndSeq - expectedSeq,
+      at: new Date(),
+      message: `${targetEndSeq - expectedSeq} entr${targetEndSeq - expectedSeq === 1 ? 'y is' : 'ies are'} missing at the end of the chain.`,
+    });
   }
 
   const unchained = await ActivityLog.countDocuments({ tenantId, chainStatus: 'unchained' });

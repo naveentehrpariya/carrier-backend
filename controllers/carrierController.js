@@ -133,13 +133,22 @@ exports.carriers_listing = catchAsync(async (req, res) => {
     if (!isAdmin && !hasCarriersAccess && req.user?.company) queryObj.company = req.user.company._id;
 
     if (search && search.length >1) {
-      const safeSearch = search.trim().replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
-      const isNumber = !isNaN(search);
-      if (isNumber) {
-        queryObj.mc_code = { $regex: new RegExp(safeSearch, 'i') };
-      } else {
-        queryObj.name = { $regex: new RegExp(safeSearch, 'i') };
-      }
+      const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const searchRegex = new RegExp(safeSearch, 'i');
+      queryObj.$and = queryObj.$and || [];
+      queryObj.$and.push({
+        $or: [
+          { name: searchRegex },
+          { mc_code: searchRegex },
+          { carrierID: searchRegex },
+          { email: searchRegex },
+          { secondary_email: searchRegex },
+          { 'emails.email': searchRegex },
+          { phone: searchRegex },
+          { secondary_phone: searchRegex },
+          { location: searchRegex }
+        ]
+      });
     }
 
     let Query = new APIFeatures(Carrier.find(queryObj).populate('created_by'), req.query ).sort();
