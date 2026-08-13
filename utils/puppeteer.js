@@ -61,4 +61,38 @@ async function launchBrowser(options = {}) {
   }
 }
 
-module.exports = { launchBrowser, resolveChromePath, CHROME_PATHS };
+// Hosts a rendering page may never reach. The browser runs INSIDE our network with the sandbox
+// off, so any URL the page loads is fetched with our own network position — an `<img
+// src="file:///etc/passwd">` or a hit on the cloud metadata endpoint would come back embedded in a
+// PDF the caller downloads. Only public http(s) is allowed out; `data:` URIs (how logos are
+// embedded) never touch the network.
+function isBlockedHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return (
+    host === 'localhost' || host.endsWith('.localhost') || host === '::1' ||
+    /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
+    /^169\.254\./.test(host) || /^0\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    /^(fc|fd)[0-9a-f]{2}:/.test(host) || /^fe80:/.test(host)
+  );
+}
+
+// Apply to every page that renders HTML we did not fully author ourselves.
+async function hardenPage(page) {
+  await page.setRequestInterception(true);
+  page.on('request', (request) => {
+    const url = request.url();
+    if (url.startsWith('data:') || url === 'about:blank') return request.continue();
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      return request.abort();
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return request.abort();
+    if (isBlockedHost(parsed.hostname)) return request.abort();
+    return request.continue();
+  });
+}
+
+module.exports = { launchBrowser, resolveChromePath, CHROME_PATHS, hardenPage, isBlockedHost };

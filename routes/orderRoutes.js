@@ -65,6 +65,9 @@ router.route('/order/convert-check/:id').get(validateToken, optionalTenant, reso
 router.route('/order/convert-type/:id').post(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.convert_order_type);
 router.route('/order/detail/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_detail);
 router.route('/order/generate-pdf').post(validateToken, optionalTenant, orderController.generatePdfFromHtml);
+// The invoice is rendered server-side from the order id so the `invoices` permission is actually
+// enforceable — see orderController.customerInvoicePdf.
+router.route('/order/customer/invoice/:id/pdf').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.customerInvoicePdf);
 router.route('/order_docs/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_docs);
 router.route('/lock-order/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.lockOrder);
 router.route('/delete-order/:id').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.deleteOrder);

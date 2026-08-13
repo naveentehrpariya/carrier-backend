@@ -14,6 +14,8 @@ const OwnerOperator = require("../db/OwnerOperator");
 const OwnerOperatorFinancialRecord = require("../db/OwnerOperatorFinancialRecord");
 const DriverSalary = require("../db/DriverSalary");
 const ConversionRate = require("../db/ConversionRate");
+const Company = require("../db/Company");
+const { buildCustomerInvoiceHtml, buildInvoiceNo } = require("../utils/invoiceHtml");
 const { syncOwnerFinancialRecords, resolveOrderOwnerFields } = require("../utils/ownerSettlement");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity, logChange } = require("../utils/activityLogger");
@@ -112,7 +114,21 @@ async function resolveMonthlyRate({ tenantId, sourceCurrency, targetCurrency = B
       return Number(liveRate);
    }
 
-   return Number(FX_FALLBACK[`${src}_${dst}`] || 1);
+   // Last resort. These constants are a safety net for "the FX API is down", not a rate anyone
+   // should be paid at — CAD_USD 0.74 here against a real 0.711173 in Aug 2026 is 4% out, and
+   // `fx_to_usd` is snapshotted onto the order forever. Say so loudly so it can be found later.
+   const fallback = Number(FX_FALLBACK[`${src}_${dst}`] || 0);
+   if (fallback > 0) {
+      console.warn(`[fx] no ${src}->${dst} rate for ${month}/${year} (tenant ${tenantId}) — using the hardcoded ${fallback}. This order's amounts will be a few percent out.`);
+      return fallback;
+   }
+
+   // Rate 1 across two different currencies is not a conversion, it is a 30–40% error written to
+   // the database. Refuse the write instead.
+   const err = new Error(`No exchange rate is available for ${src} → ${dst}. Try again shortly, or enter the order in ${dst}.`);
+   err.code = 'fx_unavailable';
+   err.statusCode = 400;
+   throw err;
 }
 
 async function resolveMonthlyRateToBase({ tenantId, sourceCurrency, referenceDate = new Date() }) {
@@ -433,10 +449,17 @@ async function resyncTripStopIndexes(tenantId, order) {
    }
 
    let cursor = 0;
-   for (const leg of legs) {
+   let kept = 0;
+   for (let i = 0; i < legs.length; i += 1) {
+      const leg = legs[i];
       const start = Math.min(Math.max(Number(leg.start_stop_index || 0), cursor), last);
       const end = Math.min(Math.max(Number(leg.end_stop_index || 0), start), last);
-      if (start >= last && leg !== legs[legs.length - 1]) {
+      // A leg squeezed down to a single stop covers no route at all, yet keeps its miles, its
+      // driver and its share of the settlement — order #1053 ended up exactly like this (1-1,
+      // 85 mi). Drop it, unless it is the only thing left to hold the order: count the legs
+      // already kept plus the ones still to come, not the ones not yet processed.
+      const othersSurviving = kept + (legs.length - i - 1);
+      if (start === end && othersSurviving > 0) {
          leg.deletedAt = Date.now();
          await leg.save();
          continue;
@@ -446,6 +469,7 @@ async function resyncTripStopIndexes(tenantId, order) {
          leg.end_stop_index = end;
          await leg.save();
       }
+      kept += 1;
       cursor = end;
    }
    // The last surviving leg must always reach the final stop, or part of the route belongs to nobody.
@@ -776,6 +800,11 @@ exports.create_order = catchAsync(async (req, res, next) => {
          message: "Order has been created."
       });
    } catch (err) {
+      // A missing exchange rate is the dispatcher's problem to see, not a 500 — see
+      // resolveMonthlyRate. Without this it reached the generic handler as "server error".
+      if (err?.code === 'fx_unavailable') {
+         return res.status(400).json({ status: false, code: err.code, message: err.message });
+      }
       JSONerror(res, err, next);
    }
 });
@@ -1018,7 +1047,8 @@ exports.update_order = catchAsync(async (req, res, next) => {
    } catch (error) {
       res.status(400).json({
          status: false,
-         message: "Failed to update order.",
+         code: error?.code === 'fx_unavailable' ? error.code : undefined,
+         message: error?.code === 'fx_unavailable' ? error.message : "Failed to update order.",
          error: error.message
       });
    }
@@ -1144,6 +1174,13 @@ exports.convert_order_type = catchAsync(async (req, res) => {
       const items = Array.isArray(req.body?.carrier_revenue_items) ? req.body.carrier_revenue_items : [];
       // The carrier cost is the sum of its line items, exactly as on the add-order form; a bare
       // `carrier_amount` is accepted for callers that have no line items to give.
+      // Same rule as create and update. The total alone is not enough: two lines of -500 and
+      // +1000 sum to a positive 500 and would have stored a negative line item.
+      const negatives = findNegativeMoney({ carrier_revenue_items: items, carrier_amount: req.body?.carrier_amount });
+      if (negatives.length > 0) {
+         return res.status(400).json({ status: false, code: 'negative_amount', message: negatives[0], problems: negatives });
+      }
+
       const itemsTotal = items.reduce((sum, i) => sum + (Number(i?.rate) || 0) * (Number(i?.quantity) || 0), 0);
       const carrierAmount = itemsTotal > 0 ? itemsTotal : Number(req.body?.carrier_amount);
 
@@ -1604,7 +1641,7 @@ exports.order_listing = catchAsync(async (req, res, next) => {
 
 exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
    // Chrome is resolved only through the shared helper — never puppeteer.launch() directly.
-   const { launchBrowser } = require('../utils/puppeteer');
+   const { launchBrowser, hardenPage } = require('../utils/puppeteer');
    const fs = require('fs');
    const path = require('path');
    const axios = require('axios');
@@ -1743,31 +1780,9 @@ exports.generatePdfFromHtml = catchAsync(async (req, res, next) => {
       });
       const page = await browser.newPage();
 
-      // The HTML comes from the client, and this browser runs INSIDE our network with
-      // --no-sandbox --disable-web-security. Without this filter an `<img src="file:///etc/passwd">`
-      // or a fetch to the cloud metadata endpoint (169.254.169.254) is a read primitive posted
-      // straight into a PDF the caller downloads. Only http(s) to public hosts is allowed out.
-      await page.setRequestInterception(true);
-      page.on('request', (request) => {
-         const url = request.url();
-         if (url.startsWith('data:') || url === 'about:blank') return request.continue();
-         let parsed;
-         try {
-            parsed = new URL(url);
-         } catch (e) {
-            return request.abort();
-         }
-         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return request.abort();
-         const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-         const isPrivate =
-            host === 'localhost' || host.endsWith('.localhost') || host === '::1' ||
-            /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) ||
-            /^169\.254\./.test(host) || /^0\./.test(host) ||
-            /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-            /^(fc|fd)[0-9a-f]{2}:/.test(host) || /^fe80:/.test(host);
-         if (isPrivate) return request.abort();
-         return request.continue();
-      });
+      // The HTML comes from the client and this browser sits inside our network with the sandbox
+      // off — block file:// and private hosts before anything renders.
+      await hardenPage(page);
 
       // 1× scale keeps file size small; quality is still crisp at A4 print resolution
       await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 1 });
@@ -2256,12 +2271,26 @@ exports.getFxRate = catchAsync(async (req, res) => {
          ? new Date(year, month - 1, 1)
          : new Date();
 
-   const rate = await resolveMonthlyRate({
-      tenantId,
-      sourceCurrency: source,
-      targetCurrency: target,
-      referenceDate
-   });
+   // Display path, not a money write: if no rate can be resolved, say so plainly instead of
+   // throwing a 500 at a component that is only trying to render a number.
+   let rate;
+   try {
+      rate = await resolveMonthlyRate({
+         tenantId,
+         sourceCurrency: source,
+         targetCurrency: target,
+         referenceDate
+      });
+   } catch (err) {
+      if (err?.code !== 'fx_unavailable') throw err;
+      return res.status(200).json({
+         status: false,
+         code: err.code,
+         sourceCurrency: source,
+         targetCurrency: target,
+         message: err.message,
+      });
+   }
 
    return res.json({
       status: true,
@@ -2271,6 +2300,115 @@ exports.getFxRate = catchAsync(async (req, res) => {
       year: referenceDate.getFullYear(),
       rate: Number(rate || 1),
    });
+});
+
+// Who may download a customer invoice. Same list the old client-HTML gate used — but here it is
+// the ONLY way to produce the document, so it is a real boundary rather than a hint.
+const canDownloadInvoice = (user) => {
+   const perms = Array.isArray(user?.permissions) ? user.permissions : [];
+   return Number(user?.is_admin) === 1
+      || Number(user?.role) === 3
+      || perms.includes('invoices')
+      || perms.includes('subadmin')
+      || perms.includes('accounting');
+};
+
+/**
+ * GET /order/customer/invoice/:id/pdf
+ *
+ * Renders the customer invoice on the SERVER from the order id. The previous flow posted the
+ * browser's own markup to /order/generate-pdf with `docType:'invoice'` — a caller who omitted that
+ * field skipped the permission check completely, and the endpoint would render any HTML at all.
+ */
+exports.customerInvoicePdf = catchAsync(async (req, res) => {
+   const tenantId = req.tenantId || req.user?.tenantId;
+   if (!tenantId) {
+      return res.status(400).json({ status: false, message: 'Tenant context is required.' });
+   }
+   if (!canDownloadInvoice(req.user)) {
+      return res.status(403).json({ status: false, message: 'You do not have permission to download invoices' });
+   }
+
+   // Scoped exactly like order_detail: tenant, not deleted, and inside the caller's modules.
+   const criteria = {
+      _id: req.params.id,
+      tenantId,
+      $or: [{ deletedAt: null }, { deletedAt: '' }, { deletedAt: { $exists: false } }],
+   };
+   if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+      criteria.order_type = { $in: req.allowedOrderTypes };
+   }
+   const order = await Order.findOne(criteria)
+      .populate({ path: 'created_by', options: { includeInactive: true } })
+      .populate(['customer'])
+      .lean();
+   if (!order) {
+      return res.status(404).json({ status: false, message: 'Order not found.' });
+   }
+
+   const companyId = order.company || req.user?.company?._id || req.user?.company || null;
+   const company = companyId
+      ? await Company.findOne({ _id: companyId, tenantId }).lean()
+      : await Company.findOne({ tenantId }).lean();
+
+   // Logo: the cached base64 first (no network), then the CDN copy, then the bundled default —
+   // same order the payslip and owner statement use.
+   const fs = require('fs');
+   const path = require('path');
+   let logoBase64 = company?.logo_base64 || '';
+   if (!logoBase64 && (company?.pdf_logo || company?.logo)) {
+      try {
+         const axios = require('axios');
+         const resp = await axios.get(company.pdf_logo || company.logo, { responseType: 'arraybuffer', timeout: 8000 });
+         const mime = resp.headers['content-type'] || 'image/png';
+         logoBase64 = `data:${mime};base64,${Buffer.from(resp.data).toString('base64')}`;
+      } catch (e) { /* fall through to the bundled logo */ }
+   }
+   if (!logoBase64) {
+      try {
+         const p = path.join(__dirname, '..', 'assets', 'logo.png');
+         if (fs.existsSync(p)) logoBase64 = `data:image/png;base64,${fs.readFileSync(p).toString('base64')}`;
+      } catch (e) { /* logo is optional */ }
+   }
+
+   const issuedAt = new Date();
+   const invoiceNo = buildInvoiceNo(order, issuedAt);
+   const html = buildCustomerInvoiceHtml({ order, company, invoiceNo, issuedAt, logoBase64 });
+
+   const { launchBrowser, hardenPage } = require('../utils/puppeteer');
+   let browser = null;
+   try {
+      browser = await launchBrowser();
+      const page = await browser.newPage();
+      await hardenPage(page);
+      await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 1 });
+      await page.setContent(html, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
+      const pdfBuffer = await page.pdf({
+         format: 'A4',
+         printBackground: true,
+         margin: { top: 0, bottom: 0, left: 0, right: 0 },
+      });
+      await browser.close();
+      browser = null;
+
+      logActivity(req, {
+         action: 'DOWNLOAD',
+         module: 'order',
+         description: `Downloaded customer invoice ${invoiceNo} for order #${order.serial_no ?? ''}`,
+         resourceId: order._id,
+         resourceName: `#${order.serial_no ?? ''}`,
+      });
+
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="CMC${order.serial_no || ''}_invoice-${invoiceNo}.pdf"`);
+      return res.end(pdfBuffer);
+   } catch (err) {
+      if (browser) { try { await browser.close(); } catch (e) { /* noop */ } }
+      if (err?.code === 'chrome_missing') {
+         return res.status(500).json({ status: false, code: 'chrome_missing', message: err.message });
+      }
+      return res.status(500).json({ status: false, message: 'Failed to generate the invoice PDF.' });
+   }
 });
 
 exports.order_detail = catchAsync(async (req, res) => {
@@ -2441,7 +2579,7 @@ exports.deleteOrder = catchAsync(async (req, res) => {
    // order. (Soft delete, like everything else here, so a mistaken delete stays recoverable.)
    const [legs, files] = await Promise.all([
       Trip.updateMany({ tenantId, order: order._id, deletedAt: null }, { deletedAt }),
-      Files.updateMany({ order: order._id, deletedAt: null }, { deletedAt }),
+      Files.updateMany({ tenantId, order: order._id, deletedAt: null }, { deletedAt }),
    ]);
 
    logChange(req, {
