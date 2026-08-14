@@ -22,9 +22,22 @@ const { logActivity, logChange } = require("../utils/activityLogger");
 const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn } = require("../utils/orderMoney");
 const { kmToMiles } = require("../utils/distance");
 
-const DISTANCE_SOURCES = ['auto_fastest', 'auto_domestic', 'auto_corridor', 'manual'];
+const DISTANCE_SOURCES = ['auto_fastest', 'auto_domestic', 'auto_corridor', 'auto_selected', 'manual'];
 const normalizeDistanceSource = (value) =>
    DISTANCE_SOURCES.includes(String(value || '')) ? String(value) : 'auto_fastest';
+
+// The routes that were on screen when one was picked. Kept small on purpose — this is evidence of
+// what the choice was between, not a second copy of Google's response.
+const normalizeRouteOptions = (value) => {
+   if (!Array.isArray(value)) return [];
+   return value.slice(0, 5).map((r) => ({
+      summary: String(r?.summary || '').slice(0, 120),
+      km: Number(r?.km) || 0,
+      miles: Number(r?.miles) || 0,
+      durationSeconds: Number(r?.durationSeconds) || 0,
+      crossesBorder: !!r?.crossesBorder,
+   }));
+};
 
 const SUPPORTED_CURRENCIES = new Set(['CAD', 'USD', 'INR']);
 const BASE_ORDER_CURRENCY = 'USD';
@@ -543,6 +556,11 @@ exports.create_order = catchAsync(async (req, res, next) => {
          route_crosses_border,
          route_countries,
          distance_source,
+         // Which road the distance is for, and what it was chosen from.
+         route_summary,
+         route_polyline,
+         route_duration_sec,
+         route_options,
 
          order_status,
        } = req.body;
@@ -726,6 +744,10 @@ exports.create_order = catchAsync(async (req, res, next) => {
          route_crosses_border: !!route_crosses_border,
          route_countries: Array.isArray(route_countries) ? route_countries : [],
          distance_source: normalizeDistanceSource(distance_source),
+         route_summary: String(route_summary || '').slice(0, 120),
+         route_polyline: String(route_polyline || ''),
+         route_duration_sec: Number(route_duration_sec) || 0,
+         route_options: normalizeRouteOptions(route_options),
          order_status,
          tenantId: tenantId,
          company:req.user && req.user.company ? req.user.company._id : null,
@@ -821,6 +843,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
          'total_amount', 'carrier_amount', 'profit',
          'shipping_details', 'totalDistance', 'notes',
          'route_crosses_border', 'route_countries', 'distance_source',
+         'route_summary', 'route_polyline', 'route_duration_sec', 'route_options',
          'order_status', 'pickup_date', 'delivery_date',
          'commodity', 'equipment', 'charges', 'extra_charges',
          'documents', 'invoice_number', 'po_number',
@@ -831,6 +854,12 @@ exports.update_order = catchAsync(async (req, res, next) => {
       const updateData = {};
       for (const key of ALLOWED_UPDATE_FIELDS) {
          if (key in req.body) updateData[key] = req.body[key];
+      }
+      if ('distance_source' in updateData) {
+         updateData.distance_source = normalizeDistanceSource(updateData.distance_source);
+      }
+      if ('route_options' in updateData) {
+         updateData.route_options = normalizeRouteOptions(updateData.route_options);
       }
 
       // Same rule on edit as on create — see findNegativeMoney.
@@ -861,6 +890,21 @@ exports.update_order = catchAsync(async (req, res, next) => {
          if (current && incoming && current !== incoming && hasTypedAmounts) {
             delete updateData.revenue_currency;
          }
+      }
+
+      // The distance is not a display field — it is the denominator every leg's miles share is
+      // derived from, so it flows into driver pay, then the owner settlement, then truck gross.
+      // Once that money has been reported, changing the route rewrites history. Refuse it the same
+      // way conversion does, instead of quietly moving a number someone has already been paid on.
+      const routeGuard = await distanceEditBlockers(existing, updateData, tenantId, req.body);
+      if (routeGuard.blocked) {
+         return res.status(409).json({
+            status: false,
+            code: routeGuard.code,
+            message: routeGuard.blockers[0],
+            blockers: routeGuard.blockers,
+            needsConfirm: !!routeGuard.needsConfirm,
+         });
       }
 
       const criteria = { _id: req.params.id, tenantId };
@@ -1067,6 +1111,54 @@ exports.update_order = catchAsync(async (req, res, next) => {
 
 // Everything that makes an order un-convertible, checked together so the user gets the full list
 // rather than one blocker at a time.
+/**
+ * Guards a route/distance change on an existing order.
+ *
+ * Two different answers, because they are two different situations:
+ *  - money already reported (owner paid, or the order sits on a generated driver payslip) -> refuse
+ *    outright. The payslip in the driver's hand would stop matching the ledger, with nothing saying so.
+ *  - the order is split into real legs but nothing is paid yet -> allowed, but only once the
+ *    dispatcher confirms: every leg's miles share is derived from this number, so all of them move.
+ *
+ * A distance that has not actually changed is not an edit — the edit form echoes the saved value
+ * back on every save, and blocking that would make paid orders uneditable for a note or a document.
+ */
+async function distanceEditBlockers(existing, updateData, tenantId, body = {}) {
+   const none = { blocked: false, blockers: [] };
+   if (!existing) return none;
+
+   const distanceMoved = 'totalDistance' in updateData
+      && Number(updateData.totalDistance || 0) !== Number(existing.totalDistance || 0);
+   const routeMoved = 'route_summary' in updateData
+      && String(updateData.route_summary || '') !== String(existing.route_summary || '');
+   if (!distanceMoved && !routeMoved) return none;
+
+   const [settledRows, salaryRows] = await Promise.all([
+      OwnerOperatorFinancialRecord.countDocuments({
+         tenantId, order: existing._id, paymentStatus: { $ne: 'pending' },
+      }),
+      DriverSalary.countDocuments({ tenantId, 'orderBreakdown.order': existing._id }),
+   ]);
+
+   const blockers = [];
+   if (settledRows > 0) blockers.push('An owner operator has already been paid for this order — the route cannot be changed.');
+   if (salaryRows > 0) blockers.push('This order is already on a generated driver payslip — the route cannot be changed.');
+   if (blockers.length > 0) {
+      return { blocked: true, code: 'route_locked_by_payroll', blockers };
+   }
+
+   const tripCount = await Trip.countDocuments({ tenantId, order: existing._id, deletedAt: null });
+   if (tripCount > 1 && body.confirm_route_change !== true) {
+      return {
+         blocked: true,
+         code: 'route_change_resplits_legs',
+         needsConfirm: true,
+         blockers: [`This order is split into ${tripCount} legs. Changing the distance re-derives every leg's miles share and the driver pay that follows from it.`],
+      };
+   }
+   return none;
+}
+
 async function conversionBlockers(order, tenantId) {
    const blockers = [];
    if (order.lock) blockers.push('The order is locked. Unlock it first.');

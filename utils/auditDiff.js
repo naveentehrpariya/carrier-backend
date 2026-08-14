@@ -40,7 +40,7 @@ const AUDIT_FIELDS = {
     'revenue_currency', 'fx_to_usd',
     'revenue_items', 'carrier_revenue_items',
     // distance feeds driver pay -> owner settlement -> truck gross
-    'totalDistance', 'distance_source', 'route_crosses_border',
+    'totalDistance', 'distance_source', 'route_crosses_border', 'route_summary',
     // who the money goes to
     'customer', 'carrier', 'truck', 'trailer', 'drivers',
     'ownerOperator', 'ownerOperators', 'isMixedOwner',

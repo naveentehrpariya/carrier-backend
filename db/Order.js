@@ -130,8 +130,28 @@ const schema = new mongo.Schema({
     route_countries: { type: [String], default: [] },      // e.g. ['CA'] or ['CA','US']
     distance_source: {
         type: String,
-        enum: ['auto_fastest', 'auto_domestic', 'auto_corridor', 'manual'],
+        enum: ['auto_fastest', 'auto_domestic', 'auto_corridor', 'auto_selected', 'manual'],
         default: 'auto_fastest',
+    },
+    // WHICH road the distance is for. "2,258 km" alone cannot be compared with what the client sees
+    // in Google Maps — Google returns two or three routes per lane and names each one, and the whole
+    // "your number disagrees with mine" class of dispute is really "we are looking at different
+    // roads". Storing the name makes that answerable from the order itself.
+    route_summary: { type: String, default: '' },          // e.g. 'Trans-Canada Hwy'
+    route_polyline: { type: String, default: '' },         // Google encoded overview, for the map
+    route_duration_sec: { type: Number, default: 0 },
+    // The options that were on screen when this one was picked — what was NOT chosen is the other
+    // half of the evidence.
+    route_options: {
+        type: [{
+            _id: false,
+            summary: String,
+            km: Number,
+            miles: Number,
+            durationSeconds: Number,
+            crossesBorder: Boolean,
+        }],
+        default: [],
     },
     revenue_items: [],
     carrier_revenue_items: [],

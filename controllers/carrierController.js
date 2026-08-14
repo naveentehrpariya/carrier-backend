@@ -466,6 +466,12 @@ exports.getDistance = async (req, res) => {
       routePolicy: result.policy,
       distanceSource: result.source,
       corridorUsed: result.corridorUsed,
+      // Which road this number is for, and the other roads the dispatcher may legitimately pick
+      // instead. Google only offers more than one when the request has no intermediate stops, so a
+      // multi-stop order returns a single entry here — that is Google's limit, not a bug.
+      routeSummary: result.summary,
+      polyline: result.polyline,
+      alternatives: result.alternatives || [],
       // Stops Google could not place from the typed text — routed from a reduced form (street+city,
       // or the postal code). Shown as a warning so the dispatcher can accept it or type the miles.
       approximatedStops: result.approximatedStops || [],

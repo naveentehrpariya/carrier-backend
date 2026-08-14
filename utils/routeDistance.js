@@ -67,16 +67,47 @@ async function callDirections(params) {
   return { routes: data.routes, error: null };
 }
 
+// Google names a route by its dominant highway ("Trans-Canada Hwy"). On a multi-leg request that
+// name is often blank, and an unnamed route on screen is indistinguishable from every other one —
+// so fall back to a positional label rather than rendering an empty chip.
+function routeLabel(route, index) {
+  const summary = String(route?.summary || '').trim();
+  return summary || `Route ${index + 1}`;
+}
+
+// One selectable route, flattened for the API/UI. `polyline` is Google's own encoded overview: the
+// map draws THIS, never its own Directions call, so what the dispatcher picks is exactly what gets
+// stored (a second browser-side measurement drifts — see the `_measuredKey` note in CLAUDE.md).
+function describeRoute(entry, index) {
+  return {
+    index,
+    summary: routeLabel(entry.route, index),
+    meters: entry.info.distanceMeters,
+    km: Number((entry.info.distanceMeters / 1000).toFixed(2)),
+    miles: Number((entry.info.distanceMeters / 1609.344).toFixed(2)),
+    durationSeconds: entry.info.durationSeconds,
+    crossesBorder: entry.info.crossesBorder,
+    countries: entry.info.countries,
+    polyline: entry.route?.overview_polyline?.points || '',
+  };
+}
+
 /**
  * Resolve a route honouring the tenant's routing policy.
  *
  * Returns { ok, meters, km, miles, durationSeconds, crossesBorder, countries, homeCountry,
- *           policy, source, corridorUsed, error }
+ *           policy, source, corridorUsed, summary, polyline, alternatives, error }
  *
  * `source`:
  *   'auto_fastest'  — policy off, or trip is genuinely cross-border: Google's best route
  *   'auto_domestic' — an alternative that stays inside the country was chosen
  *   'auto_corridor' — every alternative crossed, so domestic corridor waypoints were forced
+ *
+ * `alternatives` are the routes a dispatcher may legitimately choose between — already filtered by
+ * policy, so a border-crossing route is never offered to a domestic_only tenant. Google only returns
+ * more than one route when the request has NO waypoints, so a multi-stop order always yields exactly
+ * one entry here. Measuring each stop pair separately to get around that is not an option: pairs sum
+ * LONGER than the single connected route (CMC-1028: 1662.89 mi of legs vs 1419.68 mi of order).
  */
 async function routeOnce({ origin, destination, waypoints = [], apiKey, activePolicy, optimizeWaypoints = false }) {
   const first = await callDirections({
@@ -93,20 +124,38 @@ async function routeOnce({ origin, destination, waypoints = [], apiKey, activePo
   const analyzed = first.routes.map((route) => ({ route, info: analyzeRoute(route, homeCountry) }));
   const best = analyzed[0];
 
-  const finish = (chosen, source, corridorUsed = null) => ({
-    ok: true,
-    meters: chosen.info.distanceMeters,
-    km: Number((chosen.info.distanceMeters / 1000).toFixed(2)),
-    miles: Number((chosen.info.distanceMeters / 1609.344).toFixed(2)),
-    durationSeconds: chosen.info.durationSeconds,
-    crossesBorder: chosen.info.crossesBorder,
-    countries: chosen.info.countries,
-    homeCountry,
-    policy: activePolicy,
-    source,
-    corridorUsed,
-    error: null,
-  });
+  // What the dispatcher may pick between. Under domestic_only a border-crossing route is not a
+  // choice — it is the mistake the policy exists to prevent — so it never reaches the picker.
+  const eligible = (activePolicy === 'domestic_only' && homeCountry)
+    ? analyzed.filter((a) => !a.info.crossesBorder)
+    : analyzed;
+  const selectable = [...eligible].sort((a, b) => a.info.distanceMeters - b.info.distanceMeters);
+
+  const finish = (chosen, source, corridorUsed = null, options = selectable) => {
+    const alternatives = options.map(describeRoute);
+    const chosenPolyline = chosen.route?.overview_polyline?.points || '';
+    const chosenIndex = Math.max(analyzed.indexOf(chosen), 0);
+    return {
+      ok: true,
+      meters: chosen.info.distanceMeters,
+      km: Number((chosen.info.distanceMeters / 1000).toFixed(2)),
+      miles: Number((chosen.info.distanceMeters / 1609.344).toFixed(2)),
+      durationSeconds: chosen.info.durationSeconds,
+      crossesBorder: chosen.info.crossesBorder,
+      countries: chosen.info.countries,
+      homeCountry,
+      policy: activePolicy,
+      source,
+      corridorUsed,
+      summary: routeLabel(chosen.route, chosenIndex),
+      polyline: chosenPolyline,
+      alternatives: alternatives.map((alt) => ({
+        ...alt,
+        selected: alt.meters === chosen.info.distanceMeters && alt.polyline === chosenPolyline,
+      })),
+      error: null,
+    };
+  };
 
   // Policy off, or a genuine cross-border load (origin and destination in different countries):
   // nothing to correct, keep Google's answer.
@@ -137,13 +186,17 @@ async function routeOnce({ origin, destination, waypoints = [], apiKey, activePo
       optimize: false,
     });
     if (!retry.error && retry.routes.length) {
+      // The corridor route came from a different request, so it is not one of `selectable` —
+      // and there is nothing to choose between: it is the only route that stays in the country.
       const forced = { route: retry.routes[0], info: analyzeRoute(retry.routes[0], homeCountry) };
-      return finish(forced, 'auto_corridor', corridor.name);
+      return finish(forced, 'auto_corridor', corridor.name, [forced]);
     }
   }
 
   // No domestic option at all — return the fastest, flagged, so the UI can warn the dispatcher.
-  return finish(best, 'auto_fastest');
+  // `selectable` is empty here (every route crossed), so offer the one actually being used rather
+  // than an empty picker.
+  return finish(best, 'auto_fastest', null, [best]);
 }
 
 // ZERO_RESULTS means every stop WAS found — there is simply no driving route between them. That is
