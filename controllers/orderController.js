@@ -855,6 +855,9 @@ exports.update_order = catchAsync(async (req, res, next) => {
       for (const key of ALLOWED_UPDATE_FIELDS) {
          if (key in req.body) updateData[key] = req.body[key];
       }
+      // Read before the echo-suppression below can strip it: whether the caller MEANT to set the
+      // settlement decides if the mixed-owner recompute may overwrite it (see further down).
+      const settleExplicit = 'settle_amount' in updateData;
       if ('distance_source' in updateData) {
          updateData.distance_source = normalizeDistanceSource(updateData.distance_source);
       }
@@ -1052,10 +1055,17 @@ exports.update_order = catchAsync(async (req, res, next) => {
          order.ownerOperator = fields.ownerOperator;
          order.ownerOperators = fields.ownerOperators;
          order.isMixedOwner = fields.isMixedOwner;
-         order.settle_amount = fields.settle_amount;
-         order.input_settle_amount = fields.input_settle_amount;
-         order.owner_profit = fields.owner_profit;
-         order.carrier_amount = fields.carrier_amount;
+         // On a mixed order this derivation returns the SUM OF THE FROZEN LEG AMOUNTS, so it used
+         // to overwrite a settlement the user had just typed — set it to 3,000 with legs frozen at
+         // 1,800 + 0 and it silently snapped back to 1,800, looking like the save had failed.
+         // An explicit `settle_amount` in the payload is an instruction, not something to re-derive;
+         // the legs are then simply under-allocated, which the settlement screen already flags.
+         if (!settleExplicit) {
+            order.settle_amount = fields.settle_amount;
+            order.input_settle_amount = fields.input_settle_amount;
+            order.owner_profit = fields.owner_profit;
+            order.carrier_amount = fields.carrier_amount;
+         }
          await order.save();
       }
       if (order.isOwnerOperatedTruck) {
