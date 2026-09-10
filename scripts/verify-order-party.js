@@ -27,12 +27,17 @@ const Order = require('../db/Order');
 const Trip = require('../db/Trip');
 const Truck = require('../db/Truck');
 const { resolveOrderState } = require('../utils/orderParty');
+require('../db/ActivityLog');
 
 const arg = (name) => {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
   return hit ? hit.slice(name.length + 3) : null;
 };
 
+/* The columns that existed BEFORE this work. Deliberately does NOT include `cost_amount` /
+ * `input_cost_amount`: those are new, so every pre-deploy backup has them absent, and the moment the
+ * code starts writing them every order would read as "money moved with no audit entry" and fail all
+ * 776. They are derived from these columns anyway — if none of these moved, neither did the cost. */
 const MONEY_FIELDS = [
   'total_amount', 'carrier_amount', 'settle_amount',
   'input_total_amount', 'input_carrier_amount', 'input_settle_amount',
@@ -90,32 +95,74 @@ async function run() {
       const before = JSON.parse(fs.readFileSync(file, 'utf8'));
       const liveById = new Map(orders.map((o) => [String(o._id), o]));
       let compared = 0;
-      let moved = 0;
-      const movedRows = [];
+      const moved = [];
       for (const b of before) {
         const live = liveById.get(String(b._id));
         if (!live) continue;
         compared++;
-        const diffs = MONEY_FIELDS
+        const fields = MONEY_FIELDS
           .filter((f) => Object.prototype.hasOwnProperty.call(b, f) || live[f] !== undefined)
-          .filter((f) => cents(b[f]) !== cents(live[f]))
-          .map((f) => `${f}: ${num(b[f])} -> ${num(live[f])}`);
-        if (diffs.length) { moved++; movedRows.push({ serial_no: b.serial_no, tenantId: b.tenantId, diffs }); }
+          .filter((f) => cents(b[f]) !== cents(live[f]));
+        if (!fields.length) continue;
+        moved.push({
+          _id: String(b._id), serial_no: b.serial_no, tenantId: b.tenantId, fields,
+          diffs: fields.map((f) => `${f}: ${num(b[f])} -> ${num(live[f])}`),
+        });
       }
       console.log(`   compared ${compared} order(s) against the backup`);
-      if (moved === 0) {
+
+      /* WHO MOVED IT — the audit trail, not the column names.
+       *
+       * This compares against a MOMENT IN TIME on a LIVE database, so ten days of ordinary trading
+       * shows up here and used to fail the check forever, which made the script useless as the
+       * deploy gate it exists to be. Splitting by column does not work either: a dispatcher
+       * re-quoting a load moves `carrier_amount` too.
+       *
+       * The honest distinction is the trail. Every human edit writes a hash-chained ActivityLog
+       * entry naming the fields it changed; a migration writes none. So money that moved WITH an
+       * entry is business, and money that moved with NO entry is the alarming case — something
+       * rewrote money leaving no record, which is exactly what a bad migration looks like. */
+      const stamp = path.basename(dir).replace(/^.*?-(\d{4}-\d{2}-\d{2}T)/, '$1').replace(/-(\d{2})-(\d{2})-(\d{3})Z$/, ':$1:$2.$3Z');
+      const since = new Date(stamp);
+      const sinceValid = !Number.isNaN(since.getTime());
+
+      const explained = [];
+      const unexplained = [];
+      if (moved.length) {
+        const ActivityLog = mongoose.model('ActivityLog');
+        for (const m of moved) {
+          const entry = sinceValid
+            ? await ActivityLog.findOne({
+              resourceId: m._id,
+              createdAt: { $gte: since },
+              changedFields: { $in: m.fields },
+            }).sort({ createdAt: -1 }).select('createdAt userName userId changedFields').lean()
+            : null;
+          if (entry) explained.push({ ...m, entry });
+          else unexplained.push(m);
+        }
+      }
+
+      if (!moved.length) {
         console.log('   PASS — not one money column moved.');
+      } else if (!unexplained.length) {
+        console.log(`   PASS — ${explained.length} order(s) moved, every one of them by a person:`);
+        explained.slice(0, 20).forEach((r) => {
+          const who = r.entry.userName || r.entry.userId || 'unknown';
+          console.log(`     #${r.serial_no} ${r.tenantId}: ${r.entry.createdAt.toISOString().slice(0, 16)} by ${who}`);
+          console.log(`        ${r.diffs.join(' | ')}`);
+        });
+        console.log('   Nothing moved money without leaving a trail, which is what a migration fault');
+        console.log('   would look like.');
       } else {
         failures++;
-        console.log(`   FAIL — ${moved} order(s) have different money than before the backup was taken:`);
-        movedRows.slice(0, 20).forEach((r) => console.log(`     #${r.serial_no} ${r.tenantId}: ${r.diffs.join(' | ')}`));
-        console.log('');
-        console.log('   NOTE: this compares against a MOMENT IN TIME, on a live database. A dispatcher');
-        console.log('   editing an order after the backup was taken shows up here too, and looks');
-        console.log('   identical to a migration fault. Check who moved it before assuming the worst:');
+        console.log(`   FAIL — ${unexplained.length} order(s) moved money with NO audit entry behind it:`);
+        unexplained.slice(0, 20).forEach((r) => console.log(`     #${r.serial_no} ${r.tenantId}: ${r.diffs.join(' | ')}`));
+        if (explained.length) {
+          console.log(`   (${explained.length} other order(s) moved, each with a person's audit entry — those are business.)`);
+        }
+        console.log('   Read the full history of one with:');
         console.log('     GET /api/tenant-admin/activity-logs/resource/order/<orderId>');
-        console.log('   A migration fault would move `cost_amount` / `carrier_amount` / `settle_amount`;');
-        console.log('   a person editing the load usually moves `total_amount` and `revenue_items`.');
       }
     }
   }
