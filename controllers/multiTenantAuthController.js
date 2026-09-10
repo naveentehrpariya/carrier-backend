@@ -16,6 +16,8 @@ const { logActivity } = require('../utils/activityLogger');
 // Import utilities
 const { generateTenantUrl, generateSuperAdminUrl } = require('../middleware/tenantResolver');
 
+const { planModulesFor } = require('../utils/orderModules');
+
 const VALID_MODULES = ['outsourcing', 'regular'];
 const sanitizeModules = (value) => {
   if (!Array.isArray(value)) return [];
@@ -25,29 +27,9 @@ const sanitizeModules = (value) => {
 };
 
 const resolveTenantPlanModules = async (tenant) => {
-  const cached = sanitizeModules(tenant?.subscription?.allowedModules);
-  if (cached.length > 0) return cached;
-
-  const planSlug = (tenant?.subscription?.planSlug || tenant?.subscription?.legacyPlan || '').toString().trim();
-  const planRef = tenant?.subscription?.plan;
-
-  try {
-    const SubscriptionPlan = mongoose.model('subscription_plans');
-    let planRecord = null;
-
-    if (planSlug) {
-      planRecord = await SubscriptionPlan.findOne({ slug: planSlug });
-    } else if (planRef && mongoose.Types.ObjectId.isValid(planRef)) {
-      planRecord = await SubscriptionPlan.findById(planRef);
-    } else if (typeof planRef === 'string' && planRef.trim()) {
-      planRecord = await SubscriptionPlan.findOne({ slug: planRef.trim() });
-    }
-
-    const mods = sanitizeModules(planRecord?.allowedModules);
-    if (mods.length > 0) return mods;
-  } catch (err) {}
-
-  return ['outsourcing'];
+  // The plan no longer gates modules — see utils/orderModules.js. Kept as the single call site so
+  // the login payload's allowedModules keeps its shape.
+  return planModulesFor(tenant);
 };
 
 /**

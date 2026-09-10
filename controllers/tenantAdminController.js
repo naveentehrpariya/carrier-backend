@@ -1,4 +1,5 @@
 const catchAsync = require('../utils/catchAsync');
+const { ORDER_SHAPE_FIELDS } = require('../utils/orderParty');
 const AppError = require('../utils/AppError');
 const Tenant = require('../db/Tenant');
 const User = require('../db/Users');
@@ -1244,7 +1245,7 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
       .populate('carrier', 'name mc_code')
       .populate('truck', 'unitNumber plateNumber')
       .populate('created_by', 'name staff_commision')
-      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount settle_amount')
+      .select(`serial_no customer_order_no total_amount carrier_amount owner_profit order_type isMixedType carrier_ratio cost_amount input_cost_amount isOwnerOperatedTruck order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount settle_amount ${ORDER_SHAPE_FIELDS}`)
       .sort({ createdAt: -1 })
       .lean();
 
@@ -1258,7 +1259,9 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     for (const o of orders) {
       const money = orderMoneyIn(o, fx);
       const rev = money.revenue;
-      const cost = money.carrierAmount;
+      // The order's total outside cost, not just the carrier column: a mixed order also pays an
+      // owner settlement, and reading one column alone understates what the load cost.
+      const cost = money.cost;
       const commission = money.commission;
       // Row values are overwritten with display-currency figures so the table and the
       // summary cards can never disagree.
@@ -1320,7 +1323,7 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     .populate('customer', 'name')
     .populate('truck', 'unitNumber plateNumber')
     .populate('ownerOperator', 'fullName ownerOperatorId')
-    .select('serial_no customer_order_no total_amount settle_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator input_currency revenue_currency input_total_amount input_settle_amount input_carrier_amount carrier_amount created_by')
+    .select(`serial_no customer_order_no total_amount settle_amount owner_profit order_type isMixedType carrier_ratio cost_amount input_cost_amount isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator input_currency revenue_currency input_total_amount input_settle_amount input_carrier_amount carrier_amount created_by ${ORDER_SHAPE_FIELDS}`)
     .sort({ createdAt: -1 })
     .lean();
 
@@ -1337,6 +1340,10 @@ const getFinanceReport = catchAsync(async (req, res, next) => {
     const ownerProfit = fx.convert(Number(o.owner_profit || 0), orderBaseCurrency(o), o.createdAt);
     o.total_amount = rev;
     o.settle_amount = money.settle;
+    // A mixed order is stamped `regular` and lands in this report, but part of it was moved by an
+    // outside carrier. Without this the carrier's cost is simply missing from the fleet figures.
+    o.carrier_amount = money.carrierAmount;
+    o.cost_amount = money.cost;
     o.owner_profit = ownerProfit;
     o.profit = money.profit;
     o.currency = displayCurrency;
@@ -1411,7 +1418,7 @@ const { launchBrowser } = require('../utils/puppeteer');
       .populate('carrier', 'name mc_code')
       .populate('truck', 'unitNumber plateNumber')
       .populate('created_by', 'name staff_commision')
-      .select('serial_no customer_order_no total_amount carrier_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount settle_amount')
+      .select(`serial_no customer_order_no total_amount carrier_amount owner_profit order_type isMixedType carrier_ratio cost_amount input_cost_amount isOwnerOperatedTruck order_status customer_payment_status carrier_payment_status createdAt shipping_details customer carrier truck created_by input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount settle_amount ${ORDER_SHAPE_FIELDS}`)
       .sort({ createdAt: -1 })
       .lean();
 
@@ -1425,7 +1432,9 @@ const { launchBrowser } = require('../utils/puppeteer');
     for (const o of orders) {
       const money = orderMoneyIn(o, fx);
       const rev = money.revenue;
-      const cost = money.carrierAmount;
+      // The order's total outside cost, not just the carrier column: a mixed order also pays an
+      // owner settlement, and reading one column alone understates what the load cost.
+      const cost = money.cost;
       const commission = money.commission;
       o.total_amount = rev;
       o.carrier_amount = cost;
@@ -1455,7 +1464,7 @@ const { launchBrowser } = require('../utils/puppeteer');
       .populate('customer', 'name')
       .populate('truck', 'unitNumber plateNumber')
       .populate('ownerOperator', 'fullName ownerOperatorId')
-      .select('serial_no customer_order_no total_amount settle_amount owner_profit order_type isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator input_currency revenue_currency input_total_amount input_settle_amount input_carrier_amount carrier_amount created_by')
+      .select(`serial_no customer_order_no total_amount settle_amount owner_profit order_type isMixedType carrier_ratio cost_amount input_cost_amount isOwnerOperatedTruck order_status customer_payment_status createdAt shipping_details customer truck ownerOperator input_currency revenue_currency input_total_amount input_settle_amount input_carrier_amount carrier_amount created_by ${ORDER_SHAPE_FIELDS}`)
       .sort({ createdAt: -1 })
       .lean();
 
@@ -1470,6 +1479,10 @@ const { launchBrowser } = require('../utils/puppeteer');
       const ownerProfit = fx.convert(Number(o.owner_profit || 0), orderBaseCurrency(o), o.createdAt);
       o.total_amount = rev;
       o.settle_amount = money.settle;
+      // A mixed order is stamped `regular` and lands here, but part of it was moved by an outside
+      // carrier — without this the carrier's cost is missing from the fleet figures.
+      o.carrier_amount = money.carrierAmount;
+      o.cost_amount = money.cost;
       o.owner_profit = ownerProfit;
       o.profit = money.profit;
       totalRevenue += rev;

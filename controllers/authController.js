@@ -5,6 +5,7 @@ const {promisify} = require("util");
 const AppError = require("../utils/AppError");
 const SendEmail = require("../utils/Email");
 const { logActivity } = require("../utils/activityLogger");
+const { planModulesFor } = require("../utils/orderModules");
 
 const crypto = require("crypto");
 const JSONerror = require("../utils/jsonErrorHandler");
@@ -495,30 +496,8 @@ const profile = catchAsync ( async (req, res) => {
     try {
       const tenant = await Tenant.findOne({ tenantId: tenantIdForPlan });
       if (tenant && tenant.subscription) {
-        let planModules = sanitizeModules(tenant.subscription.allowedModules);
-        
-        // Fallback to plan record if cached is default and plan exists
-        if (tenant.subscription.plan) {
-          try {
-            const SubscriptionPlan = require('../db/SubscriptionPlan');
-            const rawPlanRef = tenant.subscription.plan;
-            let planRecord = null;
-            const planRefStr = String(rawPlanRef || '');
-            if (require('mongoose').Types.ObjectId.isValid(planRefStr)) {
-              planRecord = await SubscriptionPlan.findById(planRefStr);
-            } else if (typeof rawPlanRef === 'string' && rawPlanRef.trim()) {
-              planRecord = await SubscriptionPlan.findOne({ slug: rawPlanRef.trim(), isActive: true });
-            } else if (tenant.subscription.planSlug) {
-              planRecord = await SubscriptionPlan.findOne({ slug: tenant.subscription.planSlug, isActive: true });
-            }
-            if (planRecord && Array.isArray(planRecord.allowedModules) && planRecord.allowedModules.length > 0) {
-              planModules = sanitizeModules(planRecord.allowedModules);
-            }
-          } catch (planErr) {
-            console.error('Plan fetch error in profile:', planErr);
-          }
-        }
-        if (!planModules.length) planModules = ['outsourcing'];
+        // The plan no longer gates modules (utils/orderModules.js) — per-user permissions still do.
+        const planModules = planModulesFor(tenant);
 
         // Remove regular/outsourcing permissions from userProfile if they aren't in the plan
         userProfile.permissions = userProfile.permissions.filter(p => {
@@ -758,13 +737,8 @@ const employeeDetail = catchAsync ( async (req, res) => {
   }
   
   // Calculate effective permissions for employee detail view based on tenant plan
-  let planModules = ['outsourcing', 'regular'];
-  try {
-    const tenant = await Tenant.findOne({ tenantId }).select('subscription.allowedModules').lean();
-    if (tenant?.subscription?.allowedModules) {
-      planModules = tenant.subscription.allowedModules.map(m => String(m).toLowerCase().trim()).filter(m => ['outsourcing', 'regular'].includes(m));
-    }
-  } catch (e) {}
+  // The plan no longer gates modules (utils/orderModules.js).
+  const planModules = planModulesFor();
 
   employee.permissions = Array.isArray(employee.permissions) ? employee.permissions : [];
   employee.permissions = employee.permissions.filter(p => {
@@ -827,7 +801,7 @@ const employeesDocs = catchAsync ( async (req, res) => {
   if (!employee) {
     return res.status(404).json({ status: false, message: "Employee not found.", documents: [] });
   }
-  const documents = await EmployeeDoc.find({ tenantId, user: employeeId }).populate('added_by').sort({ createdAt: -1 });
+  const documents = await EmployeeDoc.find({ tenantId, user: employeeId, deletedAt: null }).populate('added_by').sort({ createdAt: -1 });
   console.log("documents", documents);
   
   res.status(200).json({
@@ -1538,24 +1512,8 @@ const multiTenantLogin = catchAsync(async (req, res, next) => {
         ? arr.map((m) => String(m).toLowerCase().trim()).filter((m) => valid.includes(m))
         : [];
 
-      let planModules = sanitize(tenant?.subscription?.allowedModules);
-      if (!planModules.length) planModules = ['outsourcing', 'regular'];
-      if (tenant?.subscription?.plan) {
-        const SubscriptionPlan = require('../db/SubscriptionPlan');
-        const rawPlanRef = tenant.subscription.plan;
-        const planRefStr = String(rawPlanRef || '');
-        let planRecord = null;
-        if (require('mongoose').Types.ObjectId.isValid(planRefStr)) {
-          planRecord = await SubscriptionPlan.findById(planRefStr);
-        } else if (typeof rawPlanRef === 'string' && rawPlanRef.trim()) {
-          planRecord = await SubscriptionPlan.findOne({ slug: rawPlanRef.trim(), isActive: true });
-        } else if (tenant.subscription.planSlug) {
-          planRecord = await SubscriptionPlan.findOne({ slug: tenant.subscription.planSlug, isActive: true });
-        }
-        if (planRecord && Array.isArray(planRecord.allowedModules) && planRecord.allowedModules.length > 0) {
-          planModules = sanitize(planRecord.allowedModules);
-        }
-      }
+      // The plan no longer gates modules (utils/orderModules.js).
+      const planModules = planModulesFor(tenant);
       const userModules = sanitize(user.allowedModules);
       if (user.role === 3 || user.is_admin === 1) {
         const legacyRestricted = userModules.length > 0 && planModules.length > 0 && userModules.length < planModules.length;

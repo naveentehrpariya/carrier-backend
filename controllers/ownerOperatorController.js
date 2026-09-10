@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ORDER_SHAPE_FIELDS } = require('../utils/orderParty');
 const https = require('https');
 const puppeteer = require('puppeteer');
 const { launchBrowser } = require('../utils/puppeteer');
@@ -389,13 +390,13 @@ async function buildOrderDriverDeductions(tenantId, orderIds) {
     order: { $in: orderIds },
     deletedAt: null,
   })
-    .select('order miles totalDistance total_km distance_unit rate_per_mile rate_currency drivers driver truck settle_amount')
+    .select(`order miles totalDistance total_km distance_unit rate_per_mile rate_currency drivers driver truck settle_amount ${ORDER_SHAPE_FIELDS}`)
     .lean();
   const orderRows = await Order.find({
     tenantId,
     _id: { $in: orderIds },
   })
-    .select('_id totalDistance createdAt isMixedOwner ownerOperator ownerOperators settle_amount input_settle_amount input_currency revenue_currency total_amount input_total_amount fx_to_usd')
+    .select(`_id totalDistance createdAt isMixedOwner ownerOperator ownerOperators settle_amount input_settle_amount input_currency revenue_currency total_amount input_total_amount fx_to_usd ${ORDER_SHAPE_FIELDS}`)
     .lean();
   const truckIds = [...new Set((trips || []).map((t) => String(t.truck || '')).filter(Boolean))];
   const truckRows = truckIds.length > 0
@@ -745,7 +746,7 @@ exports.ownerOperatorDetail = catchAsync(async (req, res, next) => {
         },
       ],
     })
-      .select('serial_no order_status order_type total_amount settle_amount owner_profit input_total_amount input_settle_amount input_currency revenue_currency createdAt pickup_date delivery_date customer truck shipping_details')
+      .select(`serial_no order_status order_type total_amount settle_amount owner_profit input_total_amount input_settle_amount input_currency revenue_currency createdAt pickup_date delivery_date customer truck shipping_details ${ORDER_SHAPE_FIELDS}`)
       .populate('customer', 'name company_name')
       .populate('truck', 'make model truckNumber unitNumber plateNumber')
       .sort({ createdAt: -1 })
@@ -2038,23 +2039,22 @@ exports.removeSalarySlip = catchAsync(async (req, res, next) => {
   }
 });
 
-exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
-  try {
-    if (!hasOwnerOperatorAccess(req)) {
-      return res.status(403).json({ status: false, message: 'You are not allowed to update salary payment' });
-    }
+// The one definition of "record a payment against an owner payslip" — used by
+// the endpoint below AND by cheque application. Returns { ok:false, status,
+// body } for a client error or { ok:true, salary, record }.
+async function recordOwnerPaymentCore(req, { salaryId, amount: rawAmount, currency, notes: rawNotes, allowOverpay }) {
     const tenantId = getTenantId(req);
-    const salary = await OwnerOperatorSalary.findOne({ _id: req.params.id, tenantId });
-    if (!salary) return res.status(404).json({ status: false, message: 'Salary record not found' });
+    const salary = await OwnerOperatorSalary.findOne({ _id: salaryId, tenantId });
+    if (!salary) return { ok: false, status: 404, body: { status: false, message: 'Salary record not found' } };
     const beforeSalary = salary.toObject();
-    const amount = Number(req.body?.amount || 0);
-    const notes = String(req.body?.notes || '').trim();
-    if (amount <= 0) return res.status(400).json({ status: false, message: 'Payment amount should be greater than 0' });
+    const amount = Number(rawAmount || 0);
+    const notes = String(rawNotes || '').trim();
+    if (amount <= 0) return { ok: false, status: 400, body: { status: false, message: 'Payment amount should be greater than 0' } };
     const salaryCurrency = normalizeCurrency(salary?.currency, req.tenant?.billing?.currency || 'USD');
-    const inputCurrency = normalizeCurrency(req.body?.currency, salaryCurrency);
+    const inputCurrency = normalizeCurrency(currency, salaryCurrency);
     const fxRatesMap = await getFxRatesMap(tenantId, salary.month, salary.year, salaryCurrency);
     const convertedAmount = Number(convertAmount(amount, inputCurrency, salaryCurrency, fxRatesMap).value || 0);
-    if (convertedAmount <= 0) return res.status(400).json({ status: false, message: 'Converted payment amount should be greater than 0' });
+    if (convertedAmount <= 0) return { ok: false, status: 400, body: { status: false, message: 'Converted payment amount should be greater than 0' } };
 
     const finalPayable = round2(salary.finalPayable);
     const alreadyPaid = round2(salary.paidAmount);
@@ -2065,15 +2065,15 @@ exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
     // API recorded 3,000 and answered "updated". The excess is now refused unless the caller
     // says it is intentional (an on-purpose advance against next month), and then it is
     // recorded as `overpaidAmount` rather than thrown away.
-    if (nextPaid - payableFloor > EPSILON && !req.body?.allowOverpay) {
-      return res.status(409).json({
+    if (nextPaid - payableFloor > EPSILON && !allowOverpay) {
+      return { ok: false, status: 409, body: {
         status: false,
         code: 'overpayment',
         message: `That is more than the ${salaryCurrency} ${(payableFloor - alreadyPaid).toFixed(2)} still owed on this payslip.`,
         dueAmount: round2(Math.max(payableFloor - alreadyPaid, 0)),
         excess: round2(nextPaid - payableFloor),
         currency: salaryCurrency,
-      });
+      } };
     }
 
     const totals = computeSalaryTotals({
@@ -2092,7 +2092,7 @@ exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
     salary.paymentStatus = totals.paymentStatus;
     await salary.save();
 
-    await OwnerOperatorFinancialRecord.create({
+    const record = await OwnerOperatorFinancialRecord.create({
       tenantId,
       company: req.user?.company?._id || req.user?.company || null,
       ownerOperator: salary.ownerOperator,
@@ -2131,7 +2131,24 @@ exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
       details: { amount: convertedAmount, inputAmount: amount, inputCurrency, notes },
     });
 
-    return res.json({ status: true, salary, message: 'Salary payment updated' });
+    return { ok: true, salary, record };
+}
+exports.recordOwnerPaymentCore = recordOwnerPaymentCore;
+
+exports.updateSalaryPayment = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasOwnerOperatorAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to update salary payment' });
+    }
+    const result = await recordOwnerPaymentCore(req, {
+      salaryId: req.params.id,
+      amount: req.body?.amount,
+      currency: req.body?.currency,
+      notes: req.body?.notes,
+      allowOverpay: !!req.body?.allowOverpay,
+    });
+    if (!result.ok) return res.status(result.status).json(result.body);
+    return res.json({ status: true, salary: result.salary, message: 'Salary payment updated' });
   } catch (err) {
     JSONerror(res, err, next);
     logger(err);
@@ -3189,18 +3206,16 @@ exports.updateSalaryPaymentRecord = catchAsync(async (req, res, next) => {
   }
 });
 
-exports.removeSalaryPaymentRecord = catchAsync(async (req, res, next) => {
-  try {
-    if (!hasOwnerOperatorAccess(req)) {
-      return res.status(403).json({ status: false, message: 'You are not allowed to delete payments' });
-    }
+// Reverse one recorded owner payment — shared by the endpoint and by removing
+// a cheque application.
+async function removeOwnerPaymentRecordCore(req, recordId) {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant could not be resolved' });
+    if (!tenantId) return { ok: false, status: 400, body: { status: false, message: 'Tenant could not be resolved' } };
 
-    const record = await OwnerOperatorFinancialRecord.findOne({ _id: req.params.id, tenantId, type: 'SALARY_PAYMENT' });
-    if (!record) return res.status(404).json({ status: false, message: 'Payment not found' });
+    const record = await OwnerOperatorFinancialRecord.findOne({ _id: recordId, tenantId, type: 'SALARY_PAYMENT' });
+    if (!record) return { ok: false, status: 404, body: { status: false, message: 'Payment not found' } };
     const salary = await OwnerOperatorSalary.findOne({ _id: record.salary, tenantId });
-    if (!salary) return res.status(404).json({ status: false, message: 'Payslip not found for this payment' });
+    if (!salary) return { ok: false, status: 404, body: { status: false, message: 'Payslip not found for this payment' } };
 
     const before = salary.toObject();
     const amount = round2(record.amount);
@@ -3221,7 +3236,18 @@ exports.removeSalaryPaymentRecord = catchAsync(async (req, res, next) => {
       details: { paymentId: record._id, amount, currency: record.currency, notes: record.notes },
     });
 
-    return res.json({ status: true, message: 'Payment reversed', salary, totals });
+    return { ok: true, salary, totals };
+}
+exports.removeOwnerPaymentRecordCore = removeOwnerPaymentRecordCore;
+
+exports.removeSalaryPaymentRecord = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasOwnerOperatorAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to delete payments' });
+    }
+    const result = await removeOwnerPaymentRecordCore(req, req.params.id);
+    if (!result.ok) return res.status(result.status).json(result.body);
+    return res.json({ status: true, message: 'Payment reversed', salary: result.salary, totals: result.totals });
   } catch (err) {
     JSONerror(res, err, next);
     logger(err);

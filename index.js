@@ -53,6 +53,8 @@ app.use("", require('./routes/fleetRoutes'));
 app.use("", require('./routes/ownerOperatorRoutes'));
 app.use("", require('./routes/tripRoutes'));
 app.use("", require('./routes/searchRoutes'));
+app.use("", require('./routes/chequeRoutes'));
+app.use("", require('./routes/fuelPriceRoutes'));
 app.use("/api/migration", require('./routes/migrationRoutes'));
 app.use("/api/tenant-admin", require('./routes/tenantAdmin'));
 app.use("/api/super-admin", require('./routes/superAdmin'));
@@ -171,9 +173,12 @@ app.post("/upload/employee/doc/:id", validateToken, multerParse.fields([{name: "
       if (!employee) {
         return res.status(404).json({ status: false, message: "Employee not found" });
       }
+      const docMeta = require('./controllers/docController').parseDocMeta(req.body);
+      if (docMeta.error) return res.status(400).json({ status: false, message: docMeta.error });
       const uploadResponse = await fileupload(attachment);
       if (uploadResponse) {
         const file = new EmployeeDoc({
+          ...docMeta.fields,
           name: uploadResponse.file.originalname,
           mime: uploadResponse.mime,
           filename: uploadResponse.filename,
@@ -193,6 +198,11 @@ app.post("/upload/employee/doc/:id", validateToken, multerParse.fields([{name: "
             status:true
           });
         }
+        require('./utils/activityLogger').logChange(req, {
+          model: 'EmployeeDoc', module: 'employees', action: 'CREATE', after: fileupoaded.toObject(),
+          description: `Uploaded ${fileupoaded.docType || 'document'}${fileupoaded.docNumber ? ` ${fileupoaded.docNumber}` : ''} (employee)`,
+          resourceId: fileupoaded._id, resourceName: fileupoaded.docNumber || fileupoaded.name || String(fileupoaded._id),
+        });
         return res.status(201).json({
           message: "Document uploaded successfully.",
           file_data: fileupoaded,

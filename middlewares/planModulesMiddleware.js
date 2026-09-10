@@ -1,8 +1,9 @@
 const catchAsync = require('../utils/catchAsync');
 const AppError = require('../utils/AppError');
-const SubscriptionPlan = require('../db/SubscriptionPlan');
 const Tenant = require('../db/Tenant');
 const { isSubscriptionActive } = require('../utils/subscription');
+const { planModulesFor } = require('../utils/orderModules');
+const { deriveOrderTypeFromPayload } = require('../utils/orderParty');
 
 const valid = ['outsourcing', 'regular'];
 
@@ -26,29 +27,9 @@ const requireActiveSubscription = catchAsync(async (req, res, next) => {
   });
 });
 
-const resolvePlanModules = async (req) => {
-  const fromTenant = req.tenant?.subscription?.allowedModules;
-  if (Array.isArray(fromTenant) && fromTenant.length > 0) {
-    return fromTenant.map((m) => String(m).toLowerCase()).filter((m) => valid.includes(m));
-  }
-
-  const planRef = req.tenant?.subscription?.plan || req.tenant?.subscription?.planSlug || null;
-  if (!planRef) return [];
-
-  let planRecord = null;
-  if (typeof planRef === 'string') {
-    planRecord = await SubscriptionPlan.findOne({ slug: planRef }).lean();
-  } else {
-    planRecord = await SubscriptionPlan.findById(planRef).lean();
-  }
-
-  const mods = planRecord?.allowedModules;
-  if (Array.isArray(mods) && mods.length > 0) {
-    return mods.map((m) => String(m).toLowerCase()).filter((m) => valid.includes(m));
-  }
-
-  return [];
-};
+// Modules the tenant's PLAN permits. The plan no longer restricts them — see
+// utils/orderModules.js for why. Kept so both gates below read from one place.
+const resolvePlanModules = async (req) => planModulesFor(req?.tenant);
 
 /**
  * Shared helper: compute effective modules for the current user.
@@ -93,7 +74,11 @@ const resolveAllowedModulesMiddleware = catchAsync(async (req, res, next) => {
  */
 const checkOrderModuleAccess = () => {
   return catchAsync(async (req, res, next) => {
-    const orderTypeRaw = String(req.body?.order_type || 'outsourcing').toLowerCase();
+    // The type is read from what the payload actually contains (a carrier, or a truck/driver), not
+    // from a field the client declares — the same rule create_order stamps the order with. A client
+    // that sent only `order_type` still works: it is the fallback.
+    const derived = deriveOrderTypeFromPayload(req.body);
+    const orderTypeRaw = String(derived || req.body?.order_type || 'outsourcing').toLowerCase();
     const requested = valid.includes(orderTypeRaw) ? orderTypeRaw : 'outsourcing';
 
     const effective = await computeEffectiveModules(req);
@@ -123,14 +108,9 @@ const requireModuleAccess = (moduleKey, extraPerms = []) => {
     // Platform super admin always bypasses.
     if (req.isSuperAdminUser || req.user?.permissions?.includes('super_admin')) return next();
 
-    // Gate 1 (plan-level): the module must be part of the tenant's PLAN.
-    // Applies to everyone in the tenant — admin included — so a plan without a
-    // module fully disables it, not just order creation.
-    const planModulesRaw = await resolvePlanModules(req);
-    const planModules = planModulesRaw.length ? planModulesRaw : [...valid]; // backward-compat
-    if (!planModules.includes(requested)) {
-      return next(new AppError(`Module "${requested}" is not included in this company's plan.`, 403));
-    }
+    // Gate 1 (plan-level) is gone: a subscription plan meters seats and orders, not which kind of
+    // work a company may record (utils/orderModules.js). Gate 2 — the per-user module permission —
+    // is unchanged and is what actually scopes a dispatcher to their own work.
 
     const perms = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
 

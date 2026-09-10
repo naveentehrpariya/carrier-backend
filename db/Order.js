@@ -43,6 +43,33 @@ const schema = new mongo.Schema({
     // truck). Settlement is then per trip: `ownerOperator` is null and `ownerOperators` lists every
     // owner with a leg on this order.
     isMixedOwner: { type: Boolean, default: false, index: true },
+    // WHO GETS PAID, read from the legs — see utils/orderParty.js.
+    // `order_type` above is no longer typed in by a dispatcher; it is a stamped reading of these.
+    // A mixed order (a carrier leg AND a fleet leg) is stamped `regular` and flagged here, because
+    // `regular` is the branch that does not assume a single carrier owning the whole order.
+    // Subset of ['company','owner','carrier'], always in that order.
+    order_parties: { type: [String], default: [], index: true },
+    isMixedType: { type: Boolean, default: false, index: true },
+    // Every outside carrier with a leg on this order. `carrier` below stays a single id ONLY while
+    // there is exactly one; with several it is null and this is the list — the same convention
+    // `ownerOperator` / `ownerOperators` already uses.
+    carriers: { type: [mongoose.Schema.Types.ObjectId], ref: 'carriers', default: [], index: true },
+    // (There is deliberately no `isMixedCarrier` column. "More than one carrier" is
+    //  `carriers.length > 1` — the same document already says it, so storing it again is one more
+    //  thing that can disagree with the legs. Read it with orderParty.hasMultipleCarriers(order);
+    //  query it as { 'carriers.1': { $exists: true } }.)
+
+    // THE ORDER'S TOTAL OUTSIDE COST — what leaves the company for this load, whoever it goes to:
+    // the carrier legs plus the owner-operator settlement. `carrier_amount` below is the carrier
+    // share alone and `settle_amount` the owner share alone; on an order with only one kind of leg
+    // this equals the one that applies, which is exactly what every existing report already reads,
+    // so pointing a reader here changes nothing for legacy data and fixes it for a mixed order.
+    // `cost_amount` is base currency; `input_cost_amount` is the currency it was typed in.
+    cost_amount: { type: Number, default: 0 },
+    input_cost_amount: { type: Number, default: 0 },
+    // Share of the route (by miles) that outside carriers run, 0..1. Only meaningful on a mixed
+    // order, where staff commission is earned on the brokered part of the revenue alone.
+    carrier_ratio: { type: Number, default: 0 },
     ownerOperators: [{ type: mongoose.Schema.Types.ObjectId, ref: 'owneroperators' }],
     isOwnerOperatedTruck: { type: Boolean, default: false, index: true },
     settle_amount: { type: Number, default: 0 },
@@ -101,18 +128,24 @@ const schema = new mongo.Schema({
         type: mongoose.Schema.Types.ObjectId, ref: 'users',
     },
     // Carrier
+    // An order split across TWO carriers has no single carrier: `carrier` is null and `carriers`
+    // above holds the list. Requiring the single column would then reject the save outright — the
+    // order is perfectly well described, just not by one id. Same convention, and the same fix, as
+    // `ownerOperator` / `ownerOperators` on a mixed-owner order.
     carrier: { 
         type: mongoose.Schema.Types.ObjectId, ref: 'carriers',
         required:[function() { 
             const type = this.order_type;
-            return type === 'outsourcing';
+            if (type !== 'outsourcing') return false;
+            return !(Array.isArray(this.carriers) && this.carriers.length > 0);
         }, 'Please enter carrier details.'],
     }, 
     carrier_amount:  {
         type:Number,
         required:[function() { 
             const type = this.order_type;
-            return type === 'outsourcing';
+            if (type !== 'outsourcing') return false;
+            return !(Array.isArray(this.carriers) && this.carriers.length > 0);
         }, 'Please enter carrier amount.'],
     },
     totalDistance : { 
@@ -234,6 +267,22 @@ schema.query.notDeleted = function () {
 
 schema.virtual('commission').get(function () {
     const totalAmount = this.total_amount || 0;
+    // MIXED ORDER — part brokered to a carrier, part run on our own equipment.
+    // Commission is earned on brokered work only: it is the margin between what the customer pays
+    // and what an outside carrier is paid. A leg we ran ourselves has no broker margin, so only the
+    // revenue attributable to the carrier legs counts. `carrier_ratio` is those legs' share of the
+    // route, which is the same basis the owner side uses to attribute revenue to a leg.
+    // Deliberately placed BEFORE the branches below so that every existing (non-mixed) order keeps
+    // taking exactly the path it always took, to the cent.
+    if (this.isMixedType) {
+        const staffRate = this.created_by?.staff_commision || 0;
+        if (staffRate <= 0) return 0;
+        const ratio = Math.min(Math.max(Number(this.carrier_ratio || 0), 0), 1);
+        if (ratio <= 0) return 0;
+        const brokeredRevenue = totalAmount * ratio;
+        const netBrokered = brokeredRevenue - (this.carrier_amount || 0);
+        return netBrokered * (staffRate / 100);
+    }
     if (this.order_type !== 'outsourcing') return 0;
     const staffCommissionRate = this.created_by?.staff_commision || 0;
     // Commission is calculated on net profit (customer rate - carrier cost), not the total.
@@ -252,6 +301,13 @@ schema.virtual('carrier_final_payment_status').get(function () {
 
 schema.virtual('profit').get(function () {
     const totalAmount = this.total_amount || 0;
+    // MIXED ORDER — the cost is no longer whichever single column the type points at. It is what
+    // every leg's party is owed: the carrier legs plus the owner settlement, which is exactly what
+    // `cost_amount` holds (utils/orderCost.js). As above, this branch is first so no existing order
+    // changes its arithmetic.
+    if (this.isMixedType) {
+        return totalAmount - Number(this.cost_amount || 0) - Number(this.commission || 0);
+    }
     const isOutsourcing = this.order_type === 'outsourcing';
     const isOwnerOperated = this.order_type === 'regular' && this.isOwnerOperatedTruck;
     if (isOwnerOperated) {

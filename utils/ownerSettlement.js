@@ -31,6 +31,11 @@ function resolveOrderOwnerState(trips, truckMap) {
   const owners = [];
   let hasCompanyLeg = false;
   (trips || []).forEach((trip) => {
+    // A leg handed to an outside carrier is not one of OUR settlement parties — it is not a company
+    // leg and it is not an owner's. Counting it as a company leg made a single-owner order look
+    // "mixed owner", which drops `ownerOperator` to null and switches the owner's payslip to
+    // per-leg allocation for a split that has only ever had one owner in it.
+    if (trip?.carrier) return;
     const owner = tripOwnerId(trip, truckMap);
     if (!owner) {
       hasCompanyLeg = true;
@@ -84,17 +89,27 @@ function allocateTripSettle({ order, trips, truckMap }) {
   const rows = (trips || []).map((trip) => ({
     trip,
     ownerId: tripOwnerId(trip, truckMap),
+    // A leg handed to an outside carrier is settled from the CARRIER pot
+    // (utils/carrierSettlement.js), not from this one. Without this it consumed a miles share of
+    // the owner's settlement: on an order split half to our owner and half to a carrier, the owner
+    // was paid half of what the order said, and every re-read halved it again because the shrunken
+    // share was then frozen onto the leg.
+    isCarrierLeg: Boolean(trip?.carrier),
     miles: deriveTripMiles(trip, orderDistanceKm, orderRawTotal),
     override: hasSettleOverride(trip) ? Math.max(Number(trip.settle_amount || 0), 0) : null,
   }));
 
   const remaining = Math.max(Number(pot.amount || 0) - Number(pot.overrideTotal || 0), 0);
-  const autoRows = rows.filter((r) => r.override === null);
+  const autoRows = rows.filter((r) => r.override === null && !r.isCarrierLeg);
   const autoMiles = autoRows.reduce((acc, r) => acc + Math.max(Number(r.miles || 0), 0), 0);
 
   rows.forEach((r) => {
     if (r.override !== null) {
       r.settle = r.override;
+      return;
+    }
+    if (r.isCarrierLeg) {
+      r.settle = 0;
       return;
     }
     if (autoMiles > 0) {

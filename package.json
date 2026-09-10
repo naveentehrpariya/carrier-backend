@@ -5,6 +5,8 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
+    "test:cheques": "node scripts/test-cheques.js",
+    "test:documents": "node scripts/test-documents.js",
     "start": "node index.js",
     "dev": "nodemon index.js",
     "live": "nodemon live.js",
@@ -17,7 +19,10 @@
     "normalize-tenant-ids": "node scripts/normalize-tenant-ids.js",
     "remove-superadmin-permissions": "node scripts/remove-superadmin-permissions.js",
     "test-tenant-login": "node scripts/test-tenant-login.js",
-    "push": "git add . && git commit -m 'update' && git push"
+    "push": "git add . && git commit -m 'update' && git push",
+    "test:fuel-sheets": "node scripts/test-fuel-sheets.js",
+    "test:fuel-api": "node scripts/test-fuel-api.js",
+    "test:fuel": "node scripts/test-fuel-sheets.js && node scripts/test-fuel-api.js"
   },
   "author": "",
   "license": "ISC",
@@ -63,6 +68,7 @@
     "openai": "^3.3.0",
     "paypal": "^1.0.1",
     "paypal-rest-sdk": "^1.8.1",
+    "pdfjs-dist": "^3.11.174",
     "puppeteer": "^24.10.2",
     "pusher": "^5.1.2",
     "pusher-js": "^8.0.2",
@@ -78,6 +84,7 @@
     "uuid": "^10.0.0",
     "validator": "^13.9.0",
     "winston": "^3.13.0",
+    "xlsx": "^0.18.5",
     "youtube-live-streaming": "^1.0.4"
   },
   "devDependencies": {

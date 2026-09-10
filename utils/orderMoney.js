@@ -96,14 +96,42 @@ function orderMoneyIn(order, fx) {
   const carrierAmount = fx.convertOrder(order, 'input_carrier_amount', 'carrier_amount', date);
   const settle = fx.convertOrder(order, 'input_settle_amount', 'settle_amount', date);
 
+  const rate = Number(order?.created_by?.staff_commision) || 0;
+
+  // MIXED ORDER — legs on our own equipment AND legs handed to an outside carrier. The cost is what
+  // every leg's party is owed, and commission is earned on the brokered part alone (see the Order
+  // model's virtuals and utils/orderCost.js — this must give the same answer, converted).
+  // Placed first so every existing order keeps taking exactly the branch it always took.
+  if (order?.isMixedType) {
+    const ratio = Math.min(Math.max(Number(order?.carrier_ratio || 0), 0), 1);
+    const commissionMixed = ratio > 0 ? (revenue * ratio - carrierAmount) * (rate / 100) : 0;
+    const costMixed = carrierAmount + settle;
+    return {
+      currency: fx.target,
+      revenue,
+      carrierAmount,
+      carrierCost: carrierAmount,
+      settle,
+      // The order's TOTAL outside cost. On a mixed order neither column is the cost on its own,
+      // and a report that reads one of them understates what the load actually cost.
+      cost: costMixed,
+      commission: commissionMixed,
+      profit: revenue - costMixed - commissionMixed,
+    };
+  }
+
   const isOutsourcing = order?.order_type === 'outsourcing';
   const isOwnerOperated = order?.order_type === 'regular' && !!order?.isOwnerOperatedTruck;
   const carrierCost = isOutsourcing ? carrierAmount : 0;
-  const rate = Number(order?.created_by?.staff_commision) || 0;
   const commission = isOutsourcing ? (revenue - carrierCost) * (rate / 100) : 0;
   const profit = isOwnerOperated ? (revenue - settle) : (revenue - carrierCost - commission);
 
-  return { currency: fx.target, revenue, carrierAmount, carrierCost, settle, commission, profit };
+  // `cost` is what left the company for this load, whichever column holds it. On a non-mixed order
+  // that is exactly the column the reports already read, so switching a reader to it is a no-op for
+  // existing data and correct for a mixed one.
+  const cost = isOwnerOperated ? settle : carrierCost;
+
+  return { currency: fx.target, revenue, carrierAmount, carrierCost, settle, cost, commission, profit };
 }
 
 // $addFields stage for aggregations: exposes the exact typed revenue (`_exactAmount`) and the

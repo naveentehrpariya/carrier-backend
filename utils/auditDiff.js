@@ -61,6 +61,7 @@ const AUDIT_FIELDS = {
   DriverProfile: [
     'ratePerMile', 'ratePerMileSolo', 'ratePerMileTeam',
     'cityHoursRate', 'rateCurrency',
+    'taxEnabled', 'taxNumber', 'taxCompanyName', 'taxRate',
   ],
   DriverSalary: [
     'basePayable', 'previousDueAdded', 'previousOwedDeducted',
@@ -68,6 +69,7 @@ const AUDIT_FIELDS = {
     'finalPayable', 'paidAmount', 'dueAmount', 'owedAmount', 'overpaidAmount', 'paymentStatus',
     'soloRate', 'teamRate', 'cityRate', 'rateCurrency', 'currency',
     'totalMiles', 'totalTripPay', 'deductionTotal', 'additionTotal',
+    'taxEnabled', 'taxRate', 'taxableBase', 'taxAmount', 'payableBeforeTax',
   ],
   DriverDeduction: [
     'amount', 'currency', 'type', 'direction', 'date', 'note', 'description',
@@ -94,6 +96,9 @@ const AUDIT_FIELDS = {
   // `paid_by`/`driver` decide whether a driver gets reimbursed for this receipt, so they
   // move money exactly like the amount does.
   TruckExpense: ['amount', 'currency', 'category', 'type', 'date', 'truck', 'description', 'paid_by', 'driver', 'deletedAt'],
+  // A licence/RC expiry decides whether compliance alerts fire — silently editing it hides an expired doc.
+  FleetDoc: ['docType', 'docTypeLabel', 'docNumber', 'docFields', 'issueDate', 'expiryDate', 'name', 'type', 'entityId', 'deletedAt'],
+  EmployeeDoc: ['docType', 'docTypeLabel', 'docNumber', 'docFields', 'issueDate', 'expiryDate', 'name', 'user', 'deletedAt'],
   // An FX row rewrites every historical report that converts through it.
   ConversionRate: ['rate', 'source', 'target', 'month', 'year'],
   Users: [
@@ -120,6 +125,21 @@ const AUDIT_FIELDS = {
   SubscriptionPlan: [
     'name', 'slug', 'monthlyPrice', 'currency', 'discounts',
     'maxOrders', 'maxUsers', 'modules', 'isActive',
+  ],
+  Vendor: ['name', 'code', 'phone', 'email', 'address', 'city', 'state', 'country', 'zipcode', 'deletedAt'],
+  // Fuel pricing. A margin rule decides what a customer is charged, and an expiry-
+  // style silent edit to it would change every sheet published afterwards with no
+  // trace of what the old margin was.
+  FuelPriceSheet: ['vendor', 'unit', 'currency', 'dp', 'baseColumn', 'effectiveDate', 'effectiveTo', 'sheetName', 'status', 'deletedAt'],
+  FuelMarginProfile: ['name', 'vendor', 'unit', 'customer', 'rules', 'taxMode', 'roundingDp', 'showVendorCost', 'deletedAt'],
+  FuelSheetOutput: ['sheet', 'profile', 'customer', 'title', 'version', 'unit', 'currency', 'dp', 'effectiveDate', 'showVendorCost', 'status', 'supersededBy', 'deletedAt'],
+  BankAccount: ['name', 'bankName', 'accountNo', 'currency', 'chequeStart', 'active', 'printMode', 'chequePosition', 'chequeHeightIn', 'offsetXmm', 'offsetYmm', 'printChequeNumber', 'dateFormat', 'deletedAt'],
+  // An application decides which order/payslip a cheque paid — moving it moves money.
+  ChequeApplication: ['cheque', 'chequeNo', 'targetType', 'targetId', 'targetLabel', 'amount', 'currency', 'deletedAt'],
+  // A cheque is money leaving the building — every field on it is evidence.
+  PaymentCheque: [
+    'payeeType', 'payeeId', 'payeeName', 'chequeNo', 'referenceNo', 'bankAccount',
+    'amount', 'currency', 'paymentDate', 'status', 'voidReason', 'bounceReason', 'note', 'deletedAt',
   ],
 };
 

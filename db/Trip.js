@@ -40,6 +40,27 @@ const tripSchema = new mongoose.Schema({
     // Owner-operator settlement for this leg, typed by the admin in the ORDER's input currency.
     // null = derive it from the order's settle amount by miles share (see utils/ownerSettlement.js).
     settle_amount: { type: Number, default: null },
+
+    // WHAT AN OUTSIDE CARRIER IS OWED FOR THIS LEG — the exact mirror of settle_amount above, in the
+    // ORDER's input currency. null = derive it from the order's carrier amount by miles share
+    // (see utils/carrierSettlement.js). Only meaningful when `carrier` is set on this leg.
+    //
+    // An order can now be split across our own truck AND an outside carrier, so the cost of a load
+    // is no longer one number on the order. It is the sum of what each leg's party is owed.
+    carrier_amount: { type: Number, default: null },
+    // Per-leg cost lines, same shape as Order.carrier_revenue_items. Rates are stored in the order's
+    // input currency (not base) — the leg amount is what gets converted, once, at settlement time.
+    carrier_revenue_items: { type: Array, default: [] },
+
+    // Carrier payment is per LEG, because an order can have two carriers and one of them can be paid
+    // while the other is not. The order's own carrier_payment_status is DERIVED from these
+    // (all paid -> paid, some paid -> partial, none -> pending) so every existing reader keeps
+    // working against the order.
+    carrier_payment_status: { type: String, default: 'pending' },
+    carrier_payment_date: { type: Date },
+    carrier_payment_method: { type: String },
+    carrier_payment_notes: { type: String },
+    carrier_payment_updated_by: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
     
     status: {
         type: String,

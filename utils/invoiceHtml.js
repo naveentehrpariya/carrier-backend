@@ -9,6 +9,8 @@
 // Markup mirrors frontend/src/pages/dashboard/order/CustomerInvoice.jsx so the download matches
 // what the page shows.
 
+const { getOrderNumber } = require('./orderNumber');
+
 const CUR_SYMBOL = { USD: '$', CAD: 'C$', INR: '₹' };
 
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
@@ -95,9 +97,11 @@ function stopBlock(loc, kind, num) {
     </div>`;
 }
 
-function buildCustomerInvoiceHtml({ order, company, invoiceNo, issuedAt = new Date(), logoBase64 = '' }) {
+function buildCustomerInvoiceHtml({ order, company, invoiceNo, issuedAt = new Date(), logoBase64 = '', tenantId = '' }) {
   const { currency, factor, total } = invoiceAmounts(order);
-  const orderNo = `#CMC${order?.serial_no ?? ''}`;
+  // Was hardcoded `#CMC<serial>`, so every tenant's invoice carried one particular company's
+  // prefix. `Company.order_prefix` exists exactly so a company's paperwork carries its own mark.
+  const orderNo = `#${getOrderNumber({ order, company, tenantId })}`;
 
   const shipping = (Array.isArray(order?.shipping_details) ? order.shipping_details : []).map((s) => {
     const meta = [

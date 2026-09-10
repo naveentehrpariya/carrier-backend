@@ -5,11 +5,14 @@ const { resolveTenant } = require('../middleware/tenant');
 const driverController = require('../controllers/driverController');
 const driverDeductionController = require('../controllers/driverDeductionController');
 const driverSalaryController = require('../controllers/driverSalaryController');
+const { requireDriverWriteAccess } = require('../middlewares/driverAccessMiddleware');
 
-router.route('/driver/add').post(validateToken, resolveTenant, driverController.addDriver);
-router.route('/driver/edit/:id').post(validateToken, resolveTenant, driverController.editDriver);
+// Driver writes carry pay rates, the locked pay currency and the HST registration — see
+// middlewares/driverAccessMiddleware.js. Reads stay open: every driver picker in the app uses them.
+router.route('/driver/add').post(validateToken, resolveTenant, requireDriverWriteAccess, driverController.addDriver);
+router.route('/driver/edit/:id').post(validateToken, resolveTenant, requireDriverWriteAccess, driverController.editDriver);
 router.route('/driver/listings').get(validateToken, resolveTenant, driverController.driversLists);
-router.route('/driver/remove/:id').get(validateToken, resolveTenant, driverController.removeDriver);
+router.route('/driver/remove/:id').get(validateToken, resolveTenant, requireDriverWriteAccess, driverController.removeDriver);
 
 // Driver deductions / city hours / bonuses (saved to DB)
 // Literal path — declared before the `/:driverId/...` patterns so it is not read as a driver id.

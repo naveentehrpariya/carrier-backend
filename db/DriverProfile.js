@@ -49,6 +49,15 @@ const driverProfileSchema = new mongoose.Schema({
   ratePerMileSolo: { type: Number, default: 0 },
   ratePerMileTeam: { type: Number, default: 0 },
   cityHoursRate: { type: Number, default: 0 },
+  // Contractor tax (HST/GST). An incorporated driver registered for HST invoices the company
+  // under their corp name and charges tax on top of earnings; the payslip must print the HST
+  // registration number and show totals with and without tax. Absent/false = legacy behavior.
+  // taxRate is a percent (13 = 13% Ontario HST); per-driver because GST provinces are 5%.
+  // Editable later — payslips snapshot these at generate time, so old statements never move.
+  taxEnabled: { type: Boolean, default: false },
+  taxNumber: { type: String, trim: true, default: '' },
+  taxCompanyName: { type: String, trim: true, default: '' },
+  taxRate: { type: Number, default: 13, min: 0, max: 100 },
   licenseNumber: { type: String },
   licenseState: { type: String },
   licenseIssueDate: { type: Date },

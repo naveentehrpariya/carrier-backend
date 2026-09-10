@@ -114,8 +114,11 @@ router.post(
       const entityId = req.params.id;
       const attachment = req.files?.attachment?.[0];
       if (!attachment) return res.status(400).json({ status: false, message: 'No file uploaded' });
+      const meta = require('../controllers/docController').parseDocMeta(req.body);
+      if (meta.error) return res.status(400).json({ status: false, message: meta.error });
       const uploadResponse = await fileupload(attachment);
       const file = await FleetDoc.create({
+        ...meta.fields,
         tenantId: req.tenantId,
         type: 'owner_operator',
         entityId,
@@ -125,6 +128,11 @@ router.post(
         url: uploadResponse.url,
         size: uploadResponse.size,
         added_by: req.user._id,
+      });
+      require('../utils/activityLogger').logChange(req, {
+        model: 'FleetDoc', module: 'fleet', action: 'CREATE', after: file.toObject(),
+        description: `Uploaded ${file.docType || 'document'}${file.docNumber ? ` ${file.docNumber}` : ''} (owner operator)`,
+        resourceId: file._id, resourceName: file.docNumber || file.name || String(file._id),
       });
       return res.status(201).json({ status: true, message: 'Document uploaded successfully', file_data: file });
     } catch (error) {

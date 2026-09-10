@@ -4,9 +4,17 @@ const { validateToken } = require('../controllers/multiTenantAuthController');
 const { resolveTenant } = require('../middleware/tenant');
 const tripController = require('../controllers/tripController');
 const { requireTripWriteAccess } = require('../middlewares/tripAccessMiddleware');
+const { resolveAllowedModulesMiddleware } = require('../middlewares/planModulesMiddleware');
 
 router.route('/order/split').post(validateToken, resolveTenant, requireTripWriteAccess, tripController.splitOrder);
 router.route('/order/trips/:orderId').get(validateToken, resolveTenant, tripController.getOrderTrips);
+
+// Per-LEG rate confirmation. Rendered on the server from the ids (see the note on the controller):
+// a rate confirmation is a contract with ONE carrier for the work THEY do, and an order can now be
+// split across several. `resolveAllowedModulesMiddleware` so the leg is scoped to the caller's
+// modules exactly like the order detail it belongs to.
+router.route('/order/:orderId/leg/:tripId/rate-confirmation/pdf')
+  .get(validateToken, resolveTenant, resolveAllowedModulesMiddleware, tripController.legRateConfirmationPdf);
 router.route('/trip/update/:tripId').put(validateToken, resolveTenant, requireTripWriteAccess, tripController.updateTrip);
 router.route('/driver/:driverId/trips').get(validateToken, resolveTenant, tripController.getDriverTrips);
 router.route('/driver/:driverId/trips/logs').get(validateToken, resolveTenant, tripController.getDriverTripLogs);

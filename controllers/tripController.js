@@ -3,6 +3,7 @@ const Order = require('../db/Order');
 const User = require('../db/Users');
 const DriverProfile = require('../db/DriverProfile');
 const Truck = require('../db/Truck');
+const Company = require('../db/Company');
 const TruckExpense = require('../db/TruckExpense');
 const IgnoredEmptyMove = require('../db/IgnoredEmptyMove');
 const EmptyMoveNote = require('../db/EmptyMoveNote');
@@ -10,6 +11,12 @@ const mongoose = require('mongoose');
 const { logActivity, logChange } = require('../utils/activityLogger');
 const { MI_PER_KM, KM_PER_MI, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { resolveOrderOwnerFields, syncOwnerFinancialRecords, resolveSettlePot } = require('../utils/ownerSettlement');
+const {
+    resolveOrderCarrierFields, resolveOrderCarrierState, resolveCarrierPot,
+} = require('../utils/carrierSettlement');
+const { resolveOrderCostFields } = require('../utils/orderCost');
+const { resolveOrderState } = require('../utils/orderParty');
+const { resyncOrderFromLegs, loadOrderLegsAndTrucks } = require('../utils/orderFromLegs');
 const { createOrderFxConverter, resolveDisplayCurrency, pickOrderAmount } = require('../utils/orderMoney');
 const { resolveRouteDistance } = require('../utils/routeDistance');
 const driverSalaryController = require('./driverSalaryController');
@@ -117,6 +124,82 @@ function resolveRange(from, to) {
     return { start, end };
 }
 
+
+/**
+ * Changing WHO runs a leg after somebody has been paid for it rewrites history.
+ *
+ * A driver payslip is built from the legs; an owner settlement is allocated across them; a carrier
+ * is paid against theirs. Once any of that has happened, moving a leg from our truck to a carrier
+ * (or the reverse) silently changes what those documents were built from, and nothing on screen
+ * says the numbers no longer match the paperwork in someone's hand.
+ *
+ * This is the same rule `distanceEditBlockers` applies to the order's distance, for the same
+ * reason. It is deliberately checked on the SET of settlement parties rather than per leg: a split
+ * deletes and recreates every trip, so leg identity does not survive the operation — but "this
+ * order used to be settled to an owner and a carrier, and now it is settled to two carriers" is
+ * exactly the change that must not pass unnoticed.
+ *
+ * @returns {Promise<{blocked: boolean, code?: string, blockers?: string[]}>}
+ */
+async function legPartyChangeBlockers({ tenantId, order, segments, truckMap }) {
+    const none = { blocked: false };
+
+    const existingLegs = await Trip.find({ tenantId, order: order._id, deletedAt: null })
+        .select('_id truck carrier carrier_payment_status').lean();
+    if (!existingLegs.length) return none; // nothing has been settled against yet
+
+    // The caller's truckMap only holds the INCOMING segments' trucks. An existing leg on a truck
+    // that is not in the new segments would then fall through to a `truck:<id>` key while the same
+    // party expressed through a different truck resolves to `company` — so moving a load from one
+    // company truck to another read as a party change and 409'd a perfectly ordinary edit. Resolve
+    // every truck on both sides before comparing.
+    const parties = new Map(truckMap);
+    const unknown = existingLegs
+        .map((l) => String(l.truck || ''))
+        .filter((id) => id && !parties.has(id));
+    if (unknown.length) {
+        const rows = await Truck.find({ _id: { $in: [...new Set(unknown)] }, tenantId })
+            .select('ownerOperated ownerOperator').lean();
+        rows.forEach((t) => parties.set(String(t._id), t));
+    }
+
+    const partyKey = (leg) => {
+        if (leg?.carrier) return `carrier:${String(leg.carrier)}`;
+        const truck = parties.get(String(leg?.truck || ''));
+        // A truck that no longer exists cannot be resolved to a party. Treat it as its own key
+        // rather than as `company`: guessing here would either hide a real change or invent one.
+        if (!truck) return leg?.truck ? `truck:${String(leg.truck)}` : 'none';
+        return (truck.ownerOperated && truck.ownerOperator)
+            ? `owner:${String(truck.ownerOperator)}`
+            : 'company';
+    };
+
+    const before = [...new Set(existingLegs.map(partyKey))].sort();
+    const after = [...new Set((segments || []).map(partyKey))].sort();
+    const sameParties = before.length === after.length && before.every((v, i) => v === after[i]);
+    if (sameParties) return none;
+
+    // Only now is it worth asking whether money has moved.
+    const DriverSalary = require('../db/DriverSalary');
+    const OwnerOperatorFinancialRecord = require('../db/OwnerOperatorFinancialRecord');
+    const [salaryCount, settledCount] = await Promise.all([
+        DriverSalary.countDocuments({ tenantId, 'orderBreakdown.order': order._id }),
+        OwnerOperatorFinancialRecord.countDocuments({ tenantId, order: order._id, paymentStatus: { $ne: 'pending' } }),
+    ]);
+    const paidCarrierLegs = existingLegs.filter(
+        (l) => l.carrier && String(l.carrier_payment_status || 'pending').toLowerCase() !== 'pending');
+
+    const blockers = [];
+    if (salaryCount > 0) blockers.push('This order is already on a generated driver payslip.');
+    if (settledCount > 0) blockers.push('An owner operator has already been paid for this order.');
+    if (paidCarrierLegs.length > 0) {
+        blockers.push(`${paidCarrierLegs.length} carrier leg(s) on this order have already been paid.`);
+    }
+    if (!blockers.length) return none;
+
+    return { blocked: true, code: 'leg_party_locked', blockers };
+}
+
 exports.splitOrder = async (req, res) => {
     try {
         const { orderId, segments } = req.body;
@@ -130,8 +213,11 @@ exports.splitOrder = async (req, res) => {
         // An order may be split across an owner's truck, a second owner's truck and a company truck.
         // Settlement is then per trip (see utils/ownerSettlement.js): each owner is paid only for the
         // legs their trucks ran. Validate the trucks exist and that the owner legs actually carry money.
+        // Gated on the SEGMENTS, not on order.order_type. The type is now a reading of the legs
+        // (utils/orderParty.js), so an order that was booked as outsourcing can legitimately arrive
+        // here with a fleet leg on it — that is exactly how a mixed order comes into existence.
         const truckMap = new Map();
-        if (order.order_type === 'regular') {
+        {
             const truckIds = [...new Set((segments || []).map(s => s.truck).filter(Boolean).map(String))];
             if (truckIds.length > 0) {
                 const trucksInUse = await Truck.find({ _id: { $in: truckIds }, tenantId })
@@ -192,17 +278,83 @@ exports.splitOrder = async (req, res) => {
         }
 
         // Owner legs must actually carry money: an owner whose settle share is zero would be paid
-        // nothing for the miles they ran. Check on the incoming segments, before any trip is written.
+        // nothing for the miles they ran. Same for a carrier leg. Check on the incoming segments,
+        // before any trip is written.
+        //
+        // Both settlement sides are resolved from ONE set of segment stand-ins, so the owner pot and
+        // the carrier pot are always read from the same legs. See utils/orderCost.js.
+        const segTrips = (segments || []).map((seg, i) => ({
+            _id: `seg-${i}`,
+            truck: seg.truck,
+            carrier: seg.carrier,
+            miles: Number(seg.miles || seg.totalDistance || 0),
+            totalDistance: Number(seg.totalDistance || seg.miles || 0),
+            total_km: Number(seg.total_km || 0),
+            settle_amount: normalizeSegmentSettle(seg.settle_amount),
+            carrier_amount: normalizeSegmentSettle(seg.carrier_amount),
+        }));
+        const carrierState = resolveOrderCarrierState(segTrips);
+        const hasFleetLeg = segTrips.some((t) => t.truck);
+
+        // A leg has to say who runs it. Without a truck and without a carrier there is nobody to pay
+        // and nobody to bill, and the leg would silently drop out of every settlement.
+        {
+            const orphanLegs = segTrips
+                .map((t, i) => (!t.truck && !t.carrier ? i + 1 : null))
+                .filter(Boolean);
+            if (orphanLegs.length > 0 && segTrips.length > 1) {
+                return res.status(400).json({
+                    status: false,
+                    code: 'leg_has_no_party',
+                    message: `Leg ${orphanLegs.join(', ')} has neither a truck nor a carrier. Every leg must say who runs it.`,
+                    legs: orphanLegs,
+                });
+            }
+        }
+
+        // Carrier legs must carry money, and must not claim more than the order's carrier amount.
+        // Mirrors the two owner guards below — a carrier paid nothing for the miles they ran, and a
+        // company paying out more than anyone approved, are the same two failures on the other side.
+        let carrierFields = null;
+        if (carrierState.hasCarrierLeg) {
+            const costErrors = [];
+            (segments || []).forEach((seg, i) => {
+                if (seg.carrier_amount === null || seg.carrier_amount === undefined || seg.carrier_amount === '') return;
+                const v = Number(seg.carrier_amount);
+                if (!Number.isFinite(v) || v < 0) costErrors.push(`Leg ${i + 1}`);
+            });
+            if (costErrors.length > 0) {
+                return res.status(400).json({
+                    status: false,
+                    message: `Carrier amount must be a positive number (${costErrors.join(', ')}).`,
+                });
+            }
+
+            const cpot = resolveCarrierPot(order, segTrips);
+            const callocated = Number(cpot.overrideTotal || 0);
+            if (Number(cpot.amount || 0) > 0 && callocated - Number(cpot.amount) > 0.01) {
+                return res.status(400).json({
+                    status: false,
+                    code: 'carrier_over_allocated',
+                    message: `Leg carrier amounts add up to ${callocated.toFixed(2)} ${cpot.currency}, which is more than this order's carrier amount of ${Number(cpot.amount).toFixed(2)} ${cpot.currency}. Lower a leg amount, or raise the order's carrier amount first.`,
+                    allocated: Math.round(callocated * 100) / 100,
+                    pot: Math.round(Number(cpot.amount) * 100) / 100,
+                    currency: cpot.currency,
+                });
+            }
+
+            carrierFields = resolveOrderCarrierFields({ order, trips: segTrips });
+            if (Number(cpot.amount || 0) <= 0 && callocated <= 0) {
+                return res.status(400).json({
+                    status: false,
+                    code: 'carrier_leg_unpaid',
+                    message: 'This split hands a leg to an outside carrier but has no carrier amount. Enter the amount for each carrier leg (or set it on the order) so the carrier gets paid.',
+                });
+            }
+        }
+
         let ownerFields = null;
-        if (order.order_type === 'regular') {
-            const segTrips = (segments || []).map((seg, i) => ({
-                _id: `seg-${i}`,
-                truck: seg.truck,
-                miles: Number(seg.miles || seg.totalDistance || 0),
-                totalDistance: Number(seg.totalDistance || seg.miles || 0),
-                total_km: Number(seg.total_km || 0),
-                settle_amount: normalizeSegmentSettle(seg.settle_amount),
-            }));
+        if (hasFleetLeg) {
             // Typed leg amounts and the order's settle amount are two claims about the same money.
             // When the legs claim MORE than the pot, allocateTripSettle clamps the remainder to 0,
             // pays every override in full and the order's settle amount is then rewritten upward —
@@ -231,6 +383,40 @@ exports.splitOrder = async (req, res) => {
                 });
             }
         }
+
+        // Nothing below this point is reversible — the legs are deleted and rebuilt — so the
+        // "somebody has already been paid for this" check happens here, last, and refuses outright.
+        const partyLock = await legPartyChangeBlockers({ tenantId, order, segments: segTrips, truckMap });
+        if (partyLock.blocked) {
+            return res.status(409).json({
+                status: false,
+                code: partyLock.code,
+                message: 'Who runs a leg on this order cannot be changed any more — it has already been paid against.',
+                blockers: partyLock.blockers,
+            });
+        }
+
+        /* A carrier already paid must not come back as unpaid. The legs are deleted and rebuilt, so
+           their payment state has to be carried across by CARRIER — the same rule deleteTrip
+           follows when a relay is removed. Keyed by carrier id, because that is who was paid; a
+           leg that changes carrier is a different contract and starts pending (and the party lock
+           above has already refused that case on a paid order). */
+        const paidByCarrier = new Map();
+        (await Trip.find({ order: orderId, tenantId, deletedAt: null })
+            .select('carrier carrier_payment_status carrier_payment_date carrier_payment_method carrier_payment_notes carrier_payment_updated_by')
+            .lean())
+            .forEach((t) => {
+                const cid = t.carrier ? String(t.carrier) : null;
+                if (!cid) return;
+                if (String(t.carrier_payment_status || 'pending').toLowerCase() === 'pending') return;
+                paidByCarrier.set(cid, {
+                    carrier_payment_status: t.carrier_payment_status,
+                    carrier_payment_date: t.carrier_payment_date || null,
+                    carrier_payment_method: t.carrier_payment_method || null,
+                    carrier_payment_notes: t.carrier_payment_notes || null,
+                    carrier_payment_updated_by: t.carrier_payment_updated_by || null,
+                });
+            });
 
         // Remove existing trips for this order before re-splitting
         await Trip.deleteMany({ order: orderId, tenantId });
@@ -277,6 +463,15 @@ exports.splitOrder = async (req, res) => {
                 settle_amount: ownerFields?.tripSettle?.has(`seg-${i}`)
                     ? ownerFields.tripSettle.get(`seg-${i}`)
                     : normalizeSegmentSettle(seg.settle_amount),
+                // Same freeze on the carrier side: without it, re-reading the order would split the
+                // (now carrier-only) amount across the fleet legs again and shrink the carrier's
+                // cost on every pass.
+                carrier_amount: carrierFields?.tripCost?.has(`seg-${i}`)
+                    ? carrierFields.tripCost.get(`seg-${i}`)
+                    : normalizeSegmentSettle(seg.carrier_amount),
+                carrier_revenue_items: Array.isArray(seg.carrier_revenue_items) ? seg.carrier_revenue_items : [],
+                // Carried across the rebuild, so a carrier already paid stays paid (see above).
+                ...(seg.carrier && paidByCarrier.get(String(seg.carrier)) ? paidByCarrier.get(String(seg.carrier)) : {}),
                 notes: seg.notes,
                 instructions: seg.instructions,
                 created_by: req.user._id
@@ -286,37 +481,18 @@ exports.splitOrder = async (req, res) => {
             createdTrips.push(trip);
         }
 
-        // Keep the order as source of truth for the edit form: sync the first trip's
-        // assets back onto the order (trip planning is where regular orders get assigned).
-        if (order.order_type === 'regular' && segments.length > 0) {
-            const base = segments[0];
-            const baseDrivers = Array.isArray(base.drivers) ? base.drivers.filter(Boolean) : [];
-            const baseDriver = base.driver || baseDrivers[0] || null;
-            order.truck = base.truck || null;
-            order.trailer = base.trailer || null;
-            order.drivers = baseDrivers;
-            order.driver = baseDriver;
-            // The trucks the trips run decide who gets settled — an order split across two owners has
-            // no single ownerOperator, so it carries `isMixedOwner` + `ownerOperators` instead.
-            if (ownerFields) {
-                order.isOwnerOperatedTruck = ownerFields.isOwnerOperatedTruck;
-                order.ownerOperator = ownerFields.ownerOperator;
-                order.ownerOperators = ownerFields.ownerOperators;
-                order.isMixedOwner = ownerFields.isMixedOwner;
-                order.settle_amount = ownerFields.settle_amount;
-                order.input_settle_amount = ownerFields.input_settle_amount;
-                order.owner_profit = ownerFields.owner_profit;
-                order.carrier_amount = ownerFields.carrier_amount;
-            }
-            await order.save();
-
-            await syncOwnerFinancialRecords({
-                tenantId,
-                companyId: req.user?.company?._id || req.user?.company || null,
-                userId: req.user?._id,
-                order,
-                trips: createdTrips,
-                truckMap,
+        // Keep the order as source of truth for the edit form: sync the FIRST FLEET leg's assets
+        // back onto the order. It used to take segments[0] unconditionally, which on a mixed order
+        // would put null on the order because leg 1 belongs to a carrier and has no truck.
+        if (segments.length > 0) {
+            // One definition of "re-read the order from its legs" — see utils/orderFromLegs.js.
+            // `ownerFields` is passed in rather than recomputed: it was allocated BEFORE the legs
+            // were written (it supplies `tripSettle`, which froze each leg's share), and reading it
+            // back off the frozen values would be a second, different view of the same money.
+            // `assetSource: segments` keeps exactly the driver list the dispatcher submitted.
+            await resyncOrderFromLegs({
+                tenantId, order, trips: createdTrips, truckMap,
+                ownerFields, assetSource: segments, req,
             });
         }
 
@@ -439,14 +615,95 @@ exports.updateTrip = async (req, res) => {
         // settlement. Read it as it stood so the trail can show what moved.
         const beforeTrip = await Trip.findOne({ _id: tripId, tenantId }).lean();
 
+        // The payload used to be written verbatim, so a caller could set `order`, `tenantId` or a
+        // carrier's payment state through a leg edit. Only the fields a leg edit is actually for.
+        const EDITABLE = [
+            'driver', 'drivers', 'truck', 'trailer', 'carrier',
+            'start_stop_index', 'end_stop_index', 'start_location', 'end_location',
+            'miles', 'totalDistance', 'total_km', 'distance_unit',
+            'rate_per_mile', 'rate_currency', 'settle_amount', 'carrier_amount',
+            'carrier_revenue_items', 'notes', 'instructions', 'status', 'trip_no',
+        ];
+        const patch = {};
+        Object.keys(updateData || {}).forEach((k) => { if (EDITABLE.includes(k)) patch[k] = updateData[k]; });
+
+        if (!beforeTrip) {
+            return res.status(404).json({ status: false, message: 'Trip not found' });
+        }
+
+        /* THE PAYROLL/PAYMENT LOCK APPLIES HERE TOO.
+           `splitOrder` refuses to move a leg's party once someone has been paid against it, but this
+           endpoint wrote the leg with no such check — so the same change went through unguarded, and
+           now that the order is re-derived below it also rewrites the owner ledger. Run the identical
+           check, and run it BEFORE the write: nothing after that point is reversible. */
+        const PARTY_FIELDS = ['truck', 'carrier'];
+        const movesParty = PARTY_FIELDS.some((k) => k in patch);
+        if (movesParty && beforeTrip.order) {
+            const siblings = await Trip.find({ tenantId, order: beforeTrip.order, deletedAt: null })
+                .select('_id truck carrier').lean();
+            // The leg set as it WOULD be after this patch — that is what the lock has to compare.
+            const resulting = siblings.map((t) => (String(t._id) === String(tripId)
+                ? { ...t, ...patch }
+                : t));
+            const lockTruckIds = [...new Set(
+                resulting.map((t) => String(t.truck || '')).filter(Boolean)
+            )];
+            const lockTrucks = lockTruckIds.length
+                ? await Truck.find({ _id: { $in: lockTruckIds }, tenantId }).select('ownerOperated ownerOperator').lean()
+                : [];
+            const orderDoc = await Order.findOne({ _id: beforeTrip.order, tenantId }).select('_id').lean();
+            if (orderDoc) {
+                const lock = await legPartyChangeBlockers({
+                    tenantId,
+                    order: orderDoc,
+                    segments: resulting,
+                    truckMap: new Map(lockTrucks.map((t) => [String(t._id), t])),
+                });
+                if (lock.blocked) {
+                    return res.status(409).json({
+                        status: false,
+                        code: lock.code,
+                        message: 'Who runs a leg on this order cannot be changed any more — it has already been paid against.',
+                        blockers: lock.blockers,
+                    });
+                }
+            }
+        }
+
         const trip = await Trip.findOneAndUpdate(
-            { _id: tripId, tenantId },
-            { ...updateData, updatedAt: Date.now() },
-            { new: true }
+            // `deletedAt: null` — a removed leg is not editable. Without it a soft-deleted leg could
+            // be patched, and the re-derive below would then rewrite the order's money from the legs
+            // that are still live, driven by an edit to one that is not.
+            { _id: tripId, tenantId, deletedAt: null },
+            { ...patch, updatedAt: Date.now() },
+            { new: true, runValidators: true }
         );
 
         if (!trip) {
             return res.status(404).json({ status: false, message: 'Trip not found' });
+        }
+
+        /* THE ORDER IS A READING OF ITS LEGS, so writing a leg has to re-read it.
+           This endpoint wrote the trip and stopped — so moving a leg's carrier or truck here left
+           the order still claiming the old type, the old carrier and the old cost. Everything that
+           reads the order (reports, the carrier's own order list, commission, the payment rollup)
+           then answered from a shape the legs no longer had.
+
+           Only re-read when the edit could have changed WHO runs the leg or WHAT they are owed —
+           a note or a stop time cannot, and re-deriving on those would rewrite the owner ledger for
+           nothing. Never fatal: the leg write already succeeded, and a stamp is an index. */
+        const PARTY_OR_MONEY = ['truck', 'carrier', 'driver', 'drivers', 'settle_amount', 'carrier_amount', 'miles', 'totalDistance', 'total_km'];
+        const touchedParty = Object.keys(patch).some((k) => PARTY_OR_MONEY.includes(k));
+        if (touchedParty && trip.order) {
+            try {
+                const order = await Order.findOne({ _id: trip.order, tenantId });
+                if (order) {
+                    const { trips: legs, truckMap } = await loadOrderLegsAndTrucks(tenantId, order._id);
+                    await resyncOrderFromLegs({ tenantId, order, trips: legs, truckMap, req });
+                }
+            } catch (resyncErr) {
+                console.error('order resync after leg update failed:', resyncErr?.message || resyncErr);
+            }
         }
 
         logChange(req, {
@@ -1285,6 +1542,16 @@ exports.deleteTrip = async (req, res) => {
                 // The admin-typed per-leg settlement is money, not a display value: losing it here
                 // re-split the pot across the rebuilt legs and moved what the owner is paid.
                 settle_amount: normalizeSegmentSettle(match?.settle_amount),
+                // The carrier side of the same rule: an admin-typed leg cost is money. Dropping it
+                // re-split the order's carrier amount across the rebuilt legs and moved what the
+                // carrier is owed. The payment state travels with it — a leg that was already paid
+                // must not come back as pending.
+                carrier_amount: normalizeSegmentSettle(match?.carrier_amount),
+                carrier_revenue_items: Array.isArray(match?.carrier_revenue_items) ? match.carrier_revenue_items : [],
+                carrier_payment_status: match?.carrier_payment_status || 'pending',
+                carrier_payment_date: match?.carrier_payment_date || null,
+                carrier_payment_method: match?.carrier_payment_method || null,
+                carrier_payment_notes: match?.carrier_payment_notes || null,
                 notes: match?.notes,
                 instructions: match?.instructions,
                 created_by: req.user._id
@@ -1296,7 +1563,7 @@ exports.deleteTrip = async (req, res) => {
         // Rebuilding the legs changes who runs which miles, so the order's owner columns and the
         // owner ledger have to be re-derived from the new legs — otherwise a mixed split keeps
         // settling to the trucks it had before the relay was removed.
-        if (order.order_type === 'regular') {
+        {
             const rebuiltTruckIds = [...new Set(createdTrips.map((t) => t.truck).filter(Boolean).map(String))];
             const truckMap = new Map();
             if (rebuiltTruckIds.length > 0) {
@@ -1305,34 +1572,26 @@ exports.deleteTrip = async (req, res) => {
                     .lean();
                 trucksInUse.forEach((t) => truckMap.set(String(t._id), t));
             }
-            const ownerFields = resolveOrderOwnerFields({ order, trips: createdTrips, truckMap });
-            order.isOwnerOperatedTruck = ownerFields.isOwnerOperatedTruck;
-            order.ownerOperator = ownerFields.ownerOperator;
-            order.ownerOperators = ownerFields.ownerOperators;
-            order.isMixedOwner = ownerFields.isMixedOwner;
-            order.settle_amount = ownerFields.settle_amount;
-            order.input_settle_amount = ownerFields.input_settle_amount;
-            order.owner_profit = ownerFields.owner_profit;
-            order.carrier_amount = ownerFields.carrier_amount;
-            await order.save();
-
-            // Freeze each owner leg's share back onto its trip (same reason as splitOrder).
-            if (ownerFields.tripSettle) {
-                for (const t of createdTrips) {
-                    if (!ownerFields.tripSettle.has(String(t._id))) continue;
-                    t.settle_amount = ownerFields.tripSettle.get(String(t._id));
-                    await t.save();
-                }
-            }
-
-            await syncOwnerFinancialRecords({
-                tenantId,
-                companyId: req.user?.company?._id || req.user?.company || null,
-                userId: req.user?._id,
-                order,
-                trips: createdTrips,
-                truckMap,
+            // Removing a relay can change WHO runs the order, not just how far — the order is
+            // re-read from the rebuilt legs through the one definition (utils/orderFromLegs.js).
+            const { owner: ownerFields, costFields } = await resyncOrderFromLegs({
+                tenantId, order, trips: createdTrips, truckMap, req,
             });
+
+            // Freeze each leg's share back onto its trip (same reason as splitOrder).
+            const carrierTripCost = costFields.carrier?.tripCost;
+            for (const t of createdTrips) {
+                let touched = false;
+                if (ownerFields.tripSettle?.has(String(t._id))) {
+                    t.settle_amount = ownerFields.tripSettle.get(String(t._id));
+                    touched = true;
+                }
+                if (carrierTripCost?.has(String(t._id))) {
+                    t.carrier_amount = carrierTripCost.get(String(t._id));
+                    touched = true;
+                }
+                if (touched) await t.save();
+            }
         }
 
         logActivity(req, {
@@ -1407,3 +1666,139 @@ exports.saveEmptyMoveNote = async (req, res) => {
         res.status(500).json({ status: false, message: 'Server error saving empty move note' });
     }
 };
+
+/* ── Rate confirmation, per LEG ─────────────────────────────────────────────────────────────────
+   GET /order/:orderId/leg/:tripId/rate-confirmation/pdf
+
+   A rate confirmation is a contract with ONE carrier for the work THEY do. An order can now be
+   split across two carriers and our own truck, so sending the whole order's paperwork would tell a
+   carrier about stops they never see and quote a rate that is not theirs.
+
+   Rendered on the SERVER from the order and trip ids, for the same reason the customer invoice is
+   (see orderController.customerInvoicePdf): the permission check, the tenant scope and the numbers
+   are then decided here rather than posted in as markup. `/order/generate-pdf` still serves the
+   order-level rate confirmation the app already had; it is not a boundary and must not be treated
+   as one.                                                                                        */
+
+// Who may send a carrier their rate confirmation. Deliberately the people who book carriers — a
+// dispatcher working the outsourcing module does this as ordinary work — plus accounting, who chase
+// what was agreed. A plain driver, or a user with no relevant permission, may not.
+const canDownloadRateCon = (user) => {
+  if (!user) return false;
+  if (user.is_admin === 1 || Number(user.role) === 3 || user.isTenantAdmin) return true;
+  const perms = Array.isArray(user.permissions) ? user.permissions : [];
+  return perms.includes('outsourcing') || perms.includes('carriers')
+    || perms.includes('subadmin') || perms.includes('accounting');
+};
+
+exports.legRateConfirmationPdf = async (req, res) => {
+    try {
+        const tenantId = req.tenantId || req.user?.tenantId;
+        if (!tenantId) {
+            return res.status(400).json({ status: false, message: 'Tenant context is required.' });
+        }
+        if (!canDownloadRateCon(req.user)) {
+            return res.status(403).json({ status: false, message: 'You do not have permission to download rate confirmations.' });
+        }
+
+        // Scoped exactly like order_detail: tenant, not deleted, inside the caller's modules.
+        const criteria = {
+            _id: req.params.orderId,
+            tenantId,
+            $or: [{ deletedAt: null }, { deletedAt: '' }, { deletedAt: { $exists: false } }],
+        };
+        if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
+            criteria.order_type = { $in: req.allowedOrderTypes };
+        }
+        const order = await Order.findOne(criteria).populate('customer').lean();
+        if (!order) {
+            return res.status(404).json({ status: false, message: 'Order not found.' });
+        }
+
+        // The leg must belong to THIS order — never trust the trip id alone to carry the scope.
+        const trip = await Trip.findOne({ _id: req.params.tripId, order: order._id, tenantId, deletedAt: null })
+            .populate('carrier')
+            .populate('trailer', 'unitNumber type')
+            .lean();
+        if (!trip) {
+            return res.status(404).json({ status: false, message: 'That leg is not on this order.' });
+        }
+        if (!trip.carrier) {
+            return res.status(400).json({
+                status: false,
+                code: 'leg_has_no_carrier',
+                message: 'This leg runs on your own truck. A rate confirmation is a contract with an outside carrier.',
+            });
+        }
+
+        // Real miles for the leg — never trip.miles, which is legacy and often kilometres.
+        const allLegs = await Trip.find({ tenantId, order: order._id, deletedAt: null })
+            .select('_id carrier miles totalDistance total_km').lean();
+        const rawTotal = allLegs.reduce(
+            (a, t) => a + Math.max(Number(t?.totalDistance || t?.miles || t?.total_km || 0), 0), 0);
+        const legMiles = deriveTripMiles(trip, Number(order.totalDistance || 0), rawTotal);
+
+        // Does this carrier run the whole order, or only part of it? A carrier reading a document
+        // that lists two of five stops needs to be told why, or it looks like a mistake.
+        const isPartial = allLegs.some((t) => String(t._id) !== String(trip._id)
+            && String(t.carrier || '') !== String(trip.carrier?._id || trip.carrier || ''));
+
+        const companyId = order.company || req.user?.company?._id || req.user?.company || null;
+        const company = companyId
+            ? await Company.findOne({ _id: companyId, tenantId }).lean()
+            : await Company.findOne({ tenantId }).lean();
+
+        const { resolveCompanyLogoBase64 } = require('../utils/pdfBranding');
+        const { buildRateConHtml, buildRateConNo } = require('../utils/rateConHtml');
+        const logoBase64 = await resolveCompanyLogoBase64(company);
+
+        const issuedAt = new Date();
+        const rateConNo = buildRateConNo({ order, trip, company, tenantId });
+        const html = buildRateConHtml({
+            order, trip, company, rateConNo, issuedAt, logoBase64, legMiles, isPartial, tenantId,
+        });
+
+        const { launchBrowser, hardenPage } = require('../utils/puppeteer');
+        let browser = null;
+        try {
+            browser = await launchBrowser();
+            const page = await browser.newPage();
+            await hardenPage(page);
+            await page.setViewport({ width: 794, height: 1123, deviceScaleFactor: 1 });
+            await page.setContent(html, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
+            const pdfBuffer = await page.pdf({
+                format: 'A4',
+                printBackground: true,
+                margin: { top: 0, bottom: 0, left: 0, right: 0 },
+            });
+            await browser.close();
+            browser = null;
+
+            logActivity(req, {
+                action: 'DOWNLOAD',
+                module: 'order',
+                description: `Downloaded rate confirmation ${rateConNo} (leg ${trip.trip_no}) for ${trip.carrier?.name || 'carrier'}`,
+                resourceId: order._id,
+                resourceName: `#${order.serial_no ?? ''}`,
+            });
+
+            res.setHeader('Content-Type', 'application/pdf');
+            res.setHeader('Content-Disposition', `attachment; filename="rate-confirmation-${rateConNo}.pdf"`);
+            // `res.end`, not `res.send`. Puppeteer 24 returns a Uint8Array rather than a Buffer, and
+            // `res.send` JSON-SERIALISES a Uint8Array — the download arrived as a 9.7 MB
+            // `{"0":37,"1":80,...}` blob instead of a PDF. Every other PDF route in this codebase
+            // already uses `res.end`; this one was the exception.
+            return res.end(Buffer.from(pdfBuffer));
+        } finally {
+            if (browser) await browser.close().catch(() => {});
+        }
+    } catch (error) {
+        console.error('Rate confirmation PDF error:', error);
+        if (error?.code === 'chrome_missing') {
+            return res.status(500).json({ status: false, code: 'chrome_missing', message: error.message });
+        }
+        return res.status(500).json({ status: false, message: 'Failed to generate the rate confirmation.' });
+    }
+};
+
+exports._canDownloadRateCon = canDownloadRateCon;

@@ -98,11 +98,20 @@ exports.getDeductions = catchAsync(async (req, res, next) => {
     // and nothing said so. Report it; the UI turns it into a "regenerate" prompt.
     const salary = await DriverSalary.findOne({
       tenantId, driver: driverId, month: start.getMonth() + 1, year: start.getFullYear(),
-    }).select('generatedAt paidAmount paymentStatus month year finalPayable currency').lean();
+    }).select('generatedAt paidAmount paymentStatus month year finalPayable currency taxEnabled taxRate').lean();
     const lastEntryChange = deductions.reduce((latest, d) => {
       const t = new Date(d.updatedAt || d.createdAt || d.date || 0).getTime();
       return t > latest ? t : latest;
     }, 0);
+    // Tax is snapshotted onto the payslip like the rates are — so a payslip generated before the
+    // driver's HST registration was toggled (or its rate changed) is stale the same way an edited
+    // deduction row makes it stale: the statement no longer says what the profile now says.
+    const profileTax = await DriverProfile.findOne({ tenantId, user: driverId }).select('taxEnabled taxRate').lean();
+    const taxMismatch = !!salary && (
+      (profileTax?.taxEnabled === true) !== (salary.taxEnabled === true) ||
+      (profileTax?.taxEnabled === true && Number(profileTax?.taxRate ?? 13) !== Number(salary.taxRate || 0))
+    );
+    const entriesChanged = !!(salary?.generatedAt && lastEntryChange > new Date(salary.generatedAt).getTime());
     const payslip = salary ? {
       exists: true,
       month: salary.month,
@@ -112,8 +121,14 @@ exports.getDeductions = catchAsync(async (req, res, next) => {
       paidAmount: Number(salary.paidAmount || 0),
       currency: salary.currency || null,
       finalPayable: Number(salary.finalPayable || 0),
-      stale: !!(salary.generatedAt && lastEntryChange > new Date(salary.generatedAt).getTime()),
-    } : { exists: false, stale: false };
+      stale: entriesChanged || taxMismatch,
+      // WHY it is stale. A tax-registration change and an edited ledger row both make the
+      // statement wrong, but they are fixed in different places — saying "these entries
+      // changed" for a tax change sends the user to the wrong screen.
+      staleReason: entriesChanged && taxMismatch ? 'entries_and_tax'
+        : taxMismatch ? 'tax'
+          : entriesChanged ? 'entries' : null,
+    } : { exists: false, stale: false, staleReason: null };
 
     res.json({
       status: true,

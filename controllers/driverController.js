@@ -8,6 +8,53 @@ const bcrypt = require('bcrypt');
 const { logActivity, logChange } = require('../utils/activityLogger');
 const { normalizeCurrency } = require('../utils/fx');
 
+// Tax rate is a percent applied to future payslips. Bad input here silently mis-taxes every
+// payslip generated after it, so it is clamped, never trusted.
+const parseTaxRate = (value, fallback = 13) => {
+  // `Number('')` is 0, not NaN — so a cleared field would silently register an HST driver at
+  // 0% and pay them no tax at all. A blank is "not provided", never a rate.
+  if (value === '' || value === null || value === undefined) return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.round(n * 100) / 100, 0), 100);
+};
+
+// Unchecking the box only stops taxing — the HST number/company stay stored so re-enabling
+// doesn't force re-entry of a registration the driver still holds.
+// An absent key means "leave it alone" (same rule as editCustomer.assigned_to) — a payload
+// that never mentions tax must not flip taxEnabled off.
+const parseTaxFields = (body) => ({
+  ...(body.taxEnabled !== undefined
+    ? { taxEnabled: body.taxEnabled === true || body.taxEnabled === 'true' || body.taxEnabled === 1 }
+    : {}),
+  ...(body.taxNumber !== undefined ? { taxNumber: String(body.taxNumber || '').trim() } : {}),
+  ...(body.taxCompanyName !== undefined ? { taxCompanyName: String(body.taxCompanyName || '').trim() } : {}),
+  ...(body.taxRate !== undefined ? { taxRate: parseTaxRate(body.taxRate) } : {}),
+});
+
+// The statement must print the registration number — a taxed payslip with no HST number on it
+// is not a valid invoice, so enabling tax without one is refused. Checked against the RESULTING
+// state (patch over stored), so enabling without re-sending a number the profile already holds
+// is fine, while clearing the number on a tax-enabled driver is not.
+const taxStateError = (patch, before = null) => {
+  // An edit that does not touch tax at all is never judged on tax. Without this guard a record
+  // somehow stored as enabled-with-no-number could never be saved again — every unrelated edit
+  // (a phone number, a rate) would 400 — and while the tax UI is hidden that 400 would name a
+  // field the user cannot see, let alone fix. Refusing the save does not repair the tax state;
+  // it only blocks work. A patch that DOES touch any tax key is still fully validated below.
+  const touchesTax = patch.taxEnabled !== undefined || patch.taxNumber !== undefined
+    || patch.taxCompanyName !== undefined || patch.taxRate !== undefined;
+  if (!touchesTax) return null;
+
+  const enabled = patch.taxEnabled !== undefined ? patch.taxEnabled : before?.taxEnabled === true;
+  if (!enabled) return null;
+  const number = patch.taxNumber !== undefined ? patch.taxNumber : String(before?.taxNumber || '');
+  if (!String(number || '').trim()) {
+    return 'An HST/GST number is required when the driver charges tax.';
+  }
+  return null;
+};
+
 const createCorporateId = async () => {
   let corporateID;
   let isUnique = false;
@@ -55,6 +102,12 @@ exports.addDriver = catchAsync(async (req, res, next) => {
     );
     if (isEmailUsed) {
       return res.json({ status: false, message: 'Your given email address is already used.' });
+    }
+
+    const taxPatch = parseTaxFields(req.body);
+    const taxErr = taxStateError(taxPatch);
+    if (taxErr) {
+      return res.status(400).json({ status: false, code: 'tax_number_required', message: taxErr });
     }
 
     const corporateID = await createCorporateId();
@@ -115,6 +168,7 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       licenseState,
       licenseIssueDate: licenseIssueDate ? new Date(licenseIssueDate) : undefined,
       licenseExpiry,
+      ...taxPatch,
       createdBy: req.user?._id
     });
 
@@ -170,6 +224,12 @@ exports.editDriver = catchAsync(async (req, res, next) => {
     // edit here changes what future work is worth with nothing else recording the old number.
     const beforeProfile = await DriverProfile.findOne({ user: id, tenantId }).lean();
 
+    const taxPatch = parseTaxFields(req.body);
+    const taxErr = taxStateError(taxPatch, beforeProfile);
+    if (taxErr) {
+      return res.status(400).json({ status: false, code: 'tax_number_required', message: taxErr });
+    }
+
     if (trimmedEmail && trimmedEmail !== existedUser.email) {
       const emailExists = await User.findOne({ email: trimmedEmail }, null, { includeInactive: true });
       if (emailExists) {
@@ -214,6 +274,7 @@ exports.editDriver = catchAsync(async (req, res, next) => {
         licenseState,
         licenseIssueDate: licenseIssueDate ? new Date(licenseIssueDate) : undefined,
         licenseExpiry,
+        ...taxPatch,
         updatedAt: Date.now()
       },
       { new: true, upsert: true }
@@ -343,3 +404,6 @@ exports.removeDriver = catchAsync(async (req, res, next) => {
     logger(err);
   }
 });
+
+// Pure helpers, exported for tests without a DB (same pattern as searchController._internals).
+exports._internals = { parseTaxRate, parseTaxFields, taxStateError };

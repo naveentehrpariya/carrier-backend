@@ -1,4 +1,7 @@
 const catchAsync = require("../utils/catchAsync");
+const { deriveOrderTypeFromPayload, partiesFromPayload, resolveOrderState } = require('../utils/orderParty');
+const { resolveOrderCostFields, orderCostAmounts } = require('../utils/orderCost');
+const { rollupCarrierPaymentStatus, carrierOrderMatch } = require('../utils/carrierSettlement');
 const APIFeatures  = require("../utils/APIFeatures");
 const Order = require("../db/Order");
 const Files = require("../db/Files");
@@ -19,6 +22,7 @@ const { buildCustomerInvoiceHtml, buildInvoiceNo } = require("../utils/invoiceHt
 const { syncOwnerFinancialRecords, resolveOrderOwnerFields } = require("../utils/ownerSettlement");
 const { checkOrderLimit } = require("../middlewares/planLimitsMiddleware");
 const { logActivity, logChange } = require("../utils/activityLogger");
+const mongooseLib = require("mongoose");
 const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn } = require("../utils/orderMoney");
 const { kmToMiles } = require("../utils/distance");
 
@@ -258,79 +262,48 @@ async function CreatePaymentLog(user, order, status, method, type, approval, ten
    return payment;
 }
 
+/**
+ * The next order number for a tenant.
+ *
+ * TWO counter implementations used to fight over the model name `counters`:
+ * this one keyed its documents by a STRING `_id` (`serial_no:<tenant>`) with a `sequence_value`
+ * field, while db/Counter.js (cheque numbers, vendor codes) registers the same model name with an
+ * ObjectId `_id` and `{tenantId, key, seq}`. Mongoose hands out the FIRST schema registered for a
+ * name, and db/Counter.js is loaded at boot by the cheque routes — so this function was casting
+ * "serial_no:testco" to an ObjectId and throwing, which meant **no order could be created at all**.
+ * Both features are unreleased, so it never reached production; the next deploy would have taken
+ * order creation down completely.
+ *
+ * There is now one counter implementation, and it is the better one: `nextSeq` mints atomically in a
+ * single pipeline update, waits for the unique index before racing upserts, and retries the E11000
+ * loser. The old code did findOne → create → findOneAndUpdate, which two concurrent creates could
+ * interleave into the same number.
+ *
+ * The counter is a CACHE of the tenant's highest serial, never the authority: `{tenantId, serial_no}`
+ * is uniquely indexed, so a counter that starts behind reality collides on every insert. It is
+ * therefore bumped forward from the real maximum first — which also repairs a tenant whose old
+ * string-keyed counter document is now unreachable.
+ */
+const ORDER_SERIAL_KEY = 'order_serial';
+
 async function generateUniqueSerialNumber(tenantId) {
-   const mongoose = require('mongoose');
-   
+   const Counter = require('../db/Counter');
+   const scope = tenantId || 'legacy_tenant_001';
+
    try {
-      const counterSchema = new mongoose.Schema({
-         _id: { type: String, required: true },
-         sequence_value: { type: Number, default: 1000 }
-      });
-      
-      let Counter;
-      try {
-         Counter = mongoose.model('counters');
-      } catch (error) {
-         Counter = mongoose.model('counters', counterSchema);
+      const maxOrder = await Order.findOne({ tenantId: scope }, { serial_no: 1 })
+         .sort({ serial_no: -1 })
+         .lean();
+      const maxSerial = Number(maxOrder?.serial_no);
+
+      // Forward-only. Never lower the counter to the current maximum: a deleted last order must not
+      // hand its number to the next one.
+      if (Number.isFinite(maxSerial) && maxSerial >= 1000) {
+         await Counter.bumpTo(scope, ORDER_SERIAL_KEY, maxSerial);
       }
-      
-      const counterKey = `serial_no:${tenantId || 'legacy_tenant_001'}`;
-      let existingCounter = await Counter.findOne({ _id: counterKey });
-      
-      if (!existingCounter) {
-         const maxOrder = await Order.findOne({ tenantId: tenantId || 'legacy_tenant_001' }, { serial_no: 1 }).sort({ serial_no: -1 }).lean();
-         // Start from 1000 base. The very first generated number via $inc will be 1001.
-         const maxSerialNo = maxOrder && typeof maxOrder.serial_no === 'number' && maxOrder.serial_no > 1000 ? maxOrder.serial_no : 1000;
-         
-         existingCounter = await Counter.create({
-            _id: counterKey,
-            sequence_value: maxSerialNo
-         });
-      } else {
-         // Sync counter if it's lagging behind the actual max serial_no
-         const maxOrder = await Order.findOne({ tenantId: tenantId || 'legacy_tenant_001' }, { serial_no: 1 }).sort({ serial_no: -1 }).lean();
-         // But only if there is a max order and it's higher. If there are NO orders, do NOT update the counter to 1000 if it's already higher (e.g. 1008 from a previous bug)
-         if (maxOrder && typeof maxOrder.serial_no === 'number' && existingCounter.sequence_value < maxOrder.serial_no) {
-            existingCounter = await Counter.findOneAndUpdate(
-               { _id: counterKey },
-               { $set: { sequence_value: maxOrder.serial_no } },
-               { new: true }
-            );
-         } else if (!maxOrder && existingCounter.sequence_value > 1000) {
-            // FIX: If there are NO orders but the counter got inflated to something like 1008, reset it down to 1000
-            existingCounter = await Counter.findOneAndUpdate(
-               { _id: counterKey },
-               { $set: { sequence_value: 1000 } },
-               { new: true }
-            );
-         }
-      }
-      
-      let attempts = 0;
-      const maxAttempts = 3;
-      
-      while (attempts < maxAttempts) {
-         try {
-            const counter = await Counter.findOneAndUpdate(
-               { _id: counterKey },
-               { $inc: { sequence_value: 1 } },
-               { new: true }
-            );
-            
-            if (!counter || !counter.sequence_value) {
-               throw new Error('Failed to generate serial number: Invalid counter response');
-            }
-            
-            return counter.sequence_value;
-         } catch (error) {
-            attempts++;
-            if (attempts >= maxAttempts) {
-               throw new Error(`Failed to generate unique serial number after ${maxAttempts} attempts: ${error.message}`);
-            }
-            
-            await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts) * 100));
-         }
-      }
+
+      // First issued number for a brand-new tenant is 1001, matching the old behaviour.
+      return await Counter.nextSeq(scope, ORDER_SERIAL_KEY, 1001);
    } catch (error) {
       throw new Error(`Serial number generation failed: ${error.message}`);
    }
@@ -390,7 +363,8 @@ async function resolveRegularOrderOwnerContext({ tenantId, truckId, totalAmount,
 
 async function loadOrderTripsAndTrucks(tenantId, orderId) {
    const trips = await Trip.find({ tenantId, order: orderId, deletedAt: null })
-      .select('truck miles totalDistance total_km settle_amount')
+      // `carrier` and `carrier_amount` are here for utils/orderParty.js and utils/carrierSettlement.js
+      .select('truck carrier miles totalDistance total_km settle_amount carrier_amount')
       .lean();
    const truckIds = [...new Set(trips.map((t) => String(t.truck || '')).filter(Boolean))];
    const truckRows = truckIds.length > 0
@@ -646,16 +620,11 @@ exports.create_order = catchAsync(async (req, res, next) => {
             checkAttempts++;
          } else {
             isUnique = true;
-            // Sync the counter forward to match our jump if we made any jumps
+            // Sync the counter forward to match our jump if we made any jumps. Forward-only through
+            // the one counter implementation — see generateUniqueSerialNumber.
             if (checkAttempts > 0) {
-               const counterKey = `serial_no:${tenantId || 'legacy_tenant_001'}`;
-               const mongoose = require('mongoose');
-               const Counter = mongoose.model('counters');
-               await Counter.findOneAndUpdate(
-                  { _id: counterKey },
-                  { $set: { sequence_value: finalSerialNo } },
-                  { upsert: true }
-               );
+               await require('../db/Counter').bumpTo(
+                  tenantId || 'legacy_tenant_001', ORDER_SERIAL_KEY, finalSerialNo);
             }
          }
       }
@@ -666,17 +635,16 @@ exports.create_order = catchAsync(async (req, res, next) => {
          const absoluteMax = maxOrder && maxOrder.serial_no ? parseInt(maxOrder.serial_no) : 1000;
          finalSerialNo = absoluteMax + 1;
          
-         const counterKey = `serial_no:${tenantId || 'legacy_tenant_001'}`;
-         const mongoose = require('mongoose');
-         const Counter = mongoose.model('counters');
-         await Counter.findOneAndUpdate(
-            { _id: counterKey },
-            { $set: { sequence_value: finalSerialNo } },
-            { upsert: true }
-         );
+         await require('../db/Counter').bumpTo(
+            tenantId || 'legacy_tenant_001', ORDER_SERIAL_KEY, finalSerialNo);
       }
 
-      const isRegular = order_type === 'regular';
+      // The order's type is no longer a question asked before the work is described — it is read
+      // from what was actually filled in. A carrier means an outside carrier runs the load; a truck
+      // or a driver means we do. See utils/orderParty.js. The body's own order_type survives only
+      // as a fallback for a payload that names neither, so an older client still works.
+      const derivedOrderType = deriveOrderTypeFromPayload(req.body) || order_type || 'outsourcing';
+      const isRegular = derivedOrderType === 'regular';
       const ownerContext = isRegular
          ? await resolveRegularOrderOwnerContext({
               tenantId,
@@ -716,7 +684,14 @@ exports.create_order = catchAsync(async (req, res, next) => {
          carrier_payment_date,
          carrier_payment_method,
 
-         order_type,
+         order_type: derivedOrderType,
+         order_parties: partiesFromPayload(req.body, {
+            ownerOperated: ownerContext.isOwnerOperatedTruck,
+            ownerOperator: ownerContext.ownerOperator,
+         }),
+         // An order being created cannot be mixed: it has one carrier column and one truck column.
+         // Mixing happens later, in Trip Planning, when a leg is handed to someone else.
+         isMixedType: false,
          drivers: normalizedDrivers,
          driver: normalizedDriver,
          truck,
@@ -740,6 +715,12 @@ exports.create_order = catchAsync(async (req, res, next) => {
          input_total_amount: Number(total_amount || 0),
          input_carrier_amount: Number(carrier_amount || 0),
          input_settle_amount: Number(settle_amount || 0),
+         // The order's total outside cost — see utils/orderCost.js. On a brand-new order there is
+         // exactly one settlement side, so this is that side's amount; a split can later make it the
+         // sum of both. Stored on creation so every reader can use one column from day one instead
+         // of branching on the order's type.
+         cost_amount: isRegular ? Number(settleAmountBase || 0) : Number(carrierAmountBase || 0),
+         input_cost_amount: isRegular ? Number(settle_amount || 0) : Number(carrier_amount || 0),
          totalDistance,
          route_crosses_border: !!route_crosses_border,
          route_countries: Array.isArray(route_countries) ? route_countries : [],
@@ -1064,10 +1045,66 @@ exports.update_order = catchAsync(async (req, res, next) => {
             order.settle_amount = fields.settle_amount;
             order.input_settle_amount = fields.input_settle_amount;
             order.owner_profit = fields.owner_profit;
-            order.carrier_amount = fields.carrier_amount;
          }
+         // Cost columns from one reading of both settlement sides. utils/orderCost.js is what stops
+         // the legacy settle -> carrier_amount mirror from firing on an order that has a carrier
+         // leg — applying it there would overwrite the carrier's cost with the owner's settlement.
+         const costFields = resolveOrderCostFields({ order: order.toObject(), trips, truckMap });
+         Object.entries(costFields.set).forEach(([k, v]) => {
+            // A settlement the caller explicitly typed is an instruction, not something to re-derive.
+            if (settleExplicit && (k === 'cost_amount' || k === 'input_cost_amount')) return;
+            order[k] = v;
+         });
          await order.save();
       }
+      // Keep the party stamp in step with the edit. `order_parties` is a reading of who runs the
+      // load, so it has to be re-read whenever the truck, the carrier or the legs move.
+      //
+      // `order_type` is deliberately NOT flipped here. Changing it moves an order's cost between
+      // the carrier column and the settlement column, and that is only safe once the payroll and
+      // carrier-payment locks are checked — the guards the deleted convert-type endpoint used to
+      // carry. Until those live per leg, a disagreement between the stamped type and the parties is
+      // surfaced, not silently acted on.
+      try {
+         const { trips: partyTrips, truckMap: partyTrucks } = await loadOrderTripsAndTrucks(tenantId, order._id);
+         const partyState = resolveOrderState({ order: order.toObject(), trips: partyTrips, truckMap: partyTrucks });
+         let stampDirty = false;
+         if (partyState.resolved) {
+            const nextParties = partyState.order_parties;
+            const prevParties = Array.isArray(order.order_parties) ? order.order_parties : [];
+            const partiesChanged = nextParties.length !== prevParties.length
+               || nextParties.some((v, i) => v !== prevParties[i]);
+            if (partiesChanged || Boolean(order.isMixedType) !== partyState.isMixedType) {
+               order.order_parties = nextParties;
+               order.isMixedType = partyState.isMixedType;
+               stampDirty = true;
+            }
+         }
+
+         // Keep the cost columns in step with the edit. A mixed-owner order already did this above
+         // (it has to, before the owner ledger is written), so this covers everything else: an edit
+         // that changes the carrier amount, the settlement, or which legs exist.
+         if (!order.isMixedOwner) {
+            const costFields = resolveOrderCostFields({ order: order.toObject(), trips: partyTrips, truckMap: partyTrucks });
+            Object.entries(costFields.set).forEach(([k, v]) => {
+               // Don't re-derive a settlement the caller explicitly typed on this request.
+               if (settleExplicit && (k === 'cost_amount' || k === 'input_cost_amount')) return;
+               const cur = order[k];
+               const same = Array.isArray(v)
+                  ? (Array.isArray(cur) && cur.length === v.length && cur.every((x, i) => String(x) === String(v[i])))
+                  : String(cur ?? '') === String(v ?? '');
+               if (same) return;
+               order[k] = v;
+               stampDirty = true;
+            });
+         }
+
+         if (stampDirty) await order.save();
+      } catch (partyErr) {
+         // A stamp is an index, not the money. Never fail a save over it.
+         console.error('order party stamp failed:', partyErr?.message || partyErr);
+      }
+
       if (order.isOwnerOperatedTruck) {
          await syncOwnerOperatorFinancialRecords({
             tenantId,
@@ -1169,219 +1206,6 @@ async function distanceEditBlockers(existing, updateData, tenantId, body = {}) {
    return none;
 }
 
-async function conversionBlockers(order, tenantId) {
-   const blockers = [];
-   if (order.lock) blockers.push('The order is locked. Unlock it first.');
-
-   if (String(order.customer_payment_status || 'pending') !== 'pending') {
-      blockers.push(`The customer payment is already "${order.customer_payment_status}".`);
-   }
-   if (order.order_type === 'outsourcing' && String(order.carrier_payment_status || 'pending') !== 'pending') {
-      blockers.push(`The carrier payment is already "${order.carrier_payment_status}".`);
-   }
-
-   const [tripCount, settledRows, salaryRows] = await Promise.all([
-      Trip.countDocuments({ tenantId, order: order._id, deletedAt: null }),
-      OwnerOperatorFinancialRecord.countDocuments({
-         tenantId, order: order._id, paymentStatus: { $ne: 'pending' },
-      }),
-      DriverSalary.countDocuments({ tenantId, 'orderBreakdown.order': order._id }),
-   ]);
-   // Every order is born with ONE default leg covering the whole route (see create_order), so a
-   // single leg is not planning work — it is rewritten to the new type below. More than one means
-   // a dispatcher built a real split, and converting would silently throw that away.
-   if (tripCount > 1) {
-      blockers.push(`This order is split into ${tripCount} legs. Merge them back to one in Trip Planning first.`);
-   }
-   if (settledRows > 0) {
-      blockers.push('An owner operator has already been paid for this order.');
-   }
-   if (salaryRows > 0) {
-      blockers.push('This order is already on a generated driver payslip.');
-   }
-   return blockers;
-}
-
-// Preflight: the modal asks this the moment it opens, so a dispatcher sees "this order cannot be
-// converted, here is why" before filling anything in — not after pressing the button.
-exports.convert_order_check = catchAsync(async (req, res) => {
-   const tenantId = getTenantId(req);
-   if (!tenantId) {
-      return res.status(400).json({ status: false, message: 'Tenant context is required.' });
-   }
-   const criteria = { _id: req.params.id, tenantId };
-   applyOrderOwnershipScope(req, criteria);
-   const order = await Order.findOne(criteria).select(
-      'order_type lock customer_payment_status carrier_payment_status serial_no'
-   );
-   if (!order) {
-      return res.status(404).json({ status: false, message: 'Order not found.' });
-   }
-
-   const target = order.order_type === 'regular' ? 'outsourcing' : 'regular';
-   const blockers = await conversionBlockers(order, tenantId);
-
-   const allowed = Array.isArray(req.allowedOrderTypes) ? req.allowedOrderTypes : null;
-   if (allowed && allowed.length > 0 && !allowed.includes(target)) {
-      blockers.push(`Your plan or permissions do not include ${target} orders.`);
-   }
-
-   res.json({ status: true, from: order.order_type, target, canConvert: blockers.length === 0, blockers });
-});
-
-exports.convert_order_type = catchAsync(async (req, res) => {
-   const tenantId = getTenantId(req);
-   if (!tenantId) {
-      return res.status(400).json({ status: false, message: 'Tenant context is required.' });
-   }
-
-   const target = String(req.body?.target || '').toLowerCase();
-   if (!['regular', 'outsourcing'].includes(target)) {
-      return res.status(400).json({ status: false, message: 'Choose either regular or outsourcing.' });
-   }
-
-   const criteria = { _id: req.params.id, tenantId };
-   applyOrderOwnershipScope(req, criteria);
-   const order = await Order.findOne(criteria);
-   if (!order) {
-      return res.status(404).json({ status: false, message: 'Order not found.' });
-   }
-   if (order.order_type === target) {
-      return res.status(400).json({ status: false, message: `This order is already ${target}.` });
-   }
-
-   // The module the order is moving INTO has to be one this tenant and this user may use —
-   // otherwise conversion becomes a way around the plan and the permission checks on create.
-   const allowed = Array.isArray(req.allowedOrderTypes) ? req.allowedOrderTypes : null;
-   if (allowed && allowed.length > 0 && !allowed.includes(target)) {
-      return res.status(403).json({
-         status: false,
-         message: `Your plan or permissions do not include ${target} orders.`,
-      });
-   }
-
-   const blockers = await conversionBlockers(order, tenantId);
-   if (blockers.length > 0) {
-      return res.status(400).json({ status: false, code: 'conversion_blocked', message: blockers[0], blockers });
-   }
-
-   // Amounts are typed in the order's own currency; store both the typed value and the base one,
-   // exactly like create/update do. Never re-stamp the currency here.
-   const fxToBase = Number(order.fx_to_usd || 1);
-   const missing = [];
-   const update = { order_type: target };
-
-   if (target === 'outsourcing') {
-      const carrier = req.body?.carrier;
-      const items = Array.isArray(req.body?.carrier_revenue_items) ? req.body.carrier_revenue_items : [];
-      // The carrier cost is the sum of its line items, exactly as on the add-order form; a bare
-      // `carrier_amount` is accepted for callers that have no line items to give.
-      // Same rule as create and update. The total alone is not enough: two lines of -500 and
-      // +1000 sum to a positive 500 and would have stored a negative line item.
-      const negatives = findNegativeMoney({ carrier_revenue_items: items, carrier_amount: req.body?.carrier_amount });
-      if (negatives.length > 0) {
-         return res.status(400).json({ status: false, code: 'negative_amount', message: negatives[0], problems: negatives });
-      }
-
-      const itemsTotal = items.reduce((sum, i) => sum + (Number(i?.rate) || 0) * (Number(i?.quantity) || 0), 0);
-      const carrierAmount = itemsTotal > 0 ? itemsTotal : Number(req.body?.carrier_amount);
-
-      // `carrier` and `carrier_amount` are required by the Order schema for an outsourcing order,
-      // so these two stay mandatory here — everything else mirrors what add-order lets you skip.
-      if (!carrier) missing.push('carrier');
-      if (!Number.isFinite(carrierAmount) || carrierAmount <= 0) missing.push('carrier_amount');
-      if (missing.length > 0) {
-         return res.status(400).json({
-            status: false, code: 'fields_required', missing,
-            message: 'An outsourcing order needs a carrier and what the carrier is paid.',
-         });
-      }
-      update.carrier = carrier;
-      update.input_carrier_amount = carrierAmount;
-      update.carrier_amount = convertToBase(carrierAmount, fxToBase);
-      // Line item rates are stored in base currency, the same as revenue_items on create/update.
-      update.carrier_revenue_items = normalizeRevenueItemsToBase(items, fxToBase);
-
-      // Drop everything that only means something on our own truck.
-      Object.assign(update, {
-         truck: null, trailer: null, driver: null, drivers: [],
-         isOwnerOperatedTruck: false, ownerOperator: null, ownerOperators: [], isMixedOwner: false,
-         settle_amount: 0, input_settle_amount: 0, owner_profit: 0,
-         driver_assignment_mode: 'company_driver',
-      });
-   } else {
-      // Nothing here is mandatory — the add-order form lets a fleet order be saved with no truck,
-      // no driver and no settle amount, and conversion must not be stricter than creation. The
-      // "needs attention" panel is what surfaces an order still missing them.
-      const truckId = req.body?.truck || null;
-      const driverList = Array.isArray(req.body?.drivers) ? req.body.drivers.filter(Boolean) : [];
-      const primaryDriver = req.body?.driver || driverList[0] || null;
-
-      const truck = truckId
-         ? await Truck.findOne({ _id: truckId, tenantId }).select('ownerOperated ownerOperator').lean()
-         : null;
-      if (truckId && !truck) {
-         return res.status(400).json({ status: false, message: 'That truck was not found for this tenant.' });
-      }
-
-      const ownerOperated = !!(truck?.ownerOperated && truck?.ownerOperator);
-      const settleAmount = Number(req.body?.settle_amount);
-
-      const drivers = driverList.length > 0 ? driverList : (primaryDriver ? [primaryDriver] : []);
-      update.truck = truckId;
-      update.trailer = req.body?.trailer || null;
-      update.driver = primaryDriver;
-      update.drivers = drivers;
-      update.isOwnerOperatedTruck = ownerOperated;
-      update.ownerOperator = ownerOperated ? truck.ownerOperator : null;
-      update.ownerOperators = ownerOperated ? [truck.ownerOperator] : [];
-      update.isMixedOwner = false;
-      // A settle amount only means anything on an owner's truck, and may be left blank for now.
-      const settle = ownerOperated && Number.isFinite(settleAmount) && settleAmount > 0 ? settleAmount : 0;
-      update.input_settle_amount = settle;
-      update.settle_amount = convertToBase(settle, fxToBase);
-      update.owner_profit = ownerOperated
-         ? Number(order.total_amount || 0) - Number(update.settle_amount || 0)
-         : 0;
-      update.driver_assignment_mode = ownerOperated && !primaryDriver ? 'owner_driver' : 'company_driver';
-
-      // Drop everything that only means something when an outside carrier runs the load.
-      Object.assign(update, {
-         carrier: null, carrier_amount: 0, input_carrier_amount: 0, carrier_revenue_items: [],
-         carrier_payment_status: 'pending', carrier_payment_date: null, carrier_payment_method: null,
-      });
-   }
-
-   const saved = await Order.findOneAndUpdate(criteria, update, { new: true, runValidators: true });
-
-   // The order's single default leg still describes the old type — point it at the new one, the
-   // same way create_order would have built it. (A real multi-leg split was blocked above.)
-   await Trip.updateMany(
-      { tenantId, order: order._id, deletedAt: null },
-      target === 'outsourcing'
-         ? { carrier: update.carrier, truck: null, trailer: null, driver: null, drivers: [], rate_per_mile: 0, total_driver_pay: 0, settle_amount: null }
-         : { carrier: null, truck: update.truck, trailer: update.trailer, driver: update.driver, drivers: update.drivers }
-   );
-
-   // Settlement ledger rows belong to the type we just left.
-   await OwnerOperatorFinancialRecord.deleteMany({ tenantId, order: order._id });
-
-   // Conversion clears one side's money and fills the other's — exactly the change a reader of the
-   // trail needs the before/after for.
-   logChange(req, {
-      model: 'Order',
-      module: 'order',
-      before: typeof order.toObject === 'function' ? order.toObject() : order,
-      after: saved && typeof saved.toObject === 'function' ? saved.toObject() : saved,
-      resourceId: order._id,
-      resourceName: `#${order.serial_no}`,
-      description: `Converted order #${order.serial_no} from ${order.order_type} to ${target}`,
-      details: { from: order.order_type, to: target },
-      critical: true,
-   });
-
-   res.json({ status: true, order: saved, message: `Order is now ${target}.` });
-});
 
 /* ── Orders that need attention ─────────────────────────────────────────────────
    One place that answers "which orders are not finished, and what is wrong with them".
@@ -1391,7 +1215,23 @@ exports.convert_order_type = catchAsync(async (req, res) => {
 
    Deliberately NOT flagged: an owner-operated leg with no driver of ours (the owner's own
    driver runs it — see the Trip Planning notes), and a stop that is a relay marker.        */
+// Does this order involve an outside carrier / our own equipment? Read from the party stamp
+// (utils/orderParty.js), which is the only thing that can describe a MIXED order — one whose legs go
+// to both. Falling back to `order_type` keeps every order written before the stamp existed correct.
+const hasCarrierWork = (o) => (Array.isArray(o.order_parties) && o.order_parties.length
+   ? o.order_parties.includes('carrier')
+   : String(o.order_type || '') === 'outsourcing');
+const hasFleetWork = (o) => (Array.isArray(o.order_parties) && o.order_parties.length
+   ? (o.order_parties.includes('company') || o.order_parties.includes('owner'))
+   : String(o.order_type || '') === 'regular');
+
 const ATTENTION_RULES = [
+   // An order with no leg cannot answer who ran it, so it cannot answer what it cost either. Every
+   // new order is born with one (create_order), but that write is best-effort and 374 orders predate
+   // it entirely — `_legCount` is stamped on the row before testing.
+   { code: 'no_legs', group: 'data', level: 'error', label: 'No trip legs',
+     test: (o) => Number(o._legCount || 0) === 0 },
+
    // Route — these feed distance, which feeds driver pay → owner settlement → truck gross
    { code: 'blank_stop', group: 'data', level: 'error', label: 'Stop has no address',
      test: (o) => (o.shipping_details || []).some((b) => (b.locations || []).some((l) =>
@@ -1403,22 +1243,29 @@ const ATTENTION_RULES = [
    { code: 'no_revenue', group: 'data', level: 'error', label: 'No customer amount',
      test: (o) => Number(o.total_amount || 0) <= 0 && Number(o.input_total_amount || 0) <= 0 },
    { code: 'owner_no_settle', group: 'data', level: 'error', label: 'Owner truck, nothing to settle',
-     test: (o) => o.order_type === 'regular' && o.isOwnerOperatedTruck
+     test: (o) => hasFleetWork(o) && o.isOwnerOperatedTruck
         && Number(o.settle_amount || 0) <= 0 && Number(o.input_settle_amount || 0) <= 0 },
    { code: 'carrier_no_cost', group: 'data', level: 'warn', label: 'No carrier cost',
-     test: (o) => o.order_type === 'outsourcing' && Number(o.carrier_amount || 0) <= 0 },
+     test: (o) => hasCarrierWork(o) && Number(o.carrier_amount || 0) <= 0 },
+   // Cost above revenue reads the order's TOTAL outside cost, so a mixed order is judged on what
+   // actually leaves the company (carrier legs + owner settlement), not on one of the two columns.
    { code: 'loss_making', group: 'data', level: 'warn', label: 'Cost above revenue',
-     test: (o) => o.order_type === 'outsourcing'
-        && Number(o.carrier_amount || 0) > 0 && Number(o.total_amount || 0) > 0
-        && Number(o.carrier_amount) > Number(o.total_amount) },
+     test: (o) => {
+        const cost = Number(o.cost_amount || 0) > 0
+           ? Number(o.cost_amount)
+           : (hasCarrierWork(o) ? Number(o.carrier_amount || 0) : 0);
+        return cost > 0 && Number(o.total_amount || 0) > 0 && cost > Number(o.total_amount);
+     } },
 
    // Assignment
+   // A mixed order with several carriers has `carrier: null` and the list in `carriers` — checking
+   // the single column alone would flag every one of them as having no carrier.
    { code: 'no_carrier', group: 'data', level: 'error', label: 'No carrier',
-     test: (o) => o.order_type === 'outsourcing' && !o.carrier },
+     test: (o) => hasCarrierWork(o) && !o.carrier && !(Array.isArray(o.carriers) && o.carriers.length > 0) },
    { code: 'no_truck', group: 'data', level: 'warn', label: 'No truck',
-     test: (o) => o.order_type === 'regular' && !o.truck },
+     test: (o) => hasFleetWork(o) && !o.truck },
    { code: 'no_driver', group: 'data', level: 'warn', label: 'No driver',
-     test: (o) => o.order_type === 'regular' && !o.isOwnerOperatedTruck
+     test: (o) => hasFleetWork(o) && !o.isOwnerOperatedTruck
         && !o.driver && !(Array.isArray(o.drivers) && o.drivers.length > 0) },
 
    // Paperwork and ageing — `_docCount` and `_ageDays` are stamped on the row before testing
@@ -1427,7 +1274,7 @@ const ATTENTION_RULES = [
    { code: 'customer_unpaid', group: 'followup', level: 'warn', label: 'Customer not paid',
      test: (o) => o._ageDays > 30 && String(o.customer_payment_status || 'pending') === 'pending' },
    { code: 'carrier_unpaid', group: 'followup', level: 'warn', label: 'Carrier not paid',
-     test: (o) => o.order_type === 'outsourcing' && o._ageDays > 30
+     test: (o) => hasCarrierWork(o) && o._ageDays > 30
         && String(o.carrier_payment_status || 'pending') === 'pending' },
    { code: 'stale_status', group: 'followup', level: 'info', label: 'Still "added"',
      test: (o) => o._ageDays > 30 && String(o.order_status || 'added') === 'added' },
@@ -1466,8 +1313,8 @@ exports.orders_needing_attention = catchAsync(async (req, res) => {
    }
 
    const orders = await Order.find(criteria)
-      .select('serial_no order_type customer carrier createdAt totalDistance total_amount input_total_amount '
-         + 'settle_amount input_settle_amount carrier_amount input_currency revenue_currency isOwnerOperatedTruck '
+      .select('serial_no order_type order_parties isMixedType customer carrier carriers createdAt totalDistance total_amount input_total_amount '
+         + 'settle_amount input_settle_amount carrier_amount cost_amount input_cost_amount input_currency revenue_currency isOwnerOperatedTruck '
          + 'driver drivers truck ownerOperator ownerOperators order_status customer_payment_status carrier_payment_status shipping_details created_by')
       .populate('customer', 'name')
       .populate('created_by', 'name')
@@ -1483,6 +1330,18 @@ exports.orders_needing_attention = catchAsync(async (req, res) => {
          { $group: { _id: '$order', n: { $sum: 1 } } },
       ]);
       grouped.forEach((g) => docCounts.set(String(g._id), g.n));
+   }
+
+   // Leg counts, one grouped query for the same reason. An order with no leg is now a DATA problem,
+   // not a cosmetic one: its type, its parties and its cost are all readings of its legs, so a
+   // legless order reads as costless and drops out of its own carrier's order list.
+   const legCounts = new Map();
+   if (ids.length > 0) {
+      const groupedLegs = await Trip.aggregate([
+         { $match: { order: { $in: ids }, deletedAt: null } },
+         { $group: { _id: '$order', n: { $sum: 1 } } },
+      ]);
+      groupedLegs.forEach((g) => legCounts.set(String(g._id), g.n));
    }
 
    // Which referenced trucks / owners / drivers are still alive. Three set lookups rather than a
@@ -1510,6 +1369,7 @@ exports.orders_needing_attention = catchAsync(async (req, res) => {
    const flagged = [];
    orders.forEach((o) => {
       o._docCount = docCounts.get(String(o._id)) || 0;
+      o._legCount = legCounts.get(String(o._id)) || 0;
       o._ageDays = Math.floor((now - new Date(o.createdAt || now).getTime()) / 86400000);
       const gone = (id, live) => Boolean(id) && !live.has(String(id));
       o._deadRefs = {
@@ -1628,7 +1488,12 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       if (sanitizedCarrierId) {
          const mongoose = require('mongoose');
          if (mongoose.Types.ObjectId.isValid(sanitizedCarrierId)) {
-            queryObj.carrier = sanitizedCarrierId;
+            // An order split between two carriers has `carrier: null` and the list in `carriers`,
+            // so matching the single column alone drops that order out of BOTH carriers' order
+            // lists — the carrier disappears from their own work. Pushed onto `$and`: this filter
+            // is an `$or`, and assigning `queryObj.$or` would overwrite the soft-delete `$or` and
+            // start returning deleted orders.
+            queryObj.$and = (queryObj.$and || []).concat([carrierOrderMatch(sanitizedCarrierId)]);
          } else {
             // Invalid ObjectId, return empty results
             return res.json({
@@ -1705,7 +1570,7 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       
       let Query = new APIFeatures(
          Order.find(queryObj)
-            .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
+            .populate(['created_by', 'customer', 'carrier', 'carriers', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator', 'ownerOperators'])
             .populate('documents_count'),
          req.query
       ).sort();
@@ -1965,7 +1830,7 @@ exports.order_listing_account = catchAsync(async (req, res) => {
 
    let Query = new APIFeatures(
       Order.find(queryObj)
-         .populate(['created_by', 'customer', 'carrier', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
+         .populate(['created_by', 'customer', 'carrier', 'carriers', 'carrier_payment_updated_by', 'customer_payment_updated_by', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator', 'ownerOperators'])
          .populate('documents_count'),
       req.query
    ).sort();
@@ -2015,6 +1880,13 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
       if (!tenantId) {
          return res.status(400).json({ status: false, message: "Tenant context is required." });
       }
+      // `companyId` was referenced by both CreatePaymentLog calls below but never declared in this
+      // handler, so reading it threw a ReferenceError on EVERY payment update. The order's status was
+      // already written by then, so the money moved — but the throw was caught at the bottom and the
+      // user was told "Failed to update order information", the payment log row was never created,
+      // and the audit entry below it never ran. A payment that reports failure and leaves no trail,
+      // having actually succeeded, is the worst of the three possible outcomes.
+      const companyId = normalizeCompanyId(req);
       let order;
       const criteria = { _id: req.params.id, tenantId };
 
@@ -2025,6 +1897,10 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
       // Payment state before the write — "who marked this paid, and when" is the single most
       // asked question when a receivables report and the bank do not agree.
       const beforePayment = await Order.findOne(criteria).lean();
+      // Declared here, not inside the carrier branch: the audit entry below is shared by both
+      // payment types and reads it. A `const` inside the branch is invisible there — the same
+      // block-scoping mistake that made `companyId` throw on every payment update.
+      let paidLegSummary = { legId: null, legNo: null, carrierName: null, count: 0 };
       if(req.params.type === 'customer'){
             const update = {
                customer_payment_status : status,
@@ -2041,13 +1917,77 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
               runValidators: true,
             });
          await CreatePaymentLog(req.user?._id, req.params.id, status, method, 'customer', req?.user?.is_admin == 1 ? 'admin' : null, tenantId, companyId);
-      } else { 
+      } else {
+         // CARRIER PAYMENT IS PER LEG. An order can be split across two carriers, and one of them
+         // can be paid while the other is not — a single status on the order cannot say that.
+         // The legs hold the truth; the order keeps a status column that is ROLLED UP from them,
+         // so every existing report and query against the order still works untouched.
+         //
+         // `tripId` in the body pays one leg. Without it the whole order is paid, which is what
+         // every existing caller means and what a single-carrier order always means.
+         // `tripId` goes straight into a Mongo filter, and req.body is JSON — so a caller can send
+         // an OBJECT (`{"tripId":{"$ne":null}}`) and have it read as a query operator. Scoped to the
+         // order and tenant it could not reach another tenant's data, but it still turns a typed
+         // filter into an attacker-chosen one, and a malformed string would throw a cast error that
+         // the catch below reports as the generic "failed to update".
+         const rawTripId = req.body?.tripId;
+         if (rawTripId !== undefined && rawTripId !== null && rawTripId !== ''
+            && !mongooseLib.Types.ObjectId.isValid(String(rawTripId))) {
+            return res.status(400).json({
+               status: false,
+               code: 'invalid_leg_id',
+               message: 'That is not a valid leg id.',
+            });
+         }
+         const tripId = (rawTripId === undefined || rawTripId === null || rawTripId === '')
+            ? null
+            : String(rawTripId);
+         const legUpdate = {
+            carrier_payment_status: status,
+            carrier_payment_date: Date.now(),
+            carrier_payment_method: method,
+            carrier_payment_notes: notes,
+            carrier_payment_updated_by: req?.user?._id,
+         };
+
+         const existing = await Order.findOne(criteria).select('_id').lean();
+         if (!existing) {
+            return res.send({ status: false, message: "failed to update order information." });
+         }
+
+         const legFilter = { tenantId, order: existing._id, deletedAt: null, carrier: { $ne: null } };
+         if (tripId) legFilter._id = tripId;
+         const legResult = await Trip.updateMany(legFilter, { $set: legUpdate });
+
+         if (tripId && legResult.matchedCount === 0) {
+            return res.status(404).json({
+               status: false,
+               code: 'carrier_leg_not_found',
+               message: 'That leg is not on this order, or it has no carrier to pay.',
+            });
+         }
+
+         // Roll the legs back up onto the order. With no carrier leg at all (a fleet-only order that
+         // still carries a legacy status) the rollup returns null and the typed status is used, so
+         // nothing about the old single-carrier flow changes.
+         const legs = await Trip.find({ tenantId, order: existing._id, deletedAt: null })
+            .select('trip_no carrier carrier_payment_status')
+            .populate('carrier', 'name')
+            .lean();
+         const rolled = rollupCarrierPaymentStatus(legs);
+
+         const paidLeg = tripId ? legs.find((l) => String(l._id) === String(tripId)) : null;
+         paidLegSummary = {
+            legId: tripId || null,
+            legNo: paidLeg?.trip_no ?? null,
+            carrierName: paidLeg?.carrier?.name
+               || (tripId ? null : legs.filter((l) => l.carrier).map((l) => l.carrier?.name).filter(Boolean).join(', ') || null),
+            count: legResult.matchedCount ?? legResult.n ?? 0,
+         };
+
          const update = {
-            carrier_payment_status :status,
-            carrier_payment_date : Date.now(),
-            carrier_payment_method : method,
-            carrier_payment_notes : notes,
-            carrier_payment_updated_by : req?.user?._id,
+            ...legUpdate,
+            carrier_payment_status: rolled || status,
          };
          if (approve && req?.user?.is_admin == 1) {
             update.carrier_payment_approved_by_admin = 1;
@@ -2076,7 +2016,20 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
          description: `Updated ${req.params.type} payment status to "${status}" on order #${order.serial_no}`,
          resourceId: order._id,
          resourceName: `Order #${order.serial_no}`,
-         details: { paymentType: req.params.type, status, method, notes: notes || '' },
+         // On a two-carrier order "carrier payment set to paid" is not an answer — the trail has to
+         // name the leg and the carrier, or nobody can tell afterwards which of them was paid.
+         details: {
+            paymentType: req.params.type,
+            status,
+            method,
+            notes: notes || '',
+            ...(req.params.type !== 'customer' ? {
+               legId: paidLegSummary.legId,
+               legNo: paidLegSummary.legNo,
+               carrier: paidLegSummary.carrierName,
+               legsAffected: paidLegSummary.count,
+            } : {}),
+         },
       });
       res.send({
          status: true,
@@ -2260,7 +2213,7 @@ exports.overview = catchAsync(async (req, res) => {
    const displayCurrency = resolveDisplayCurrency(req, BASE_ORDER_CURRENCY);
    const fx = createOrderFxConverter(overviewTenantId, displayCurrency);
 
-   const moneyFields = 'total_amount carrier_amount settle_amount order_type isOwnerOperatedTruck created_by createdAt input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount';
+   const moneyFields = 'total_amount carrier_amount settle_amount cost_amount input_cost_amount carrier_ratio isMixedType order_type isOwnerOperatedTruck created_by createdAt input_currency revenue_currency input_total_amount input_carrier_amount input_settle_amount';
    const allOrdersForProfit = await Order.find(queryFilter)
          .select(moneyFields)
          .populate({ path: 'created_by', select: 'staff_commision' })
@@ -2453,29 +2406,15 @@ exports.customerInvoicePdf = catchAsync(async (req, res) => {
       ? await Company.findOne({ _id: companyId, tenantId }).lean()
       : await Company.findOne({ tenantId }).lean();
 
-   // Logo: the cached base64 first (no network), then the CDN copy, then the bundled default —
-   // same order the payslip and owner statement use.
-   const fs = require('fs');
-   const path = require('path');
-   let logoBase64 = company?.logo_base64 || '';
-   if (!logoBase64 && (company?.pdf_logo || company?.logo)) {
-      try {
-         const axios = require('axios');
-         const resp = await axios.get(company.pdf_logo || company.logo, { responseType: 'arraybuffer', timeout: 8000 });
-         const mime = resp.headers['content-type'] || 'image/png';
-         logoBase64 = `data:${mime};base64,${Buffer.from(resp.data).toString('base64')}`;
-      } catch (e) { /* fall through to the bundled logo */ }
-   }
-   if (!logoBase64) {
-      try {
-         const p = path.join(__dirname, '..', 'assets', 'logo.png');
-         if (fs.existsSync(p)) logoBase64 = `data:image/png;base64,${fs.readFileSync(p).toString('base64')}`;
-      } catch (e) { /* logo is optional */ }
-   }
+   // Cached base64 first (no network), then the stored URL, then the bundled default — see
+   // utils/pdfBranding.js. Shared with the rate confirmation so the two documents cannot end up
+   // branded differently.
+   const { resolveCompanyLogoBase64 } = require('../utils/pdfBranding');
+   const logoBase64 = await resolveCompanyLogoBase64(company);
 
    const issuedAt = new Date();
    const invoiceNo = buildInvoiceNo(order, issuedAt);
-   const html = buildCustomerInvoiceHtml({ order, company, invoiceNo, issuedAt, logoBase64 });
+   const html = buildCustomerInvoiceHtml({ order, company, invoiceNo, issuedAt, logoBase64, tenantId });
 
    const { launchBrowser, hardenPage } = require('../utils/puppeteer');
    let browser = null;
@@ -2501,8 +2440,11 @@ exports.customerInvoicePdf = catchAsync(async (req, res) => {
          resourceName: `#${order.serial_no ?? ''}`,
       });
 
+      const { getOrderNumber } = require('../utils/orderNumber');
+      const orderNo = getOrderNumber({ order, company, tenantId });
+
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="CMC${order.serial_no || ''}_invoice-${invoiceNo}.pdf"`);
+      res.setHeader('Content-Disposition', `attachment; filename="${orderNo}_invoice-${invoiceNo}.pdf"`);
       return res.end(pdfBuffer);
    } catch (err) {
       if (browser) { try { await browser.close(); } catch (e) { /* noop */ } }
@@ -2534,7 +2476,7 @@ exports.order_detail = catchAsync(async (req, res) => {
 
    const order = await Order.findOne(criteria)
       .populate({ path: 'created_by', options: { includeInactive: true } })
-      .populate(['customer', 'carrier', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator'])
+      .populate(['customer', 'carrier', 'carriers', 'driver', 'drivers', 'truck', 'trailer', 'ownerOperator', 'ownerOperators'])
       .populate('documents_count');
 
     if(!order){
@@ -3067,7 +3009,12 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
       if (sanitizedCarrierId) {
          const mongoose = require('mongoose');
          if (mongoose.Types.ObjectId.isValid(sanitizedCarrierId)) {
-            queryObj.carrier = sanitizedCarrierId;
+            // An order split between two carriers has `carrier: null` and the list in `carriers`,
+            // so matching the single column alone drops that order out of BOTH carriers' order
+            // lists — the carrier disappears from their own work. Pushed onto `$and`: this filter
+            // is an `$or`, and assigning `queryObj.$or` would overwrite the soft-delete `$or` and
+            // start returning deleted orders.
+            queryObj.$and = (queryObj.$and || []).concat([carrierOrderMatch(sanitizedCarrierId)]);
          } else {
             // Invalid ObjectId, return empty results
             return res.json({

@@ -52,6 +52,18 @@ const driverSalarySchema = new mongoose.Schema(
     deductionTotal: { type: Number, default: 0 },  // per-date DriverDeduction 'deduct' rows, converted
     additionTotal: { type: Number, default: 0 },   // per-date DriverDeduction 'add' (non-city) rows, converted
 
+    // Contractor tax (HST/GST) — SNAPSHOT of the driver's profile at generate time, like the
+    // rate snapshot above: regenerating reproduces the same numbers even if the profile's tax
+    // registration is edited later. Tax base = trip pay + city pay ONLY (additions/deductions
+    // excluded — client unconfirmed on those). All amounts in `currency`.
+    taxEnabled: { type: Boolean, default: false },
+    taxRate: { type: Number, default: 0 },          // percent, e.g. 13
+    taxNumber: { type: String, default: '' },
+    taxCompanyName: { type: String, default: '' },
+    taxableBase: { type: Number, default: 0 },      // tripPay + cityPay, converted
+    taxAmount: { type: Number, default: 0 },        // taxableBase × taxRate/100, converted
+    payableBeforeTax: { type: Number, default: 0 }, // finalPayable − taxAmount ("without tax" line)
+
     // Lifecycle (parity with owner)
     basePayable: { type: Number, default: 0 },     // tripPay + cityPay - deductionTotal
     previousDueAdded: { type: Number, default: 0 },

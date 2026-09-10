@@ -6,6 +6,8 @@ const Trailer = require('../db/Trailer');
 const User = require('../db/Users');
 const DriverProfile = require('../db/DriverProfile');
 const OwnerOperator = require('../db/OwnerOperator');
+const Vendor = require('../db/Vendor');
+const { hasChequeAccess } = require('./vendorController');
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -84,7 +86,11 @@ const FIELD_SETS = {
   driverProfiles: [
     { path: 'emails.email', weight: 85 },
     { path: 'phones.phone', weight: 80, phone: true },
-    { path: 'licenseNumber', weight: 95 }
+    { path: 'licenseNumber', weight: 95 },
+    // An incorporated driver is often looked up by the corp on their invoice, or by the HST
+    // number on it — neither is their personal name, so without these they are unfindable.
+    { path: 'taxNumber', weight: 90 },
+    { path: 'taxCompanyName', weight: 75 }
   ],
   trucks: [
     { path: 'plateNumber', weight: 100 },
@@ -119,6 +125,19 @@ const FIELD_SETS = {
     { path: 'shipping_details.locations.city', weight: 55 },
     { path: 'order_status', weight: 35 },
     { path: 'notes', weight: 25 }
+  ],
+  vendors: [
+    { path: 'name', weight: 100 },
+    { path: 'code', weight: 95 },
+    { path: 'email', weight: 85 },
+    { path: 'emails.email', weight: 85 },
+    { path: 'phone', weight: 80, phone: true },
+    { path: 'address', weight: 40 },
+    { path: 'city', weight: 45 },
+    { path: 'state', weight: 35 },
+    { path: 'country', weight: 30 },
+    { path: 'zipcode', weight: 45 },
+    { path: 'notes', weight: 25 }
   ]
 };
 
@@ -131,6 +150,7 @@ const SECTION_ORDER = [
   { key: 'drivers', title: 'Drivers' },
   { key: 'employees', title: 'Employees' },
   { key: 'ownerOperators', title: 'Owner Operators' },
+  { key: 'vendors', title: 'Vendors' },
   { key: 'trucks', title: 'Trucks' },
   { key: 'trailers', title: 'Trailers' },
   { key: 'orders', title: 'Orders' }
@@ -148,6 +168,7 @@ function looseDigitsRegex(digits) {
 
 /** Every token must match SOME field (AND across tokens, OR across fields). */
 function buildFieldQuery(tokens, fields, qDigits) {
+  const phoneFields = fields.filter((f) => f.phone);
   const and = tokens.map((token) => {
     const r = new RegExp(escapeRegex(token), 'i');
     const or = [];
@@ -166,16 +187,32 @@ function buildFieldQuery(tokens, fields, qDigits) {
       }
       or.push({ [f.path]: r });
     }
+
+    // A token that is mostly digits may be a phone typed without separators.
+    // This is an ALTERNATIVE inside the token's own $or, never an extra
+    // requirement — see the note below.
+    const tokenDigits = token.replace(/[^0-9]/g, '');
+    if (tokenDigits.length >= 7) {
+      const loose = looseDigitsRegex(tokenDigits);
+      for (const f of phoneFields) or.push({ [f.path]: loose });
+    }
+
     return or.length ? { $or: or } : null;
   }).filter(Boolean);
 
-  // Phone typed with separators, or stored with them.
-  if (qDigits && qDigits.length >= 4) {
+  // Whole query as one phone number, e.g. "416 555 2211" typed with spaces —
+  // each token matches a fragment, but the joined digits are the real signal.
+  //
+  // This used to be `and.push(...)`, which made a phone match REQUIRED: any
+  // query carrying 4+ digits ("V9999", a postal code, a street number) was
+  // silently ANDed against the phone fields and returned nothing for every
+  // entity that has a phone. It is an alternative to the token match, not a
+  // second condition.
+  if (qDigits && qDigits.length >= 7 && phoneFields.length) {
     const loose = looseDigitsRegex(qDigits);
-    const phoneFields = fields.filter((f) => f.phone);
-    if (phoneFields.length) {
-      and.push({ $or: phoneFields.map((f) => ({ [f.path]: loose })) });
-    }
+    const phoneOr = { $or: phoneFields.map((f) => ({ [f.path]: loose })) };
+    if (!and.length) return [phoneOr];
+    return [{ $or: [{ $and: and }, phoneOr] }];
   }
   return and;
 }
@@ -262,7 +299,7 @@ exports._internals = { FIELD_SETS, SECTION_ORDER, buildFieldQuery, valuesAtPath,
 exports.globalSearch = async (req, res) => {
   const emptyResults = () => ({
     orders: [], customers: [], carriers: [], trucks: [], trailers: [],
-    drivers: [], employees: [], ownerOperators: []
+    drivers: [], employees: [], ownerOperators: [], vendors: []
   });
 
   try {
@@ -377,7 +414,14 @@ exports.globalSearch = async (req, res) => {
       $and: [NOT_DELETED, ...buildFieldQuery(searchTokens, FIELD_SETS.driverProfiles, qDigits)]
     };
 
-    const [rawCustomers, rawCarriers, rawOwnerOperators, matchingProfiles, rawTrucks, rawTrailers] = await Promise.all([
+    // Vendors exist to be paid, so they follow the cheque gate, not the module
+    // gates — a dispatcher with no accounting access never sees this section.
+    const vendorQuery = {
+      tenantId,
+      $and: [NOT_DELETED, ...buildFieldQuery(searchTokens, FIELD_SETS.vendors, qDigits)]
+    };
+
+    const [rawCustomers, rawCarriers, rawOwnerOperators, matchingProfiles, rawTrucks, rawTrailers, rawVendors] = await Promise.all([
       hasCustomersAccess && wants('customers')
         ? Customer.find(customerQuery)
           .select('_id name email phone customerCode address city state country zipcode secondary_email secondary_phone emails createdAt')
@@ -397,7 +441,7 @@ exports.globalSearch = async (req, res) => {
         : Promise.resolve([]),
 
       hasEmployeesAccess
-        ? DriverProfile.find(profileQuery).select('user licenseNumber emails phones').limit(SCAN_LIMIT).lean()
+        ? DriverProfile.find(profileQuery).select('user licenseNumber emails phones taxNumber taxCompanyName').limit(SCAN_LIMIT).lean()
         : Promise.resolve([]),
 
       hasRegular && wants('trucks')
@@ -409,6 +453,12 @@ exports.globalSearch = async (req, res) => {
       hasRegular && wants('trailers')
         ? Trailer.find(trailerQuery)
           .select('_id plateNumber unitNumber vin licenseNumber type make model length notes createdAt')
+          .limit(SCAN_LIMIT).lean()
+        : Promise.resolve([]),
+
+      hasChequeAccess(req.user) && wants('vendors')
+        ? Vendor.find(vendorQuery)
+          .select('_id name code email phone emails address city state country zipcode notes createdAt')
           .limit(SCAN_LIMIT).lean()
         : Promise.resolve([])
     ]);
@@ -437,7 +487,14 @@ exports.globalSearch = async (req, res) => {
     const profileById = new Map(matchingProfiles.map((p) => [String(p.user), p]));
     const withProfile = (u) => {
       const profile = profileById.get(String(u._id));
-      return profile ? { ...u, licenseNumber: profile.licenseNumber, emails: profile.emails, phones: profile.phones } : u;
+      return profile ? {
+        ...u,
+        licenseNumber: profile.licenseNumber,
+        emails: profile.emails,
+        phones: profile.phones,
+        taxNumber: profile.taxNumber,
+        taxCompanyName: profile.taxCompanyName
+      } : u;
     };
     const rawDrivers = rawPeople.filter(isDriverUser).map(withProfile);
     const rawEmployees = hasStaffDirectoryAccess ? rawPeople.filter((u) => !isDriverUser(u)) : [];
@@ -449,6 +506,7 @@ exports.globalSearch = async (req, res) => {
     const ownerOperators = rank(rawOwnerOperators, FIELD_SETS.ownerOperators, ctx, limit);
     const trucks = rank(rawTrucks, FIELD_SETS.trucks, ctx, limit);
     const trailers = rank(rawTrailers, FIELD_SETS.trailers, ctx, limit);
+    const vendors = rank(rawVendors, FIELD_SETS.vendors, ctx, limit);
     // A driver matched only through their DriverProfile still deserves a slot.
     const drivers = wants('drivers') ? rank(rawDrivers, driverFields, ctx, limit, { baseScore: 55 }) : [];
     const employees = wants('employees') ? rank(rawEmployees, FIELD_SETS.drivers, ctx, limit) : [];
@@ -486,7 +544,14 @@ exports.globalSearch = async (req, res) => {
         ownerOperator: rawOwnerOperators.map((d) => d._id)
       };
       if (relationIds.customer.length) orderMatch.push({ customer: { $in: relationIds.customer } });
-      if (relationIds.carrier.length) orderMatch.push({ carrier: { $in: relationIds.carrier } });
+      // Both columns: an order split between two carriers carries them in `carriers` and leaves
+      // `carrier` null, so matching the single column alone would hide it from a carrier search.
+      if (relationIds.carrier.length) {
+        orderMatch.push({ $or: [
+          { carrier: { $in: relationIds.carrier } },
+          { carriers: { $in: relationIds.carrier } },
+        ] });
+      }
       if (relationIds.driver.length) {
         orderMatch.push({ driver: { $in: relationIds.driver } });
         orderMatch.push({ drivers: { $in: relationIds.driver } });
@@ -502,7 +567,7 @@ exports.globalSearch = async (req, res) => {
         orderQuery.$and.push({ $or: orderMatch });
 
         const rawOrders = await Order.find(orderQuery)
-          .select('_id serial_no customer_order_no company_name order_type total_amount order_status createdAt shipping_details customer carrier truck trailer driver drivers ownerOperator ownerOperators notes')
+          .select('_id serial_no customer_order_no company_name order_type total_amount order_status createdAt shipping_details customer carrier carriers truck trailer driver drivers ownerOperator ownerOperators notes')
           .sort({ createdAt: -1 })
           .limit(SCAN_LIMIT)
           .lean();
@@ -519,6 +584,7 @@ exports.globalSearch = async (req, res) => {
         const matchVia = (order) => {
           if (order.customer && relSets.customer.has(String(order.customer))) return 'customer';
           if (order.carrier && relSets.carrier.has(String(order.carrier))) return 'carrier';
+          if (Array.isArray(order.carriers) && order.carriers.some((c) => relSets.carrier.has(String(c)))) return 'carrier';
           const orderDrivers = [order.driver, ...(order.drivers || [])].filter(Boolean).map(String);
           if (orderDrivers.some((d) => relSets.driver.has(d))) return 'driver';
           if (order.truck && relSets.truck.has(String(order.truck))) return 'truck';
@@ -545,7 +611,7 @@ exports.globalSearch = async (req, res) => {
       }
     }
 
-    const results = { orders, customers, carriers, trucks, trailers, drivers, employees, ownerOperators };
+    const results = { orders, customers, carriers, trucks, trailers, drivers, employees, ownerOperators, vendors };
     const sections = SECTION_ORDER
       .map(({ key, title }) => ({ key, title, count: results[key].length, items: results[key] }))
       .filter((s) => s.count > 0);

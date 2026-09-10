@@ -21,6 +21,10 @@ const EPSILON = 0.005;
  * @param {number} input.additions            itemized additions, in the payslip currency
  * @param {number} input.deductions           itemized deductions, in the payslip currency
  * @param {number} input.paidAmount           paid to date, in the payslip currency
+ * @param {number} [input.taxAmount]          contractor tax (HST/GST) ADDED on top of earnings.
+ *   Driver payroll only; owner payroll never passes it (defaults to 0, math unchanged).
+ *   Computed by the caller on the period's earnings — carry-forward balances were already
+ *   taxed in their own month and must not be taxed again.
  */
 function computePayslipTotals(input) {
   const basePayable = round2(input?.basePayable);
@@ -29,9 +33,10 @@ function computePayslipTotals(input) {
   const additions = round2(input?.additions);
   const deductions = round2(input?.deductions);
   const paidAmount = round2(input?.paidAmount);
+  const taxAmount = round2(input?.taxAmount);
 
   const finalPayable = round2(
-    basePayable + previousDueAdded - previousOwedDeducted + additions - deductions
+    basePayable + taxAmount + previousDueAdded - previousOwedDeducted + additions - deductions
   );
 
   // A NEGATIVE payslip is a real state: the worker owes the company. Clamping it to zero
@@ -52,6 +57,7 @@ function computePayslipTotals(input) {
 
   return {
     basePayable,
+    taxAmount,
     previousDueAdded,
     previousOwedDeducted,
     additions,

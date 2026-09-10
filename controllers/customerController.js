@@ -1,4 +1,5 @@
 const catchAsync = require("../utils/catchAsync");
+const { customerVisibilityOr } = require('../utils/entityVisibility');
 const APIFeatures  = require("../utils/APIFeatures");
 const Customer = require("../db/Customer");
 const JSONerror = require("../utils/jsonErrorHandler");
@@ -127,27 +128,11 @@ exports.customers_listing = catchAsync(async (req, res) => {
   }
   queryObj.tenantId = tenantId;
 
-  const perms    = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
-  const isAdmin  = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || perms.includes('subadmin');
-  const hasAccounting = perms.includes('accounting');
-
-  if (isAdmin || hasAccounting) {
-    // Admin / Subadmin / Accounting → see ALL customers in the tenant
-  } else {
-    // Everyone else → customers assigned to them, PLUS unassigned customers in
-    // their own company if they have the `regular` orders permission.
-    const visibility = [{ assigned_to: req.user._id }];
-    if (perms.includes('regular')) {
-      const myCompany = req.user?.company?._id || req.user?.company || null;
-      if (myCompany) {
-        visibility.push({
-          company: myCompany,
-          $or: [{ assigned_to: { $size: 0 } }, { assigned_to: { $exists: false } }],
-        });
-      }
-    }
-    queryObj.$or = visibility;
-  }
+  // Admin / sub-admin / accounting see everything; everyone else is scoped to
+  // assigned customers plus unassigned ones in their own company. One definition,
+  // shared with customerDetails and with the document endpoints.
+  const customerScope = customerVisibilityOr(req.user);
+  if (customerScope) queryObj.$or = customerScope;
 
   if (search && search.length >1) {
     const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -194,24 +179,8 @@ exports.customerDetails = catchAsync(async (req, res, next) => {
   }
   const criteria = { _id: req.params.id, tenantId: tenantIdDet };
 
-  const permsD = Array.isArray(req.user?.permissions) ? req.user.permissions : [];
-  const isAdminDet = req.user?.is_admin === 1 || Number(req.user?.role) === 3 || permsD.includes('subadmin');
-  const hasAccountingDet = permsD.includes('accounting');
-  if (!isAdminDet && !hasAccountingDet) {
-    // Assigned customers, plus unassigned ones in their company if they hold
-    // the `regular` orders permission (mirrors listing visibility).
-    const visibilityDet = [{ assigned_to: req.user._id }];
-    if (permsD.includes('regular')) {
-      const myCompanyDet = req.user?.company?._id || req.user?.company || null;
-      if (myCompanyDet) {
-        visibilityDet.push({
-          company: myCompanyDet,
-          $or: [{ assigned_to: { $size: 0 } }, { assigned_to: { $exists: false } }],
-        });
-      }
-    }
-    criteria.$or = visibilityDet;
-  }
+  const detailScope = customerVisibilityOr(req.user);
+  if (detailScope) criteria.$or = detailScope;
 
   const customer = await Customer.findOne(criteria).populate('assigned_to', '_id name email phone role is_admin');
   if(!customer){

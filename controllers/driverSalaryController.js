@@ -175,6 +175,14 @@ async function computeDriverTripPay(tenantId, driverId, range) {
     soloRate, teamRate, cityRate,
     totalTrips, totalMiles, totalKm, totalPay,
     byOrder: Array.from(byOrderMap.values()).sort((a, b) => b.trips - a.trips),
+    // Contractor tax registration, read here (the one place the profile is loaded) so the
+    // payload builder can snapshot it onto the payslip.
+    tax: {
+      enabled: driverProfile?.taxEnabled === true,
+      rate: Math.min(Math.max(Number(driverProfile?.taxRate ?? 13) || 0, 0), 100),
+      number: String(driverProfile?.taxNumber || ''),
+      companyName: String(driverProfile?.taxCompanyName || ''),
+    },
   };
 }
 exports.computeDriverTripPay = computeDriverTripPay;
@@ -292,8 +300,18 @@ async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCu
   const manualDeduction = 0;
 
   const basePayable = round2(tripPay + cityPay - deductionTotal);
+
+  // Contractor tax (HST/GST): charged ON TOP of what the period's driving earned — trip pay +
+  // city pay only. Additions/deductions and carry-forward balances are deliberately outside the
+  // base (additions unconfirmed with the client; carry-forwards were taxed in their own month).
+  const taxEnabled = tp.tax?.enabled === true;
+  const taxRate = taxEnabled ? Number(tp.tax.rate || 0) : 0;
+  const taxableBase = taxEnabled ? round2(tripPay + cityPay) : 0;
+  const taxAmount = taxEnabled ? round2(taxableBase * (taxRate / 100)) : 0;
+
   const totals = computePayslipTotals({
     basePayable,
+    taxAmount,
     previousDueAdded,
     previousOwedDeducted,
     additions: additionTotal,
@@ -313,6 +331,9 @@ async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCu
     soloRate: tp.soloRate, teamRate: tp.teamRate, cityRate: tp.cityRate,
     totalTrips: tp.totalTrips, totalMiles: tp.totalMiles, totalKm: tp.totalKm,
     tripPay, cityHours: dd.cityHours, cityPay, deductionTotal, additionTotal,
+    taxEnabled, taxRate, taxNumber: taxEnabled ? tp.tax.number : '',
+    taxCompanyName: taxEnabled ? tp.tax.companyName : '',
+    taxableBase, taxAmount, payableBeforeTax: round2(finalPayable - taxAmount),
     basePayable, previousDueAdded, previousOwedDeducted, manualDeduction, manualAddition,
     finalPayable, paidAmount, dueAmount, owedAmount, overpaidAmount, paymentStatus,
     orderBreakdown,
@@ -489,6 +510,7 @@ exports.updateDriverSalary = catchAsync(async (req, res, next) => {
 
     const totals = computePayslipTotals({
       basePayable: salary.basePayable,
+      taxAmount: salary.taxAmount,
       previousDueAdded: salary.previousDueAdded,
       previousOwedDeducted: salary.previousOwedDeducted,
       additions: salary.additionTotal,
@@ -508,6 +530,7 @@ exports.updateDriverSalary = catchAsync(async (req, res, next) => {
     }
 
     salary.finalPayable = totals.finalPayable;
+    salary.payableBeforeTax = round2(totals.finalPayable - round2(salary.taxAmount || 0));
     salary.paidAmount = totals.paidAmount;
     salary.dueAmount = totals.dueAmount;
     salary.owedAmount = totals.owedAmount;
@@ -679,8 +702,9 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
         </div>
 
         <div class="cards">
-          <div class="card"><div class="l">Driver</div><div class="n">${safe(driver.name || '')}</div></div>
+          <div class="card"><div class="l">Driver</div><div class="n">${safe(driver.name || '')}</div>${salary.taxEnabled && salary.taxCompanyName ? `<div style="font-size:10px;margin-top:3px;color:#64748b;">${safe(salary.taxCompanyName)}</div>` : ''}</div>
           <div class="card"><div class="l">ID</div><div class="n">${safe(driver.corporateID || '—')}</div></div>
+          ${salary.taxEnabled ? `<div class="card"><div class="l">HST/GST No</div><div class="n" style="font-size:13px;">${safe(salary.taxNumber || '—')}</div></div>` : ''}
           <div class="card"><div class="l">Trips</div><div class="n">${Number(salary.totalTrips || 0)}</div></div>
           <div class="card"><div class="l">Miles</div><div class="n">${Number(salary.totalMiles || 0).toFixed(2)} mi</div></div>
         </div>
@@ -704,7 +728,11 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
           ${Number(salary.previousDueAdded) ? `<tr><td>Previous Due</td><td style="text-align:right;">${fmt(salary.previousDueAdded)}</td></tr>` : ''}
           ${(Number(salary.additionTotal) + Number(salary.manualAddition)) ? `<tr><td>Additions</td><td style="text-align:right;">${fmt(Number(salary.additionTotal || 0) + Number(salary.manualAddition || 0))}</td></tr>` : ''}
           ${Number(salary.manualDeduction) ? `<tr><td>Manual Deduction</td><td style="text-align:right;color:#dc2626;">- ${fmt(salary.manualDeduction)}</td></tr>` : ''}
-          <tr><td class="grand">NET PAYABLE</td><td class="grand" style="text-align:right;">${fmt(salary.finalPayable)}</td></tr>
+          ${salary.taxEnabled && Number(salary.taxAmount || 0) !== 0 ? `
+          <tr><td style="font-weight:700;">TOTAL BEFORE TAX</td><td style="text-align:right;font-weight:700;">${fmt(salary.payableBeforeTax)}</td></tr>
+          <tr><td>HST/GST (${Number(salary.taxRate || 0)}% on ${fmt(salary.taxableBase)})</td><td style="text-align:right;">+ ${fmt(salary.taxAmount)}</td></tr>
+          <tr><td class="grand">NET PAYABLE (WITH TAX)</td><td class="grand" style="text-align:right;">${fmt(salary.finalPayable)}</td></tr>` : `
+          <tr><td class="grand">NET PAYABLE</td><td class="grand" style="text-align:right;">${fmt(salary.finalPayable)}</td></tr>`}
           ${Number(salary.paidAmount) ? `<tr><td>Paid</td><td style="text-align:right;">${fmt(salary.paidAmount)}</td></tr><tr><td>Due</td><td style="text-align:right;font-weight:700;">${fmt(salary.dueAmount)}</td></tr>` : ''}
         </table>
       </body></html>`;
@@ -809,6 +837,7 @@ exports.syncRecurringDeductions = syncRecurringDeductions;
 async function applyDriverPaidTotal(salary, nextPaid) {
   const totals = computePayslipTotals({
     basePayable: salary.basePayable,
+    taxAmount: salary.taxAmount,
     previousDueAdded: salary.previousDueAdded,
     previousOwedDeducted: salary.previousOwedDeducted,
     additions: salary.additionTotal,
@@ -816,6 +845,7 @@ async function applyDriverPaidTotal(salary, nextPaid) {
     paidAmount: Math.max(round2(nextPaid), 0),
   });
   salary.finalPayable = totals.finalPayable;
+  salary.payableBeforeTax = round2(totals.finalPayable - round2(salary.taxAmount || 0));
   salary.paidAmount = totals.paidAmount;
   salary.dueAmount = totals.dueAmount;
   salary.owedAmount = totals.owedAmount;
@@ -844,48 +874,47 @@ exports.listDriverPayments = catchAsync(async (req, res, next) => {
 });
 
 // POST /driver/:driverId/salary/:salaryId/payment  { amount, currency, notes, date, method, allowOverpay }
-exports.addDriverPayment = catchAsync(async (req, res, next) => {
-  try {
-    if (!hasDriverSalaryAccess(req)) {
-      return res.status(403).json({ status: false, message: 'You are not allowed to record driver payments' });
-    }
+// The one definition of "record a payment against a driver payslip" — used by
+// the payment endpoint below AND by cheque application (a cheque applied to a
+// payslip IS a payment). Returns { ok:false, status, body } for a client error
+// or { ok:true, salary, payment, totals }.
+async function recordDriverPaymentCore(req, { driverId, salaryId, amount, currency, date, notes, method, allowOverpay }) {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant could not be resolved' });
-    const { driverId, salaryId } = req.params;
+    if (!tenantId) return { ok: false, status: 400, body: { status: false, message: 'Tenant could not be resolved' } };
     const salary = await DriverSalary.findOne({ _id: salaryId, tenantId, driver: driverId });
-    if (!salary) return res.status(404).json({ status: false, message: 'Payslip not found' });
+    if (!salary) return { ok: false, status: 404, body: { status: false, message: 'Payslip not found' } };
 
-    const typed = Number(req.body?.amount);
+    const typed = Number(amount);
     if (!Number.isFinite(typed) || typed <= 0) {
-      return res.status(400).json({ status: false, message: 'Payment amount must be greater than 0' });
+      return { ok: false, status: 400, body: { status: false, message: 'Payment amount must be greater than 0' } };
     }
-    let date = null;
-    if (req.body?.date) {
-      date = new Date(req.body.date);
-      if (Number.isNaN(date.getTime())) return res.status(400).json({ status: false, message: 'Invalid date' });
+    let payDate = null;
+    if (date) {
+      payDate = new Date(date);
+      if (Number.isNaN(payDate.getTime())) return { ok: false, status: 400, body: { status: false, message: 'Invalid date' } };
     }
 
     const salaryCurrency = normalizeCurrency(salary.currency, 'USD');
-    const inputCurrency = normalizeCurrency(req.body?.currency, salaryCurrency);
+    const inputCurrency = normalizeCurrency(currency, salaryCurrency);
     const fxMap = await ensureMonthlyFxRates(tenantId, salary.month, salary.year, salaryCurrency, [inputCurrency], req.user?._id);
     const conv = convertAmount(typed, inputCurrency, salaryCurrency, fxMap);
     const converted = round2(conv.value);
-    if (!(converted > 0)) return res.status(400).json({ status: false, message: 'Converted payment amount is invalid' });
+    if (!(converted > 0)) return { ok: false, status: 400, body: { status: false, message: 'Converted payment amount is invalid' } };
 
     const alreadyPaid = round2(salary.paidAmount);
     const nextPaid = round2(alreadyPaid + converted);
     const payableFloor = Math.max(round2(salary.finalPayable), 0);
     // Never clamp silently: the excess is either intentional or a typo, and only the person
     // typing it knows which.
-    if (nextPaid - payableFloor > EPSILON && !req.body?.allowOverpay) {
-      return res.status(409).json({
+    if (nextPaid - payableFloor > EPSILON && !allowOverpay) {
+      return { ok: false, status: 409, body: {
         status: false,
         code: 'overpayment',
         message: `That is more than the ${salaryCurrency} ${(payableFloor - alreadyPaid).toFixed(2)} still owed on this payslip.`,
         dueAmount: round2(Math.max(payableFloor - alreadyPaid, 0)),
         excess: round2(nextPaid - payableFloor),
         currency: salaryCurrency,
-      });
+      } };
     }
 
     const before = salary.toObject();
@@ -902,9 +931,9 @@ exports.addDriverPayment = catchAsync(async (req, res, next) => {
       inputAmount: round2(typed),
       inputCurrency,
       fxRate: Number(conv.rate || 1),
-      date,
-      notes: String(req.body?.notes || '').trim(),
-      method: String(req.body?.method || '').trim(),
+      date: payDate,
+      notes: String(notes || '').trim(),
+      method: String(method || '').trim(),
       createdBy: req.user?._id,
     });
 
@@ -924,6 +953,27 @@ exports.addDriverPayment = catchAsync(async (req, res, next) => {
       },
     });
 
+    return { ok: true, salary, payment, totals };
+}
+exports.recordDriverPaymentCore = recordDriverPaymentCore;
+
+exports.addDriverPayment = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasDriverSalaryAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to record driver payments' });
+    }
+    const result = await recordDriverPaymentCore(req, {
+      driverId: req.params.driverId,
+      salaryId: req.params.salaryId,
+      amount: req.body?.amount,
+      currency: req.body?.currency,
+      date: req.body?.date,
+      notes: req.body?.notes,
+      method: req.body?.method,
+      allowOverpay: !!req.body?.allowOverpay,
+    });
+    if (!result.ok) return res.status(result.status).json(result.body);
+    const { salary, payment, totals } = result;
     return res.json({ status: true, message: 'Payment recorded', salary, payment, totals });
   } catch (err) {
     JSONerror(res, err, next);
@@ -997,17 +1047,15 @@ exports.updateDriverPayment = catchAsync(async (req, res, next) => {
 });
 
 // POST /driver/:driverId/salary/payment/remove/:paymentId
-exports.removeDriverPayment = catchAsync(async (req, res, next) => {
-  try {
-    if (!hasDriverSalaryAccess(req)) {
-      return res.status(403).json({ status: false, message: 'You are not allowed to delete driver payments' });
-    }
+// Reverse one recorded driver payment — shared by the endpoint and by removing
+// a cheque application.
+async function removeDriverPaymentCore(req, paymentId) {
     const tenantId = getTenantId(req);
-    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant could not be resolved' });
-    const payment = await DriverPayment.findOne({ _id: req.params.paymentId, tenantId });
-    if (!payment) return res.status(404).json({ status: false, message: 'Payment not found' });
+    if (!tenantId) return { ok: false, status: 400, body: { status: false, message: 'Tenant could not be resolved' } };
+    const payment = await DriverPayment.findOne({ _id: paymentId, tenantId });
+    if (!payment) return { ok: false, status: 404, body: { status: false, message: 'Payment not found' } };
     const salary = await DriverSalary.findOne({ _id: payment.salary, tenantId });
-    if (!salary) return res.status(404).json({ status: false, message: 'Payslip not found for this payment' });
+    if (!salary) return { ok: false, status: 404, body: { status: false, message: 'Payslip not found for this payment' } };
 
     const before = salary.toObject();
     const amount = round2(payment.amount);
@@ -1028,7 +1076,18 @@ exports.removeDriverPayment = catchAsync(async (req, res, next) => {
       details: { paymentId: payment._id, amount, currency: payment.currency, notes: payment.notes },
     });
 
-    return res.json({ status: true, message: 'Payment reversed', salary, totals });
+    return { ok: true, salary, totals };
+}
+exports.removeDriverPaymentCore = removeDriverPaymentCore;
+
+exports.removeDriverPayment = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasDriverSalaryAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to delete driver payments' });
+    }
+    const result = await removeDriverPaymentCore(req, req.params.paymentId);
+    if (!result.ok) return res.status(result.status).json(result.body);
+    return res.json({ status: true, message: 'Payment reversed', salary: result.salary, totals: result.totals });
   } catch (err) {
     JSONerror(res, err, next);
     logger(err);
