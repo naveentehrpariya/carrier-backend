@@ -246,5 +246,10 @@ app.all('*', (req, res, next) => {
 app.use(errorHandler);
 app.use(globalErrorHandler);
 
-const port = process.env.PORT || '5004';
+// 8080 is what nginx on the production box proxies /api to. This default is
+// PRODUCTION CONFIGURATION, not a local convenience: changing it to 5004 in
+// bd12424 moved the live app off the port nginx was forwarding to, and every
+// /api route answered Cloudflare 502 while pm2 reported the app healthy and
+// every deploy went green. Override it with PORT in .env for local work.
+const port = process.env.PORT || '8080';
 app.listen(port, () => { console.log(`On PORT ${port} SERVER RUNNINGGGGG.....`) });

@@ -5,3 +5,7 @@ config.env
 uploads
 client_secret.json
 client_secret - Copy.json
+# pm2 writes carrier-out.log / carrier-error.log here. The deploy runs
+# `git clean -fd`, which was deleting them mid-run — so the one place the
+# app's own crash output lives disappeared on every deploy.
+logs

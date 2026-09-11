@@ -30,28 +30,32 @@ jobs:
             # that would have told us.
             npm ci --omit=dev
 
-            # Restart the ONE app that serves this repo, BY NAME. Set APP to whatever
-            # `pm2 list` calls it on the box — do not invent a new name here, or pm2
-            # starts an extra copy and two processes then fight over port 8080.
-            # `pm2 restart all` is deliberately not used: it touches every app on the
-            # box and fails the whole deploy when any unrelated entry is missing, which
-            # is how a deploy reported failure while the API was the thing that needed
-            # attention.
-            APP=index
+            # Restart ONLY this repo's app, by name. pm2 on this box also runs an
+            # unrelated email/chat sync app called `index` (port 5001) — `pm2 restart
+            # all` was bouncing that too, and failing this whole deploy whenever one of
+            # its entries was missing.
+            APP=carrier
             pm2 restart "$APP" --update-env
             pm2 save
+
+            # The port the app actually binds: .env wins, else index.js's default.
+            # Hardcoding it here is how a health check passes against the wrong process.
+            PORT=$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | sed -E 's/^PORT=//; s/[^0-9]//g')
+            PORT=${PORT:-8080}
+            echo "health check will probe 127.0.0.1:$PORT"
 
             # A deploy that leaves the app crash-looping must FAIL. Without this, pm2
             # reports the restart as fine, the workflow goes green, and the first person
             # to notice is a customer getting a 502.
             for i in $(seq 1 15); do
               sleep 2
-              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8080/ || true)
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/" || true)
               if [ "$code" = "200" ]; then
-                echo "health check: origin answered 200 after $((i * 2))s"
+                echo "health check: origin answered 200 on :$PORT after $((i * 2))s"
                 exit 0
               fi
             done
-            echo "health check FAILED — the app is not answering on :8080. Last 60 log lines:"
+            echo "health check FAILED — $APP is not answering on :$PORT."
+            pm2 describe "$APP" || true
             pm2 logs "$APP" --lines 60 --nostream || true
             exit 1
