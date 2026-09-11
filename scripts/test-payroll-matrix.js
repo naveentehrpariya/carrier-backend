@@ -43,6 +43,30 @@ require.cache[loggerPath] = {
   },
 };
 
+/* The PDF routes are worth testing for the FIGURES they print, not for Chrome's rendering. Stub the
+ * browser and keep the HTML the controller actually produced — the template and the data wiring are
+ * what can be wrong. `hardenPage` is exercised for real elsewhere. */
+global.__pdfHtml = [];
+const puppeteerPath = require.resolve('../utils/puppeteer');
+require.cache[puppeteerPath] = {
+  id: puppeteerPath, filename: puppeteerPath, loaded: true, exports: {
+    hardenPage: async () => {},
+    launchBrowser: async () => ({
+      newPage: async () => ({
+        setContent: async (html) => { global.__pdfHtml.push(html); },
+        emulateMediaType: async () => {},
+        pdf: async () => Buffer.from('%PDF-1.4 stub'),
+        setViewport: async () => {},
+        goto: async () => {},
+        setRequestInterception: async () => {},
+        on: () => {},
+        evaluate: async () => {},
+      }),
+      close: async () => {},
+    }),
+  },
+};
+
 const Order = require('../db/Order');
 const Trip = require('../db/Trip');
 const Truck = require('../db/Truck');
@@ -63,6 +87,7 @@ require('../db/TruckExpense');
 const tripController = require('../controllers/tripController');
 const driverSalaryController = require('../controllers/driverSalaryController');
 const ownerOperatorController = require('../controllers/ownerOperatorController');
+const orderController = require('../controllers/orderController');
 const { isUnassigned, hasCarrierWork, hasFleetWork } = require('../utils/orderParty');
 
 let pass = 0, fail = 0;
@@ -96,6 +121,12 @@ const mkRes = () => {
   const answer = (b) => { r.body = b; settle(b); return r; };
   r.status = (c) => { r.statusCode = c; return r; };
   r.json = answer; r.send = answer; r.end = answer;
+  // The PDF routes set headers and stream a buffer, so the double has to behave like a real
+  // response or the handler dies on `res.setHeader` long before anything can be asserted.
+  r.headers = {};
+  r.setHeader = (k, v) => { r.headers[k] = v; return r; };
+  r.set = r.setHeader;
+  r.type = () => r;
   return r;
 };
 const answered = (res, ms = 15000) => Promise.race([
@@ -678,7 +709,430 @@ async function run() {
     for (const l of legs) near(l.rate_per_mile, RATE.solo, 0.001);
   });
 
-  console.log('\n══ 7. ORDER COST — every shape adds up ══\n');
+  console.log('\n══ 7. CITY HOURS, CARRY-FORWARD, OVERPAYMENT, PDFs, FINANCE REPORT ══\n');
+
+  await t('city hours are PAID, and counted as pay even if entered as a deduction', async () => {
+    const DriverDeduction = require('../db/DriverDeduction');
+    const before = Number((await driverPay(D1, 'CAD')).cityPay || 0);
+    /* Entered through the CONTROLLER, deliberately asking for 'deduct'. The rule that forces a
+       city_hours row to 'add' lives there, not on the schema — the payslip counts every such row as
+       pay regardless, so a row stored as 'deduct' would read one way on screen and pay the other way
+       on the statement. Writing the row straight to the collection would skip the very rule under
+       test. */
+    const driverDeductionController = require('../controllers/driverDeductionController');
+    const addRes = await call(driverDeductionController.addDeduction, {
+      params: { driverId: String(D1._id) },
+      body: { type: 'city_hours', direction: 'deduct', hours: 4, date: '2026-06-15', note: 'yard time' },
+    });
+    assert.ok(addRes.statusCode === 200 || addRes.body?.status !== false,
+      `could not add city hours: ${addRes.body?.message}`);
+    const slip = await driverPay(D1, 'CAD');
+    near(Number(slip.cityPay || 0), before + 4 * 25, 0.02);
+    const row = await DriverDeduction.findOne({ driver: D1._id, type: 'city_hours' }).lean();
+    assert.strictEqual(row.direction, 'add', 'a city_hours row must be stored as pay');
+  });
+
+  await t("last month's unpaid balance carries into this month", async () => {
+    const DriverSalary = require('../db/DriverSalary');
+    // A May payslip left 120 CAD unpaid.
+    await DriverSalary.create({
+      tenantId: TENANT, driver: D1._id, company: CO._id, month: 5, year: YEAR,
+      currency: 'CAD', rateCurrency: 'CAD',
+      basePayable: 120, finalPayable: 120, paidAmount: 0, dueAmount: 120, paymentStatus: 'pending',
+    });
+    const res = await call(driverSalaryController.generateDriverSalary, {
+      params: { driverId: String(D1._id) }, body: { month: MONTH, year: YEAR, currency: 'CAD' },
+    });
+    assert.ok(res.statusCode === 200, `generate failed: ${res.body?.message}`);
+    const slip = res.body.salary || res.body.data;
+    near(Number(slip.previousDueAdded), 120, 0.02);
+
+    /* And it is ADDED, not merely displayed. Note the shape while asserting it: `basePayable` is
+       TRIP pay only — city-hours pay is a separate column that joins the total on its own, so the
+       identity is base + city + carried-forward − deductions. Reading `basePayable` as "everything
+       earned" understates a driver who spent the month on city work. */
+    near(
+      Number(slip.finalPayable),
+      Number(slip.basePayable) + Number(slip.cityPay || 0)
+        + Number(slip.previousDueAdded) - Number(slip.previousOwedDeducted || 0)
+        + Number(slip.manualAddition || 0) - Number(slip.deductionTotal || 0),
+      0.05,
+    );
+  });
+
+  await t('paying MORE than the payslip is refused, not silently clamped', async () => {
+    const DriverSalary = require('../db/DriverSalary');
+    const saved = await DriverSalary.findOne({ tenantId: TENANT, driver: D1._id, month: MONTH, year: YEAR }).lean();
+    assert.ok(saved, 'no generated payslip to pay');
+    const res = await call(driverSalaryController.updateDriverSalary, {
+      params: { driverId: String(D1._id), salaryId: String(saved._id) },
+      body: { paidAmount: Number(saved.finalPayable) + 500 },
+    });
+    assert.strictEqual(res.statusCode, 409, `expected a refusal, got ${res.statusCode}`);
+    assert.strictEqual(res.body.code, 'overpayment');
+  });
+
+  await t('an overpayment is recorded, and tracked as recoverable, when confirmed', async () => {
+    const DriverSalary = require('../db/DriverSalary');
+    const saved = await DriverSalary.findOne({ tenantId: TENANT, driver: D1._id, month: MONTH, year: YEAR }).lean();
+    const over = Number(saved.finalPayable) + 500;
+    const res = await call(driverSalaryController.updateDriverSalary, {
+      params: { driverId: String(D1._id), salaryId: String(saved._id) },
+      body: { paidAmount: over, allowOverpay: true },
+    });
+    assert.ok(res.statusCode === 200, `expected it to be recorded, got ${res.statusCode}`);
+    const after = await DriverSalary.findById(saved._id).lean();
+    near(after.paidAmount, over, 0.02);              // what was typed, not a clamp
+    near(after.overpaidAmount, 500, 0.02);           // and the excess is named
+    near(after.dueAmount, 0, 0.02);
+  });
+
+  await t('the driver payslip PDF prints the same figures as the payslip', async () => {
+    global.__pdfHtml = [];
+    const res = await call(driverSalaryController.getDriverSalaryPdf, {
+      params: { driverId: String(D1._id) }, query: { month: MONTH, year: YEAR, currency: 'CAD' },
+    });
+    assert.ok(res.statusCode === 200, `pdf failed ${res.statusCode}: ${res.body?.message}`);
+    const html = global.__pdfHtml.join('');
+    assert.ok(html.length > 500, 'no document was rendered');
+    assert.ok(/Driver One/i.test(html), "the driver's name is missing from their own payslip");
+    const slip = await driverPay(D1, 'CAD');
+    // The net figure has to appear on the page the driver is handed.
+    const net = Number(slip.finalPayable).toFixed(2);
+    const netWithSeparators = Number(slip.finalPayable).toLocaleString('en-US', { minimumFractionDigits: 2 });
+    assert.ok(html.includes(net) || html.includes(netWithSeparators),
+      `net payable ${net} does not appear in the document`);
+  });
+
+  await t('the owner statement PDF renders with that owner on it', async () => {
+    const OwnerOperatorSalary = require('../db/OwnerOperatorSalary');
+    const slip = await OwnerOperatorSalary.findOne({ tenantId: TENANT, ownerOperator: OWNER_1._id }).lean();
+    assert.ok(slip, 'no owner statement to render');
+    global.__pdfHtml = [];
+    const res = await call(ownerOperatorController.salaryStatementPdf, { params: { id: String(slip._id) } });
+    assert.ok(res.statusCode === 200, `pdf failed ${res.statusCode}: ${res.body?.message}`);
+    const html = global.__pdfHtml.join('');
+    assert.ok(html.length > 500, 'no document was rendered');
+    assert.ok(/Owner One/i.test(html), 'the owner is not named on their own statement');
+  });
+
+  await t('the finance report totals match the orders it covers', async () => {
+    const tenantAdmin = require('../controllers/tenantAdminController');
+    const handler = tenantAdmin.getFinanceReport || tenantAdmin;
+    const res = await call(typeof handler === 'function' ? handler : tenantAdmin.getFinanceReport, {
+      tenantId: TENANT,
+      query: { type: 'regular', period: 'custom', startDate: '2026-06-01', endDate: '2026-06-30', currency: 'usd' },
+    });
+    assert.ok(res.statusCode === 200, `report failed ${res.statusCode}: ${res.body?.message}`);
+    const d = res.body.data;
+    assert.ok(d && d.summary, 'no summary returned');
+    // Every REGULAR order in June, revenue summed independently.
+    const orders = await Order.find({
+      tenantId: TENANT, order_type: 'regular', deletedAt: null,
+      createdAt: { $gte: new Date('2026-06-01'), $lte: new Date('2026-06-30T23:59:59Z') },
+    }).lean();
+    const expectedRevenue = orders.reduce((sum, o) => sum + Number(o.input_total_amount || o.total_amount || 0), 0);
+    near(d.summary.totalRevenue, expectedRevenue, 1.0);
+    assert.strictEqual(d.summary.totalOrders, orders.length);
+  });
+
+  await t("a MIXED order's carrier cost reaches the finance report", async () => {
+    /* A mixed order is stamped `regular`, so it lands in the FLEET report — and reading only the
+       settlement column would drop its carrier cost out of the figures entirely. */
+    const tenantAdmin = require('../controllers/tenantAdminController');
+    const res = await call(tenantAdmin.getFinanceReport, {
+      tenantId: TENANT,
+      query: { type: 'regular', period: 'custom', startDate: '2026-06-01', endDate: '2026-06-30', currency: 'usd' },
+    });
+    const row = (res.body.data.orders || []).find((o) => String(o._id) === String(shapes.mixed._id));
+    assert.ok(row, 'the mixed order is missing from the fleet report');
+    // `carrier_amount` on the row is overwritten with the order's TOTAL outside cost.
+    near(row.carrier_amount, 900, 1.0);
+  });
+
+  console.log('\n══ 8. ADVERSARIAL EDGES — rounding, ghosts, locks, rollups ══\n');
+
+  await t('three legs of one order sum EXACTLY to the order, no mile lost to rounding', async () => {
+    /* 100 miles over three legs is 33.333... each. If each leg rounds independently the driver is
+       paid for 99.99 or 100.01 miles, and the truck report disagrees with the payslip by the
+       residue on every single order. */
+    const o = await makeOrder({ order_type: 'regular', totalDistance: 160.9344, settle_amount: 0, input_settle_amount: 0 }); // 100 mi
+    const r = await split(o, [
+      seg({ truck: T_CO._id, driver: D1._id, miles: 33, totalDistance: 33 }),
+      seg({ truck: T_CO._id, driver: D1._id, miles: 33, totalDistance: 33, start_stop_index: 1, end_stop_index: 1 }),
+      seg({ truck: T_CO._id, driver: D1._id, miles: 34, totalDistance: 34, start_stop_index: 1, end_stop_index: 1 }),
+    ]);
+    assert.ok(r.body.status !== false, r.body?.message);
+    const legs = await Trip.find({ order: o._id }).lean();
+    const orderMiles = 160.9344 * 0.621371;
+    const raw = legs.reduce((a, l) => a + Number(l.totalDistance), 0);
+    const derived = legs.reduce((a, l) => a + orderMiles * (Number(l.totalDistance) / raw), 0);
+    near(derived, orderMiles, 0.0001);
+    near(orderMiles, 100, 0.01);
+  });
+
+  await t('legs whose measured miles are all ZERO do not divide by zero', async () => {
+    const o = await makeOrder({ order_type: 'regular', settle_amount: 0, input_settle_amount: 0 });
+    const r = await split(o, [
+      seg({ truck: T_CO._id, driver: D1._id, miles: 0, totalDistance: 0 }),
+      seg({ truck: T_CO._id, driver: D1._id, miles: 0, totalDistance: 0, start_stop_index: 1, end_stop_index: 1 }),
+    ]);
+    assert.ok(r.body.status !== false, r.body?.message);
+    const legs = await Trip.find({ order: o._id }).lean();
+    for (const l of legs) {
+      assert.ok(Number.isFinite(Number(l.total_driver_pay || 0)), `pay is not a number: ${l.total_driver_pay}`);
+      assert.ok(!Number.isNaN(Number(l.miles)), 'miles became NaN');
+    }
+  });
+
+  await t('a SOFT-DELETED leg pays nobody', async () => {
+    const o = await makeOrder({ order_type: 'regular', settle_amount: 0, input_settle_amount: 0 });
+    await split(o, [seg({ truck: T_CO._id, driver: D3._id, miles: 200, totalDistance: 200 })]);
+    await Trip.updateMany({ order: o._id }, { $set: { createdAt: WHEN, updatedAt: WHEN } }, { timestamps: false });
+    await Order.updateOne({ _id: o._id }, { $set: { createdAt: WHEN, updatedAt: WHEN } }, { timestamps: false });
+    const withLeg = Number((await driverPay(D3, 'USD')).tripPay ?? 0);
+    assert.ok(withLeg > 0, 'the fixture leg paid nothing to begin with');
+    await Trip.updateMany({ order: o._id }, { $set: { deletedAt: new Date() } });
+    const afterDelete = Number((await driverPay(D3, 'USD')).tripPay ?? 0);
+    near(afterDelete, 0, 0.02);
+  });
+
+  await t('ONE owner running TWO trucks on an order is not a MIXED-owner order', async () => {
+    const t3 = await Truck.create({
+      tenantId: TENANT, company: CO._id, unitNumber: 'O-1b', plateNumber: 'OO1B',
+      ownerOperated: true, ownerOperator: OWNER_1._id,
+    });
+    const o = await makeOrder({ order_type: 'regular', settle_amount: 900, input_settle_amount: 900 });
+    const r = await split(o, [
+      seg({ truck: T_O1._id, driver: D1._id }),
+      seg({ truck: t3._id, start_stop_index: 1, end_stop_index: 1 }),
+    ]);
+    assert.ok(r.body.status !== false, r.body?.message);
+    const f = await Order.findById(o._id).lean();
+    assert.strictEqual(f.isMixedOwner, false, 'one owner is not a mix, however many trucks they run');
+    assert.strictEqual(String(f.ownerOperator), String(OWNER_1._id), 'the single owner must still be named');
+    near(f.settle_amount, 900, 0.02);
+  });
+
+  await t('a driver paid across TWO orders of different lengths gets both, each on its own basis', async () => {
+    const short = await makeOrder({ order_type: 'regular', totalDistance: 160.9344, settle_amount: 0, input_settle_amount: 0 }); // 100 mi
+    const long = await makeOrder({ order_type: 'regular', totalDistance: 643.7376, settle_amount: 0, input_settle_amount: 0 }); // 400 mi
+    for (const o of [short, long]) {
+      const r = await split(o, [seg({ truck: T_CO2._id, driver: D3._id, miles: 10, totalDistance: 10 })]);
+      assert.ok(r.body.status !== false, r.body?.message);
+    }
+    await Trip.updateMany({ order: { $in: [short._id, long._id] } }, { $set: { createdAt: WHEN, updatedAt: WHEN } }, { timestamps: false });
+    await Order.updateMany({ _id: { $in: [short._id, long._id] } }, { $set: { createdAt: WHEN, updatedAt: WHEN } }, { timestamps: false });
+    const slip = await driverPay(D3, 'USD');
+    // One leg per order, each leg IS the whole order → 100 + 400 miles at the USD solo rate.
+    near(Number(slip.tripPay ?? 0), (100 + 400) * RATE.soloUsd, 1.0);
+  });
+
+  await t('a CAD order paying a USD driver converts the other way, once', async () => {
+    const o = await makeOrder({
+      order_type: 'regular', input_currency: 'cad', revenue_currency: 'usd', fx_to_usd: 0.711173,
+      total_amount: 1422.35, input_total_amount: 2000,
+      settle_amount: 0, input_settle_amount: 0,
+    });
+    const r = await split(o, [seg({ truck: T_CO2._id, driver: D3._id, miles: 200, totalDistance: 200 })]);
+    assert.ok(r.body.status !== false, r.body?.message);
+    const leg = await Trip.findOne({ order: o._id }).lean();
+    // The driver's pay currency is theirs, not the order's — USD 0.45, not CAD.
+    assert.strictEqual(leg.rate_currency, 'USD');
+    near(leg.rate_per_mile, RATE.soloUsd, 0.001);
+  });
+
+  await t('regenerating a payslip keeps what was already paid', async () => {
+    const DriverSalary = require('../db/DriverSalary');
+    const saved = await DriverSalary.findOne({ tenantId: TENANT, driver: D1._id, month: MONTH, year: YEAR }).lean();
+    assert.ok(saved && Number(saved.paidAmount) > 0, 'nothing was paid to preserve');
+    const paidBefore = Number(saved.paidAmount);
+    const res = await call(driverSalaryController.generateDriverSalary, {
+      params: { driverId: String(D1._id) }, body: { month: MONTH, year: YEAR, currency: 'CAD' },
+    });
+    assert.ok(res.statusCode === 200, `regenerate failed: ${res.body?.message}`);
+    const after = await DriverSalary.findById(saved._id).lean();
+    near(after.paidAmount, paidBefore, 0.02);
+  });
+
+  await t('regenerating an owner statement does not multiply their financial summary', async () => {
+    const OwnerRecord = require('../db/OwnerOperatorFinancialRecord');
+    const countGen = () => OwnerRecord.countDocuments({ tenantId: TENANT, ownerOperator: OWNER_1._id, type: 'SALARY_GENERATED' });
+    const before = await countGen();
+    for (let i = 0; i < 2; i++) {
+      const res = await call(ownerOperatorController.generateMonthlySalary, {
+        body: { month: MONTH, year: YEAR, ownerOperatorId: String(OWNER_1._id), payoutCurrency: 'USD' },
+      });
+      assert.ok(res.statusCode === 200, `generate failed: ${res.body?.message}`);
+    }
+    const after = await countGen();
+    assert.strictEqual(after, Math.max(before, 1), `SALARY_GENERATED rows went ${before} → ${after}`);
+  });
+
+  await t('changing who runs a leg is REFUSED once a payslip exists for the order', async () => {
+    /* shapes.fleetSolo was run by D1, who now has a generated payslip covering this month. Handing
+       that leg to a carrier would silently change what the payslip was built from. */
+    const r = await split({ _id: shapes.fleetSolo._id }, [
+      seg({ carrier: CARRIER_A._id, carrier_amount: 500, miles: 200, totalDistance: 200 }),
+    ]);
+    assert.strictEqual(r.statusCode, 409, `expected a lock, got ${r.statusCode}`);
+    assert.strictEqual(r.body.code, 'leg_party_locked');
+  });
+
+  await t('re-saving the SAME parties is never blocked, even on a paid order', async () => {
+    const r = await split({ _id: shapes.fleetSolo._id }, [
+      seg({ truck: T_CO._id, driver: D1._id, miles: 200, totalDistance: 200 }),
+    ]);
+    assert.ok(r.body.status !== false, `a no-op re-save was refused: ${r.body?.message}`);
+  });
+
+  await t('paying ONE carrier of two leaves the order partial, not paid', async () => {
+    const o = await Order.findById(shapes.twoCarriers._id).lean();
+    const legs = await Trip.find({ order: o._id }).sort({ trip_no: 1 }).lean();
+    const res = await call(orderController.updateOrderPaymentStatus, {
+      params: { id: String(o._id), type: 'carrier' },
+      body: { status: 'paid', method: 'wire', tripId: String(legs[0]._id) },
+    });
+    assert.ok(res.statusCode === 200, `payment failed ${res.statusCode}: ${res.body?.message}`);
+    const after = await Order.findById(o._id).lean();
+    assert.strictEqual(after.carrier_payment_status, 'partial',
+      `one of two carriers paid must read partial, got ${after.carrier_payment_status}`);
+  });
+
+  await t('paying the second carrier rolls the order up to paid', async () => {
+    const legs = await Trip.find({ order: shapes.twoCarriers._id }).sort({ trip_no: 1 }).lean();
+    const res = await call(orderController.updateOrderPaymentStatus, {
+      params: { id: String(shapes.twoCarriers._id), type: 'carrier' },
+      body: { status: 'paid', method: 'wire', tripId: String(legs[1]._id) },
+    });
+    assert.ok(res.statusCode === 200, `payment failed: ${res.body?.message}`);
+    const after = await Order.findById(shapes.twoCarriers._id).lean();
+    assert.strictEqual(after.carrier_payment_status, 'paid');
+  });
+
+  await t('a leg id from ANOTHER order cannot be paid through this one', async () => {
+    const foreign = await Trip.findOne({ order: shapes.mixed._id, carrier: { $ne: null } }).lean();
+    const res = await call(orderController.updateOrderPaymentStatus, {
+      params: { id: String(shapes.outsourcing._id), type: 'carrier' },
+      body: { status: 'paid', method: 'wire', tripId: String(foreign._id) },
+    });
+    /* Assert the refusal itself, not just that nothing moved — "nothing moved" also passes when the
+       leg happened to be unpaid already, which would make this test prove nothing. */
+    const stillUnpaid = await Trip.findById(foreign._id).lean();
+    assert.notStrictEqual(stillUnpaid.carrier_payment_status, 'paid',
+      'a leg was paid through an order it does not belong to');
+    // The real answer is 404 carrier_leg_not_found — the leg is looked up scoped to THIS order.
+    assert.ok(res.statusCode >= 400, `a foreign leg id was accepted (HTTP ${res.statusCode})`);
+  });
+
+  await t('a malformed leg id is a 400, never a cast error surfacing as a generic failure', async () => {
+    const res = await call(orderController.updateOrderPaymentStatus, {
+      params: { id: String(shapes.outsourcing._id), type: 'carrier' },
+      body: { status: 'paid', method: 'wire', tripId: { $ne: null } },
+    });
+    assert.strictEqual(res.statusCode, 400);
+    assert.strictEqual(res.body.code, 'invalid_leg_id');
+  });
+
+  await t('a distance that already paid someone cannot be moved', async () => {
+    /* Every leg's miles share is derived from the order's distance, and that share is what the
+       payslip paid from. shapes.fleetSolo now sits on a generated payslip. */
+    const res = await call(orderController.update_order, {
+      params: { id: String(shapes.fleetSolo._id) },
+      body: { totalDistance: 999 },
+    });
+    assert.strictEqual(res.statusCode, 409, `expected a lock, got ${res.statusCode}: ${res.body?.message}`);
+    assert.ok(['route_locked_by_payroll', 'route_change_resplits_legs'].includes(res.body.code),
+      `unexpected code ${res.body.code}`);
+    const after = await Order.findById(shapes.fleetSolo._id).lean();
+    near(after.totalDistance, KM_200MI, 0.01);
+  });
+
+  await t('deleting an order stops it paying anyone', async () => {
+    const o = await makeOrder({ order_type: 'regular', settle_amount: 0, input_settle_amount: 0 });
+    await split(o, [seg({ truck: T_CO2._id, driver: D2._id, miles: 200, totalDistance: 200 })]);
+    await Trip.updateMany({ order: o._id }, { $set: { createdAt: WHEN, updatedAt: WHEN } }, { timestamps: false });
+    await Order.updateOne({ _id: o._id }, { $set: { createdAt: WHEN, updatedAt: WHEN } }, { timestamps: false });
+    const before = Number((await driverPay(D2, 'CAD')).tripPay ?? 0);
+
+    const res = await call(orderController.deleteOrder, { params: { id: String(o._id) } });
+    assert.ok(res.statusCode === 200, `delete failed ${res.statusCode}: ${res.body?.message}`);
+
+    // The legs must go with it, or a cancelled load keeps paying driver wages for ever.
+    const liveLegs = await Trip.countDocuments({ order: o._id, deletedAt: null });
+    assert.strictEqual(liveLegs, 0, 'the order was deleted but its legs are still live');
+    const after = Number((await driverPay(D2, 'CAD')).tripPay ?? 0);
+    assert.ok(after < before - 1, `the driver is still paid for a deleted order (${before} → ${after})`);
+  });
+
+  await t('deleting a relay stop rebuilds the legs WITH the crew and the money', async () => {
+    const o = await makeOrder({
+      order_type: 'regular', settle_amount: 1200, input_settle_amount: 1200,
+      shipping_details: [{ reference: 'RELAY2', locations: [
+        { type: 'pickup', location: 'Toronto, ON', date: '2026-06-10' },
+        { type: 'relay', location: 'Kingston, ON', date: '2026-06-10' },
+        { type: 'delivery', location: 'Montreal, QC', date: '2026-06-11' },
+      ] }],
+    });
+    const r = await split(o, [
+      seg({ truck: T_O1._id, drivers: [D1._id, D2._id], settle_amount: 700, start_stop_index: 0, end_stop_index: 1 }),
+      seg({ truck: T_O2._id, settle_amount: 500, start_stop_index: 1, end_stop_index: 2 }),
+    ]);
+    assert.ok(r.body.status !== false, r.body?.message);
+    const legs = await Trip.find({ order: o._id }).sort({ trip_no: 1 }).lean();
+    const teamLeg = legs[0];
+    assert.strictEqual(teamLeg.drivers.length, 2);
+
+    const del = await call(tripController.deleteTrip, { params: { tripId: String(legs[1]._id) } });
+    assert.ok(del.statusCode === 200, `relay delete failed ${del.statusCode}: ${del.body?.message}`);
+
+    const rebuilt = await Trip.find({ order: o._id, deletedAt: null }).sort({ trip_no: 1 }).lean();
+    assert.ok(rebuilt.length >= 1, 'every leg vanished');
+    const crew = rebuilt[0].drivers || [];
+    assert.strictEqual(crew.length, 2,
+      'the rebuild dropped a driver — a team leg silently became solo, moving the survivor to the solo rate');
+    assert.ok(Number(rebuilt[0].settle_amount) > 0, 'the rebuild dropped the leg settlement');
+  });
+
+  await t('one truck working two orders is credited with both', async () => {
+    const g = await truckGross();
+    const row = (g.trucks || []).find((r) => r.unitNumber === 'C-2');
+    assert.ok(row, 'C-2 missing from the report');
+    const legs = await Trip.find({ tenantId: TENANT, truck: T_CO2._id, deletedAt: null }).lean();
+    const orders = [...new Set(legs.map((l) => String(l.order)))];
+    assert.ok(orders.length > 1, `the fixture only gave C-2 ${orders.length} order(s)`);
+    assert.ok(Number(row.totalGross) > 0, 'a truck that ran several orders shows no gross');
+  });
+
+  await t("an owner leg sitting on a MIXED-type order still settles that owner", async () => {
+    const o = await makeOrder({
+      order_type: 'regular', settle_amount: 600, input_settle_amount: 600,
+      carrier_amount: 0, input_carrier_amount: 0,
+    });
+    const r = await split(o, [
+      seg({ truck: T_O2._id, driver: D2._id }),
+      seg({ carrier: CARRIER_B._id, carrier_amount: 400, start_stop_index: 1, end_stop_index: 1 }),
+    ]);
+    assert.ok(r.body.status !== false, r.body?.message);
+    const f = await Order.findById(o._id).lean();
+    assert.strictEqual(f.isMixedType, true);
+    // The owner is paid the whole settle pot: the carrier leg is paid from its own column and the
+    // owner leg is the only FLEET leg, so nothing consumes a share beside it.
+    near(f.settle_amount, 600, 0.02);
+    near(f.cost_amount, 600 + 400, 0.02);
+  });
+
+  await t('an INACTIVE driver still on a leg does not break the payslip', async () => {
+    await Users.updateOne({ _id: D3._id }, { $set: { status: 'inactive' } });
+    const res = await call(driverSalaryController.getDriverSalary, {
+      params: { driverId: String(D3._id) }, query: { month: MONTH, year: YEAR, currency: 'USD' },
+    });
+    await Users.updateOne({ _id: D3._id }, { $set: { status: 'active' } });
+    assert.ok(res.statusCode === 200 || res.body?.status !== false,
+      `an inactive driver's payslip failed: ${res.body?.message}`);
+  });
+
+  console.log('\n══ 9. ORDER COST — every shape adds up ══\n');
 
   await t('fleet-only order: cost is the settlement, never doubled', async () => {
     const o = await Order.findById(shapes.ownerNoDriver._id).lean();

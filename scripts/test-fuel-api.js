@@ -167,6 +167,18 @@ const upload = (fixture, body = {}) => run(fuel.uploadFuelSheet, mkReq({ files: 
       sheets[key] = res.body.sheet;
     });
   }
+  await t('the sheet records what the vendor prices run between', async () => {
+    const doc = await FuelPriceSheet.findById(sheets.flyingJ._id).lean();
+    // Flying J's own prices, min and max of the column a margin applies to
+    assert.strictEqual(fmtMoney(doc.stats.priceRange.minInt, 4), '1.9635');
+    assert.strictEqual(fmtMoney(doc.stats.priceRange.maxInt, 4), '2.4830');
+  });
+  await t('a sheet whose price column is not known yet has no range', async () => {
+    const res = await upload('unknown-vendor-rack.xlsx');
+    const doc = await FuelPriceSheet.findById(res.body.sheet._id).lean();
+    assert.strictEqual(doc.stats.priceRange, null);
+    await run(fuel.removeFuelSheet, mkReq({ params: { id: String(res.body.sheet._id) } }));
+  });
   await t('the uploaded rows are stored, money and all', async () => {
     const doc = await FuelPriceSheet.findById(sheets.flyingJ._id).lean();
     assert.strictEqual(doc.rows.length, 54);
@@ -749,6 +761,19 @@ const upload = (fixture, body = {}) => run(fuel.uploadFuelSheet, mkReq({ files: 
       body: { baseColumn: 'col4', unit: 'per_litre', currency: 'CAD', dp: 4, totalColumn: 'col4' },
     }));
     assert.strictEqual(res.body.code, 'column_role_invalid');
+  });
+  await t('mapping fills the price range in', async () => {
+    const before = await FuelPriceSheet.findById(unknown._id).lean();
+    assert.strictEqual(before.stats.priceRange, null);
+    await run(fuel.setFuelSheetMapping, mkReq({
+      params: { id: String(unknown._id) },
+      body: { baseColumn: 'col4', unit: 'per_litre', currency: 'CAD', dp: 4 },
+    }));
+    const after = await FuelPriceSheet.findById(unknown._id).lean();
+    assert.strictEqual(fmtMoney(after.stats.priceRange.minInt, 4), '1.5990');
+    assert.strictEqual(fmtMoney(after.stats.priceRange.maxInt, 4), '1.7440');
+    // and the rest of the stats survived the write
+    assert.strictEqual(after.stats.rows, 8);
   });
   await t('once mapped it behaves exactly like a known vendor sheet', async () => {
     const map = await run(fuel.setFuelSheetMapping, mkReq({

@@ -176,7 +176,7 @@ exports.uploadFuelSheet = catchAsync(async (req, res) => {
     availableSheets: parsed.meta.availableSheets || [],
     meta: parsed.meta,
     rows: parsed.rows,
-    stats: parsed.stats,
+    stats: { ...parsed.stats, priceRange: priceRangeOf(parsed.rows, parsed.baseColumn) },
     warnings: parsed.warnings,
     unparsed: parsed.unparsed,
     sourceFile: stored ? { name: file.originalname, url: stored.url, size: stored.size, mime: stored.mime } : { name: file.originalname, size: file.size, mime: file.mimetype },
@@ -202,6 +202,28 @@ exports.uploadFuelSheet = catchAsync(async (req, res) => {
     unparsed: doc.unparsed,
   });
 });
+
+/**
+ * What the vendor's own prices run between, on the column a margin applies to.
+ *
+ * The sheet list shows it, so the dispatcher can tell one day's sheet from another at
+ * a glance instead of opening both. Computed when the rows are in hand (upload, and
+ * again when an unrecognised sheet is finally told which column is the price) because
+ * the listing endpoint deliberately does not load 350 rows per sheet.
+ */
+function priceRangeOf(rows, baseColumn) {
+  if (!baseColumn) return null;
+  let min = null;
+  let max = null;
+  (rows || []).forEach((r) => {
+    const money = r.money instanceof Map ? Object.fromEntries(r.money) : (r.money || {});
+    const v = money[baseColumn];
+    if (!v || !Number.isFinite(v.int)) return;
+    if (min === null || v.int < min) min = v.int;
+    if (max === null || v.int > max) max = v.int;
+  });
+  return min === null ? null : { minInt: min, maxInt: max };
+}
 
 function summarize(doc) {
   return {
@@ -372,9 +394,11 @@ exports.setFuelSheetMapping = catchAsync(async (req, res) => {
     return { key: c.key, label, kind: c.kind, role };
   });
 
+  const withRows = await FuelPriceSheet.findOne({ _id: sheet._id, tenantId }).select('rows').lean();
   await FuelPriceSheet.updateOne({ _id: sheet._id, tenantId }, {
     $set: {
       baseColumn, unit, currency, dp, columns: nextColumns,
+      stats: { ...(sheet.stats || {}), priceRange: priceRangeOf(withRows?.rows, baseColumn) },
       mappingRequired: false, mappedBy: req.user?._id, mappedAt: new Date(),
     },
   });
