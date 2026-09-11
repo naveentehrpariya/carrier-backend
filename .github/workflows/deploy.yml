@@ -19,11 +19,9 @@ jobs:
           script: |
             set -e
             cd /home/ubuntu/carrier-backend
-
             git fetch origin
             git reset --hard origin/main
             git clean -fd
-
             npm install --production
             npm install --force
             pm2 restart all
