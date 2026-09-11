@@ -19,9 +19,39 @@ jobs:
           script: |
             set -e
             cd /home/ubuntu/carrier-backend
+
             git fetch origin
             git reset --hard origin/main
             git clean -fd
-            npm install --production
-            npm install --force
-            pm2 restart all
+
+            # npm ci installs exactly what package-lock.json pins, so the server runs
+            # the tree that was tested. `npm install` can resolve different versions on
+            # the box than on a developer's machine, and `--force` disables the checks
+            # that would have told us.
+            npm ci --omit=dev
+
+            # Restart the ONE app that serves this repo, BY NAME. Set APP to whatever
+            # `pm2 list` calls it on the box — do not invent a new name here, or pm2
+            # starts an extra copy and two processes then fight over port 8080.
+            # `pm2 restart all` is deliberately not used: it touches every app on the
+            # box and fails the whole deploy when any unrelated entry is missing, which
+            # is how a deploy reported failure while the API was the thing that needed
+            # attention.
+            APP=index
+            pm2 restart "$APP" --update-env
+            pm2 save
+
+            # A deploy that leaves the app crash-looping must FAIL. Without this, pm2
+            # reports the restart as fine, the workflow goes green, and the first person
+            # to notice is a customer getting a 502.
+            for i in $(seq 1 15); do
+              sleep 2
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8080/ || true)
+              if [ "$code" = "200" ]; then
+                echo "health check: origin answered 200 after $((i * 2))s"
+                exit 0
+              fi
+            done
+            echo "health check FAILED — the app is not answering on :8080. Last 60 log lines:"
+            pm2 logs "$APP" --lines 60 --nostream || true
+            exit 1
