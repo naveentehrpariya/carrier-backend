@@ -6,6 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "test:cheques": "node scripts/test-cheques.js",
+    "test:payroll": "node scripts/test-payroll-matrix.js",
+    "test:orders": "node scripts/test-carrier-settlement.js && node scripts/test-order-shape-projection.js && node scripts/test-mixed-order.js && node scripts/test-payroll-matrix.js",
     "test:documents": "node scripts/test-documents.js",
     "start": "node index.js",
     "dev": "nodemon index.js",

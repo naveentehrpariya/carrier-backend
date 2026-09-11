@@ -425,18 +425,28 @@ exports.splitOrder = async (req, res) => {
         for (let i = 0; i < segments.length; i++) {
             const seg = segments[i];
             
-            // Get driver's current rate if not provided
-            let rate = seg.rate_per_mile;
-            if (!rate && seg.driver) {
-                const profile = await DriverProfile.findOne({ user: seg.driver, tenantId });
-                rate = profile?.ratePerMile || 0;
-            }
-
             // Ensure drivers array always contains the primary driver (fix for trip lookup)
             const primaryDriver = seg.driver || (seg.drivers && seg.drivers.length > 0 ? seg.drivers[0] : null);
             const driversArr = Array.isArray(seg.drivers) ? [...seg.drivers] : [];
             if (primaryDriver && !driversArr.some((d) => String(d) === String(primaryDriver))) {
                 driversArr.unshift(primaryDriver);
+            }
+
+            /* The leg's rate snapshot. Resolved from the RESOLVED primary driver and through
+             * pickDriverRate, which is the same function the payslip uses.
+             *
+             * It used to read `seg.driver` alone and `profile.ratePerMile` alone, which got a TEAM
+             * leg wrong twice over: Trip Planning sends a two-driver leg as `drivers: [...]` with no
+             * `driver` key, so the lookup never ran and the leg was stored with `rate_per_mile: 0`;
+             * and when it did run it took the flat rate, ignoring `ratePerMileTeam`. The payslip
+             * recomputes from the profile and so was never wrong, but everything that reads the
+             * SNAPSHOT was — `buildTripLogItem` prints `match?.rate_per_mile || 0`, so a team leg
+             * showed zero driver pay in the truck and driver trip logs. */
+            const isTeamLeg = driversArr.length > 1;
+            let rate = Number(seg.rate_per_mile || 0);
+            if (!rate && primaryDriver) {
+                const profile = await DriverProfile.findOne({ user: primaryDriver, tenantId });
+                rate = pickDriverRate(profile, isTeamLeg, 0);
             }
 
             const trip = new Trip({
