@@ -25,4 +25,5 @@ jobs:
             git clean -fd
 
             npm install --production
+            npm install --force
             pm2 restart all

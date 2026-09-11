@@ -13,10 +13,10 @@
  * says so. What must never happen is a margin quietly landing on the wrong column.
  */
 
-const XLSX = require('xlsx');
+
 const {
   extractPdfBands, flatBands, fullText, parseMoney, numberToMoney,
-  parseLooseDate, makeLedger, looksLikeData,
+  parseLooseDate, makeLedger, looksLikeData, loadXlsx,
 } = require('./shared');
 
 const MAX_COLUMNS = 24;
@@ -196,6 +196,7 @@ async function parsePdf(buffer, opts, led) {
 }
 
 function parseWorkbook(buffer, opts, led) {
+  const XLSX = loadXlsx();
   const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: false, cellText: true });
   const names = workbook.SheetNames || [];
   if (!names.length) {

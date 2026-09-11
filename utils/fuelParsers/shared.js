@@ -111,6 +111,26 @@ function fmtMoney(int, dp) {
 /** Absolute difference in micro-units. */
 function diff(a, b) { return Math.abs((a || 0) - (b || 0)); }
 
+/**
+ * Load the spreadsheet reader on FIRST USE, never at require time.
+ *
+ * `index.js` mounts the fuel routes at boot, so a top-level `require('xlsx')` made
+ * the whole backend fail to start with MODULE_NOT_FOUND whenever the dependency was
+ * missing — a deploy that skipped `npm install`, for instance. Every route then 502s,
+ * including login, and the outage looks nothing like a fuel problem. One feature's
+ * dependency must not be able to take authentication down.
+ */
+function loadXlsx() {
+  try {
+    // eslint-disable-next-line global-require
+    return require('xlsx');
+  } catch (e) {
+    const err = new Error('Spreadsheets cannot be read on this server: the "xlsx" package is not installed. Run npm install in backend/ and restart. PDF sheets are unaffected.');
+    err.code = 'xlsx_missing';
+    throw err;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // PDF text geometry
 // ---------------------------------------------------------------------------
@@ -374,4 +394,5 @@ module.exports = {
   checkIdentity,
   makeLedger,
   parseLooseDate,
+  loadXlsx,
 };

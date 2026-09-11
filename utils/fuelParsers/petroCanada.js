@@ -15,8 +15,8 @@
  * whose displayed value has been rounded away from what is stored underneath.
  */
 
-const XLSX = require('xlsx');
-const { numberToMoney, parseMoney, parseLooseDate, checkIdentity, makeLedger, looksLikeData } = require('./shared');
+
+const { numberToMoney, parseMoney, parseLooseDate, checkIdentity, makeLedger, looksLikeData, loadXlsx } = require('./shared');
 
 const columns = [
   { key: 'site_name', label: 'Site Name', kind: 'text',  col: 'A', role: 'info' },
@@ -91,6 +91,7 @@ function sheetMeta(ws) {
  */
 function parse(buffer, opts = {}) {
   const led = makeLedger();
+  const XLSX = loadXlsx();
   const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: false, cellText: true });
 
   if (!signature(workbook)) {

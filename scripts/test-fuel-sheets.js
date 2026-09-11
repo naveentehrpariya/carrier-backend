@@ -479,6 +479,30 @@ const fm = (int, dp) => shared.fmtMoney(int, dp);
       () => reg.parseSheet(Buffer.from('just some words\nand another line\n'), { filename: 'notes.csv' }), 'no_table_found');
   }
 
+  // ================================================================ BOOT SAFETY
+  // index.js mounts the fuel routes at boot. A top-level require of an optional
+  // dependency therefore decides whether the WHOLE backend starts — a deploy that
+  // skipped npm install took every route down, login included, and the outage looked
+  // nothing like a fuel problem. Checked in the source because by the time this suite
+  // runs the dependency is installed and the failure cannot be reproduced in-process.
+  {
+    const dir = path.join(__dirname, '..', 'utils', 'fuelParsers');
+    const heavy = /require\(\s*['"](xlsx|pdfjs-dist[^'"]*)['"]\s*\)/;
+    const offenders = [];
+    fs.readdirSync(dir).filter((f) => f.endsWith('.js')).forEach((f) => {
+      const src = fs.readFileSync(path.join(dir, f), 'utf8');
+      src.split('\n').forEach((line, i) => {
+        if (!heavy.test(line)) return;
+        // a require indented inside a function body is lazy, which is the point
+        if (/^\s+/.test(line)) return;
+        offenders.push(`${f}:${i + 1}`);
+      });
+    });
+    eq('no parser requires a heavy dependency at module level', offenders.join(', '), '');
+    check('the lazy loader is exported for the spreadsheet reader',
+      typeof shared.loadXlsx === 'function', 'shared.loadXlsx is missing');
+  }
+
   // ---------------------------------------------------------------- report
   const total = pass + failures.length;
   console.log(`\nfuel sheets: ${pass}/${total} checks passed`);
