@@ -7,10 +7,8 @@ const { resolveTenant } = require('../middleware/tenant');
 const multer = require('multer');
 const os = require('os');
 const path = require('path');
-
 const uploadDir = path.join(os.tmpdir(), 'uploads');
 const multerParse = multer({ dest: uploadDir });
-
 router.route('/create_user').post(validateToken, authController.signup);
 router.route('/edit_user/:id').post(validateToken, authController.editUser);
 router.route('/suspanduser/:id').get(validateToken, authController.suspandUser);
