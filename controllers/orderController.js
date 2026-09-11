@@ -1,5 +1,6 @@
 const catchAsync = require("../utils/catchAsync");
-const { deriveOrderTypeFromPayload, partiesFromPayload, resolveOrderState } = require('../utils/orderParty');
+const { deriveOrderTypeFromPayload, partiesFromPayload, resolveOrderState,
+        hasCarrierWork, hasFleetWork, isUnassigned } = require('../utils/orderParty');
 const { resolveOrderCostFields, orderCostAmounts } = require('../utils/orderCost');
 const { rollupCarrierPaymentStatus, carrierOrderMatch } = require('../utils/carrierSettlement');
 const APIFeatures  = require("../utils/APIFeatures");
@@ -643,7 +644,16 @@ exports.create_order = catchAsync(async (req, res, next) => {
       // from what was actually filled in. A carrier means an outside carrier runs the load; a truck
       // or a driver means we do. See utils/orderParty.js. The body's own order_type survives only
       // as a fallback for a payload that names neither, so an older client still works.
-      const derivedOrderType = deriveOrderTypeFromPayload(req.body) || order_type || 'outsourcing';
+      /* Nothing named at all — no carrier, no truck, no driver — is a load that is booked but not
+       * yet assigned. Stamped `regular` for exactly the reason a mixed order is: regular is the
+       * branch that does NOT assume one carrier owns the load, so it demands nothing. The truth
+       * ("nobody yet") is carried by `order_parties`, which comes out empty.
+       *
+       * This fallback used to be `'outsourcing'`, which made the schema demand a carrier — so an
+       * order describing real work failed validation for naming nobody, and the dispatcher had to
+       * claim a type they had not decided on. A client that DOES send `order_type` explicitly is
+       * still taken at its word: choosing outsourcing and omitting the carrier is still refused. */
+      const derivedOrderType = deriveOrderTypeFromPayload(req.body) || order_type || 'regular';
       const isRegular = derivedOrderType === 'regular';
       const ownerContext = isRegular
          ? await resolveRegularOrderOwnerContext({
@@ -1215,15 +1225,11 @@ async function distanceEditBlockers(existing, updateData, tenantId, body = {}) {
 
    Deliberately NOT flagged: an owner-operated leg with no driver of ours (the owner's own
    driver runs it — see the Trip Planning notes), and a stop that is a relay marker.        */
-// Does this order involve an outside carrier / our own equipment? Read from the party stamp
-// (utils/orderParty.js), which is the only thing that can describe a MIXED order — one whose legs go
-// to both. Falling back to `order_type` keeps every order written before the stamp existed correct.
-const hasCarrierWork = (o) => (Array.isArray(o.order_parties) && o.order_parties.length
-   ? o.order_parties.includes('carrier')
-   : String(o.order_type || '') === 'outsourcing');
-const hasFleetWork = (o) => (Array.isArray(o.order_parties) && o.order_parties.length
-   ? (o.order_parties.includes('company') || o.order_parties.includes('owner'))
-   : String(o.order_type || '') === 'regular');
+// Does this order involve an outside carrier / our own equipment / nobody yet? Read from the party
+// stamp, which is the only thing that can describe a MIXED order — one whose legs go to both.
+// These were re-declared here, byte-identical to utils/orderParty.js. Two copies of the rule that
+// decides which side of an order's money a report reads is exactly one too many, so they are
+// imported now; the fallback to `order_type` for orders written before the stamp lives there.
 
 const ATTENTION_RULES = [
    // An order with no leg cannot answer who ran it, so it cannot answer what it cost either. Every
@@ -1262,10 +1268,16 @@ const ATTENTION_RULES = [
    // the single column alone would flag every one of them as having no carrier.
    { code: 'no_carrier', group: 'data', level: 'error', label: 'No carrier',
      test: (o) => hasCarrierWork(o) && !o.carrier && !(Array.isArray(o.carriers) && o.carriers.length > 0) },
+   /* Booked, but nobody is running it yet. ONE flag, not two: an unassigned order has neither a
+    * truck nor a driver by definition, and reporting both said the same thing twice while naming
+    * neither the actual state nor the fix. `warn`, not `error` — a load taken this morning that
+    * nobody has been put on is normal, it just must not be forgotten. */
+   { code: 'not_assigned', group: 'data', level: 'warn', label: 'Not assigned yet',
+     test: (o) => isUnassigned(o) },
    { code: 'no_truck', group: 'data', level: 'warn', label: 'No truck',
-     test: (o) => hasFleetWork(o) && !o.truck },
+     test: (o) => hasFleetWork(o) && !isUnassigned(o) && !o.truck },
    { code: 'no_driver', group: 'data', level: 'warn', label: 'No driver',
-     test: (o) => hasFleetWork(o) && !o.isOwnerOperatedTruck
+     test: (o) => hasFleetWork(o) && !isUnassigned(o) && !o.isOwnerOperatedTruck
         && !o.driver && !(Array.isArray(o.drivers) && o.drivers.length > 0) },
 
    // Paperwork and ageing — `_docCount` and `_ageDays` are stamped on the row before testing

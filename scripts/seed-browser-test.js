@@ -147,11 +147,15 @@ const PASSWORD = 'Test@12345';
                  ['INR','USD',0.0119], ['USD','INR',84.2]];
   for (let back = 0; back < 3; back++) {
     const d = new Date(now.getFullYear(), now.getMonth() - back, 1);
-    for (const [from, to, rate] of pairs) {
+    for (const [sourceCurrency, targetCurrency, rate] of pairs) {
+      // The fields are `sourceCurrency`/`targetCurrency`. They were written as `fromCurrency`/
+      // `toCurrency`, which strict mode drops — so `sourceCurrency` was missing, the required-field
+      // error was swallowed by the `.catch()` below, and this seed produced ZERO FX rows while
+      // reporting success. Not caught, so a broken rate row fails loudly next time.
       await ConversionRate.create({
         tenantId: TENANT, month: d.getMonth() + 1, year: d.getFullYear(),
-        fromCurrency: from, toCurrency: to, rate, createdBy: admin._id,
-      }).catch(() => {});
+        sourceCurrency, targetCurrency, rate, createdBy: admin._id,
+      });
     }
   }
 

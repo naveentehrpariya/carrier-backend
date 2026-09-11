@@ -223,6 +223,24 @@ function resolveOrderState({ order, trips, truckMap }) {
 const partiesOf = (order) => (Array.isArray(order?.order_parties) ? order.order_parties : []);
 const countOf = (v) => (Array.isArray(v) ? v.filter(Boolean).length : 0);
 
+/**
+ * Booked, but nobody is running it yet — no carrier, no truck of ours.
+ *
+ * This is a real state, not a gap: a load is often taken before it is decided who moves it, and the
+ * whole point of deriving the type is that the question can wait until there is an answer. The
+ * dispatcher leaves the choice alone on the order form and assigns the leg later in Trip Planning,
+ * at which point the type stamps itself.
+ *
+ * An EMPTY `order_parties` array means it — an ABSENT one does not. Absent is a legacy order the
+ * party migration could not read (72 of them: no legs and no carrier/truck), and those must keep
+ * falling back to their stored `order_type`. Verified before relying on the distinction: not one
+ * order on the live database carried `order_parties: []`, so the empty array was free to take this
+ * meaning without a migration or a new column.
+ */
+function isUnassigned(order) {
+  return Array.isArray(order?.order_parties) && order.order_parties.length === 0;
+}
+
 /** Does an outside carrier move any part of this order? */
 function hasCarrierWork(order) {
   const p = partiesOf(order);
@@ -281,6 +299,7 @@ const ORDER_SHAPE_FIELDS = 'order_type order_parties carriers ownerOperators car
 module.exports = {
   PARTY_TYPES,
   ORDER_SHAPE_FIELDS,
+  isUnassigned,
   hasCarrierWork,
   hasFleetWork,
   isOwnerOperated,

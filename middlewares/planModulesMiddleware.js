@@ -78,10 +78,23 @@ const checkOrderModuleAccess = () => {
     // from a field the client declares — the same rule create_order stamps the order with. A client
     // that sent only `order_type` still works: it is the fallback.
     const derived = deriveOrderTypeFromPayload(req.body);
-    const orderTypeRaw = String(derived || req.body?.order_type || 'outsourcing').toLowerCase();
-    const requested = valid.includes(orderTypeRaw) ? orderTypeRaw : 'outsourcing';
+    const declared = String(req.body?.order_type || '').toLowerCase();
 
     const effective = await computeEffectiveModules(req);
+
+    /* Nothing named and nothing declared: the order is booked but not assigned, so it commits to
+     * NEITHER module — the question is answered later, on the leg. Demanding one module here would
+     * stop an outsourcing-only dispatcher from booking a load they have not placed yet, purely
+     * because the unassigned state happens to be stamped `regular`. Any module is enough. */
+    if (!derived && !declared) {
+      if (!effective.length) {
+        return next(new AppError('No order module is enabled for this company.', 403));
+      }
+      return next();
+    }
+
+    const orderTypeRaw = String(derived || declared).toLowerCase();
+    const requested = valid.includes(orderTypeRaw) ? orderTypeRaw : 'outsourcing';
 
     if (!effective.includes(requested)) {
       return next(new AppError(`Order type "${requested}" is not enabled for this company.`, 403));
