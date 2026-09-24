@@ -734,7 +734,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
       && stockAcct.printMode === 'preprinted' && stockAcct.offsetYmm === 2, JSON.stringify(r.data.account));
     r = await A.post(`/bank-accounts/update/${stockAcct._id}`, { chequeHeightIn: 9, offsetXmm: 999 });
     ok('out-of-range stock values are clamped, not rejected',
-      r.data.account?.chequeHeightIn === 3.75 && r.data.account?.offsetXmm === 25,
+      r.data.account?.chequeHeightIn === 3.75 && r.data.account?.offsetXmm === require('../utils/chequeHtml').NUDGE_MAX_MM,
       JSON.stringify({ h: r.data.account?.chequeHeightIn, x: r.data.account?.offsetXmm }));
     // Field overrides are interpolated into a style attribute, so they are
     // validated key by key rather than stored as given.
@@ -776,6 +776,17 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     ok('mixed plain/pre-printed batch refused', r.status === 409 && r.data.code === 'mixed_stock', r.status);
     r = await A.post('/cheques/print-batch', { ids: [stockCheque._id], preview: true }, { responseType: 'arraybuffer' });
     ok('single-stock batch still prints', pdfSkipped || isPdf(r), r.status);
+
+    // A legal amount too long for the words line is refused, never clipped.
+    if (!pdfSkipped) {
+      const huge = (await add({ bankAccount: stockAcct._id, amount: 777777777.77 })).data.cheque;
+      r = await A.get(`/cheques/${huge._id}/pdf`, { responseType: 'arraybuffer' });
+      const body = (() => { try { return JSON.parse(Buffer.from(r.data).toString()); } catch (e) { return {}; } })();
+      ok('printing a cheque whose amount in words cannot fit is refused (422)', r.status === 422 && body.code === 'field_too_long', `${r.status} ${body.code}`);
+      r = await A.get('/cheques/listings', { params: { search: huge.chequeNo } });
+      const after = (r.data.cheques || []).find((c) => String(c._id) === String(huge._id));
+      ok('a refused print does not mark the cheque printed', after?.status === 'issued', after?.status);
+    }
 
     // On numbered stock the sheet order is fixed by the paper, not the clicks.
     {

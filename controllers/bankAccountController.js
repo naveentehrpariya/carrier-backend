@@ -4,7 +4,7 @@ const PaymentCheque = require('../db/PaymentCheque');
 const Counter = require('../db/Counter');
 const { logChange } = require('../utils/activityLogger');
 const { hasChequeAccess } = require('./vendorController');
-const { buildAlignmentSheetHtml } = require('../utils/chequeHtml');
+const { buildAlignmentSheetHtml, NUDGE_MAX_MM } = require('../utils/chequeHtml');
 const { logActivity } = require('../utils/activityLogger');
 
 const notDeleted = { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
@@ -32,7 +32,7 @@ function parsePrintSettings(body) {
   for (const k of ['offsetXmm', 'offsetYmm']) {
     if (body[k] !== undefined) {
       const n = Number(body[k]);
-      if (Number.isFinite(n)) out[k] = clamp(n, -25, 25);
+      if (Number.isFinite(n)) out[k] = clamp(n, -NUDGE_MAX_MM, NUDGE_MAX_MM);
     }
   }
   if (body.printChequeNumber !== undefined) out.printChequeNumber = !!body.printChequeNumber;
@@ -236,11 +236,11 @@ exports.alignmentSheet = catchAsync(async (req, res) => {
   const spec = account.printSpec();
   if (req.query.offsetXmm !== undefined) {
     const n = Number(req.query.offsetXmm);
-    if (Number.isFinite(n)) spec.offsetXmm = clamp(n, -25, 25);
+    if (Number.isFinite(n)) spec.offsetXmm = clamp(n, -NUDGE_MAX_MM, NUDGE_MAX_MM);
   }
   if (req.query.offsetYmm !== undefined) {
     const n = Number(req.query.offsetYmm);
-    if (Number.isFinite(n)) spec.offsetYmm = clamp(n, -25, 25);
+    if (Number.isFinite(n)) spec.offsetYmm = clamp(n, -NUDGE_MAX_MM, NUDGE_MAX_MM);
   }
 
   const html = buildAlignmentSheetHtml(spec, account.layoutOverrides, account);

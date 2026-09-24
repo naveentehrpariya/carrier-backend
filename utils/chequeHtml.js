@@ -311,6 +311,25 @@ const DEFAULT_PREPRINTED_LAYOUT = {
 
 const mmToIn = (mm) => (Number(mm) || 0) / 25.4;
 
+/**
+ * How far the whole sheet may be nudged — derived from the layout, not picked.
+ * A laser printer cannot put ink in roughly the outer 0.25in, and the fields
+ * closest to the paper's edge are the date (0.50in from the top on a top band)
+ * and the right-hand fields (0.62in from the right). The nearest one decides:
+ * (0.50 - 0.25) x 25.4 = 6.35mm, so 6mm.
+ *
+ * Measured in the rendered PDF, not inferred: the old 25mm limit pushed the
+ * amount in figures off the paper ("***2,52"), and a 9mm limit derived from
+ * the right edge alone still put the date 0.16in from the top. Real feed drift
+ * is a few mm; a bigger number means the stock is loaded wrong.
+ */
+const PRINTER_MARGIN_IN = 0.25;
+const NUDGE_MAX_MM = Math.floor((Math.min(
+  DEFAULT_PREPRINTED_LAYOUT.date.top,
+  DEFAULT_PREPRINTED_LAYOUT.date.right,
+  DEFAULT_PREPRINTED_LAYOUT.amountFigures.right
+) - PRINTER_MARGIN_IN) * 25.4);
+
 /** Merge a sparse per-account override map over the spec defaults. */
 function resolveLayout(overrides) {
   const out = {};
@@ -332,6 +351,30 @@ function fieldTopIn(f, bandHeightIn) {
   // Anchored to the MICR band, which is the one place nothing may print.
   if (f.aboveMicr !== undefined) return bandHeightIn - CPA.micrBandIn - f.aboveMicr - lineIn;
   return 0;
+}
+
+/**
+ * On a short band the scan area reaches (almost) to the top of the cheque: on
+ * 2.75in its upper edge IS the top edge, on 3.0in it is 0.25in below it. The
+ * date and cheque number sit top-right, so there they print INSIDE the
+ * rectangle the bank's reader scans for the amount — measured in the rendered
+ * PDF, not inferred. A compliant short cheque carries its date box to the left
+ * of that area, so that is where these go when they would otherwise collide.
+ */
+function layoutForBand(layout, bandHeightIn) {
+  const scanTop = bandHeightIn - CPA.amountUpperFromBottomIn;
+  const scanBottom = bandHeightIn - CPA.amountLowerFromBottomIn;
+  const out = { ...layout };
+  for (const key of ['date', 'chequeNo']) {
+    const f = layout[key];
+    if (!f || f.right === undefined || f.right >= CPA.amountScanWidthIn) continue;
+    const top = fieldTopIn(f, bandHeightIn);
+    const bottom = top + (f.size || 11) * 1.25 / 72;
+    if (bottom > scanTop && top < scanBottom) {
+      out[key] = { ...f, right: CPA.amountScanWidthIn + CPA.clearAreaIn };
+    }
+  }
+  return out;
 }
 
 /**
@@ -417,6 +460,33 @@ function payeeMaxHeight(layout, bandHeightIn, hasMemo) {
  */
 const PAYEE_SIZE_LADDER = [11, 10, 9, 8, 7.5];
 
+/**
+ * The amount in words is the LEGAL amount — it may be shrunk, never clipped
+ * and never wrapped (a second line reads as a second amount). Below this size
+ * the cheque is refused rather than printed.
+ */
+const WORDS_MIN_PT = 7;
+
+/**
+ * Exact fit, measured by the browser that renders the PDF. The server-side
+ * estimates (fitPayeeSize) pick a starting size; this shrinks any field still
+ * overflowing its box in 0.25pt steps using the real glyph widths, and marks
+ * one that cannot fit even at its floor. A long amount in words (a six-figure
+ * cheque) measured 1.00-5.95in against a box ending at 5.60in — straight into
+ * the bank's scan area — before this existed.
+ */
+const FIT_SCRIPT = `<script>(function () {
+  var els = document.querySelectorAll('[data-fit]');
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    var min = parseFloat(el.getAttribute('data-min')) || 7;
+    var pt = parseFloat(el.style.fontSize) || parseFloat(getComputedStyle(el).fontSize) * 0.75;
+    var over = function () { return el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 1; };
+    while (over() && pt > min) { pt = Math.max(min, pt - 0.25); el.style.fontSize = pt + 'pt'; }
+    if (over()) el.setAttribute('data-overflow', '1');
+  }
+})();</script>`;
+
 function fitPayeeSize(nameAndLines, widthIn, availableHeightIn, lineHeight) {
   for (const size of PAYEE_SIZE_LADDER) {
     const charsPerLine = Math.max(Math.floor((widthIn * 72) / (size * 0.55)), 8);
@@ -429,8 +499,9 @@ function fitPayeeSize(nameAndLines, widthIn, availableHeightIn, lineHeight) {
   return PAYEE_SIZE_LADDER[PAYEE_SIZE_LADDER.length - 1];
 }
 
-function preprintedChequeBand(cheque, spec, layout) {
+function preprintedChequeBand(cheque, spec, layoutIn) {
   const bandH = spec.chequeHeightIn;
+  const layout = layoutForBand(layoutIn, bandH);
   const words = cheque.amountInWords || amountToWords(cheque.amount);
   const addressLines = String(cheque.payeeAddress || '')
     .split('\n').map((l) => l.trim()).filter(Boolean);
@@ -438,7 +509,7 @@ function preprintedChequeBand(cheque, spec, layout) {
   // The words line must stop one clear area short of the amount scan area,
   // or a long payee amount would run into the box the bank's reader scans.
   const wordsRight = CPA.amountScanWidthIn + CPA.clearAreaIn;
-  const wordsStyle = `${fieldStyle(layout.amountWords, bandH)};right:${wordsRight}in`;
+  const wordsStyle = `${fieldStyle(layout.amountWords, bandH)};right:${wordsRight}in;overflow:hidden`;
   const currencyNote = currencyDesignation(cheque, spec);
 
   // Shrink the payee block to fit before letting the height cap clip it.
@@ -454,9 +525,9 @@ function preprintedChequeBand(cheque, spec, layout) {
     <div class="band" style="height:${bandH}in">
       <div class="f" style="${fieldStyle(layout.date, bandH)}">${esc(fmtChequeDateCPA(cheque.paymentDate, spec.dateFormat))}</div>
       <div class="f" style="${fieldStyle(layout.amountFigures, bandH)}">${esc(fmtAmountFiguresCPA(cheque.amount))}</div>
-      <div class="f" style="${wordsStyle}">${esc(fmtAmountWordsCPA(words))}</div>
+      <div class="f" style="${wordsStyle}" data-fit="amountWords" data-min="${WORDS_MIN_PT}" data-required="1">${esc(fmtAmountWordsCPA(words))}</div>
       ${currencyNote ? `<div class="f" style="${fieldStyle(layout.currencyNote, bandH)}">${esc(currencyNote)}</div>` : ''}
-      <div class="f" style="${payeeStyle}">
+      <div class="f" style="${payeeStyle}" data-fit="payee" data-min="${PAYEE_SIZE_LADDER[PAYEE_SIZE_LADDER.length - 1]}">
         <div style="font-weight:bold">${esc(cheque.payeeName || '')}</div>
         ${addressLines.map((l) => `<div>${esc(l)}</div>`).join('')}
       </div>
@@ -600,7 +671,7 @@ function buildPreprintedSheetsHtml(entries) {
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8" /><style>${PREPRINTED_CSS}</style></head>
-<body>${sheets}</body></html>`;
+<body>${sheets}${FIT_SCRIPT}</body></html>`;
 }
 
 /**
@@ -615,8 +686,10 @@ function buildPreprintedSheetsHtml(entries) {
 function buildAlignmentSheetHtml(spec, layoutOverrides, account) {
   const SHEET_H = 11;
   const SHEET_W = 8.5;
-  const layout = resolveLayout(layoutOverrides);
   const bandH = spec.chequeHeightIn;
+  // Same band adjustment as the real cheque, or the sheet shows a date box
+  // where the date will not print.
+  const layout = layoutForBand(resolveLayout(layoutOverrides), bandH);
   const bandTop = spec.bandTopIn;
 
   const sample = {
@@ -743,6 +816,10 @@ module.exports.buildPreprintedSheetsHtml = buildPreprintedSheetsHtml;
 module.exports.buildAlignmentSheetHtml = buildAlignmentSheetHtml;
 module.exports.DEFAULT_PREPRINTED_LAYOUT = DEFAULT_PREPRINTED_LAYOUT;
 module.exports.CPA = CPA;
+module.exports.NUDGE_MAX_MM = NUDGE_MAX_MM;
+module.exports.PRINTER_MARGIN_IN = PRINTER_MARGIN_IN;
+module.exports.WORDS_MIN_PT = WORDS_MIN_PT;
+module.exports.layoutForBand = layoutForBand;
 module.exports.fitPayeeSize = fitPayeeSize;
 module.exports.DATE_FORMATS = DATE_FORMATS;
 module.exports.fmtChequeDateCPA = fmtChequeDateCPA;

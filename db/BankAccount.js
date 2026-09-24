@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { NUDGE_MAX_MM } = require('../utils/chequeHtml');
 
 // The account a cheque is drawn on. A cheque book belongs to a bank account,
 // not to the company — its pre-printed numbers run per account, which is why
@@ -36,8 +37,8 @@ const schema = new mongoose.Schema({
     // Printer feed drift, in millimetres. Every printer pulls the sheet a
     // fraction differently, and cheque stock is numbered — a misfed sheet is a
     // void cheque. The alignment sheet finds these; they are never guessed.
-    offsetXmm: { type: Number, default: 0, min: -25, max: 25 },
-    offsetYmm: { type: Number, default: 0, min: -25, max: 25 },
+    offsetXmm: { type: Number, default: 0, min: -NUDGE_MAX_MM, max: NUDGE_MAX_MM },
+    offsetYmm: { type: Number, default: 0, min: -NUDGE_MAX_MM, max: NUDGE_MAX_MM },
 
     // Pre-printed stock already carries its number; printing ours on top of it
     // would put two different numbers on one cheque.
@@ -82,8 +83,10 @@ schema.methods.printSpec = function () {
         chequePosition: this.chequePosition || 'top',
         chequeHeightIn: Number(this.chequeHeightIn) || 3.5,
         bandTopIn: this.chequeBandTopIn(),
-        offsetXmm: Number(this.offsetXmm) || 0,
-        offsetYmm: Number(this.offsetYmm) || 0,
+        // Clamped on read as well: a value stored before the limit was
+        // tightened must not push the amount off the paper.
+        offsetXmm: Math.max(-NUDGE_MAX_MM, Math.min(NUDGE_MAX_MM, Number(this.offsetXmm) || 0)),
+        offsetYmm: Math.max(-NUDGE_MAX_MM, Math.min(NUDGE_MAX_MM, Number(this.offsetYmm) || 0)),
         printChequeNumber: !!this.printChequeNumber,
         dateFormat: this.dateFormat || 'YYYYMMDD',
         // The renderer needs the account's own currency to decide whether a

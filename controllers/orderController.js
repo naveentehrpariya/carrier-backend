@@ -12,6 +12,7 @@ const Equipment = require("../db/Equipment");
 const Charges = require("../db/Charges");
 const PaymentLogs = require("../db/PaymentLogs");
 const Trip = require("../db/Trip");
+const { legPartyChangeBlockers } = require("../utils/legPartyLock");
 const Truck = require("../db/Truck");
 const Users = require("../db/Users");
 const OwnerOperator = require("../db/OwnerOperator");
@@ -822,6 +823,114 @@ exports.create_order = catchAsync(async (req, res, next) => {
    }
 });
 
+/* THE EDIT ORDER FORM'S CARRIER FIELD IS A LEG EDIT.
+ *
+ * An order's carrier is a READING of its legs (utils/orderParty.js): after every save
+ * `resolveOrderCostFields` re-reads the legs and writes the carrier they name back onto the order.
+ * So writing a new carrier onto the ORDER alone was undone a few lines later by that re-read — the
+ * leg still named the old carrier. The form answered "Order updated successfully" and the load
+ * stayed with the old carrier: a client report, "facing an issue to change the carrier in any load".
+ * "Any" because since migrate-order-default-leg every outsourcing order has a leg; the 374 that had
+ * none used to escape through the no-legs early return.
+ *
+ * So a carrier edit goes where the carrier actually lives:
+ *   - ONE carrier leg (a plain outsourcing load — every order the form can edit) → that leg changes.
+ *   - several carrier legs → which one is ambiguous; refused with a pointer to Trip Planning, never
+ *     silently ignored.
+ *   - no carrier leg → the load is on our own truck or nobody's; handing it to a carrier is a leg
+ *     change and belongs in Trip Planning. (The one exception is an outsourcing order whose only leg
+ *     names nobody — that leg IS the carrier's, it just lost its id.)
+ * The amount follows the same rule: when the single carrier leg carries a FROZEN share, it is moved
+ * with the order's figure, because the per-leg rate confirmation prints the leg's amount — otherwise
+ * the order would say 2,500 while the paperwork sent to the carrier said 2,000.
+ *
+ * A carrier change is guarded by the SAME lock Trip Planning uses (utils/legPartyLock.js): once the
+ * carrier has been paid, or the order sits on a payslip, the leg is a contract with someone else.
+ *
+ * @returns {{ok: true, push: null|{legId, set}} | {ok: false, status, body}}
+ */
+async function planOrderCarrierEdit({ tenantId, existingOrder, updateData }) {
+   const idOf = (v) => {
+      if (!v) return null;
+      const s = String(v._id || v);
+      return s && s !== 'null' && s !== 'undefined' ? s : null;
+   };
+   const refuse = (code, message) => ({ ok: false, status: 409, body: { status: false, code, message } });
+
+   const wanted = ('carrier' in updateData) ? idOf(updateData.carrier) : null;
+   const isOutsourcing = String(existingOrder.order_type || '') === 'outsourcing';
+   // On a fleet order `carrier_amount` is the legacy settlement mirror written by the handler itself,
+   // not something the user typed — only an outsourcing order's amount is the carrier's money.
+   const amountTyped = isOutsourcing && ('input_carrier_amount' in updateData);
+   if (!wanted && !amountTyped) return { ok: true, push: null };
+
+   const legs = await Trip.find({ tenantId, order: existingOrder._id, deletedAt: null })
+      .select('_id trip_no truck carrier carrier_amount carrier_payment_status').lean();
+   // A legacy order with no leg: its own columns are the source and the re-read leaves them alone.
+   if (!legs.length) return { ok: true, push: null };
+
+   const carrierLegs = legs.filter((l) => idOf(l.carrier));
+   const onOrder = idOf(existingOrder.carrier);
+   let target = null;
+   const set = {};
+
+   if (wanted) {
+      if (carrierLegs.length === 1) {
+         target = carrierLegs[0];
+         if (idOf(target.carrier) !== wanted) set.carrier = wanted;
+      } else if (carrierLegs.length > 1) {
+         // The form echoes whatever it loaded; only a carrier that is on none of the legs is an edit.
+         const named = carrierLegs.map((l) => idOf(l.carrier));
+         if (!named.includes(wanted) && wanted !== onOrder) {
+            return refuse('carrier_set_on_legs',
+               `This load is split across ${carrierLegs.length} carriers, so there is no single carrier to change here. `
+               + 'Open Trip Planning and change the carrier on the leg you mean.');
+         }
+      } else {
+         const only = legs.length === 1 ? legs[0] : null;
+         if (only && !only.truck && isOutsourcing) {
+            target = only;
+            set.carrier = wanted;
+         } else if (wanted !== onOrder) {
+            return refuse('carrier_set_on_legs',
+               'This load is not with a carrier. To hand it — or one leg of it — to a carrier, use Trip Planning.');
+         }
+      }
+   }
+
+   if (amountTyped && carrierLegs.length === 1) {
+      target = target || carrierLegs[0];
+      const frozen = target.carrier_amount;
+      const typed = Number(updateData.input_carrier_amount || 0);
+      // `Number(null) === 0` — a null leg amount means "take the order's figure", so it is left null.
+      const hasFrozen = frozen !== null && frozen !== undefined && frozen !== '' && Number.isFinite(Number(frozen));
+      if (hasFrozen && Math.abs(Number(frozen) - typed) > 0.004) set.carrier_amount = typed;
+   }
+
+   if (!target || !Object.keys(set).length) return { ok: true, push: null };
+
+   if (set.carrier) {
+      const segments = legs.map((l) => (String(l._id) === String(target._id)
+         ? { ...l, carrier: set.carrier, truck: null }
+         : l));
+      const lock = await legPartyChangeBlockers({ tenantId, order: existingOrder, segments, truckMap: new Map() });
+      if (lock.blocked) {
+         return {
+            ok: false,
+            status: 409,
+            body: {
+               status: false,
+               code: lock.code,
+               message: `${lock.blockers.join(' ')} Changing the carrier now would change what that was built from.`,
+               blockers: lock.blockers,
+            },
+         };
+      }
+   }
+
+   return { ok: true, push: { legId: target._id, before: target, set } };
+}
+
 exports.update_order = catchAsync(async (req, res, next) => {
    try {
       const tenantId = getTenantId(req);
@@ -1025,10 +1134,29 @@ exports.update_order = catchAsync(async (req, res, next) => {
             updateData.driver = updateData.drivers[0] || null;
          }
       }
+      // Decided BEFORE anything is written: a refused carrier change must leave the order untouched.
+      const carrierPlan = await planOrderCarrierEdit({ tenantId, existingOrder, updateData });
+      if (!carrierPlan.ok) return res.status(carrierPlan.status).json(carrierPlan.body);
+
       const order = await Order.findOneAndUpdate(criteria, updateData, {
          new: true,
          runValidators: true,
       });
+
+      // Write the carrier onto the leg it lives on, so the re-read below agrees with the edit
+      // instead of reverting it. See planOrderCarrierEdit.
+      if (carrierPlan.push) {
+         await Trip.updateOne({ _id: carrierPlan.push.legId, tenantId }, { $set: carrierPlan.push.set });
+         logChange(req, {
+            model: 'Trip',
+            module: 'order',
+            before: carrierPlan.push.before,
+            after: { ...carrierPlan.push.before, ...carrierPlan.push.set },
+            resourceId: carrierPlan.push.legId,
+            resourceName: `Order #${order.serial_no} leg ${carrierPlan.push.before.trip_no || 1}`,
+            description: `Carrier changed on order #${order.serial_no} from the order form`,
+         });
+      }
 
       // A leg addresses its stops by POSITION (`start_stop_index` / `end_stop_index`). Editing the
       // order's stops used to leave those numbers untouched, so deleting a stop silently pointed a

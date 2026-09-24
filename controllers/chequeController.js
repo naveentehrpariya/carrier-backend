@@ -580,6 +580,9 @@ exports.chequePdf = catchAsync(async (req, res) => {
     if (err?.code === 'mixed_stock') {
       return res.status(409).json({ status: false, code: 'mixed_stock', message: `These cheques are drawn on different kinds of paper (${(err.detail || []).join(', ')}). Print one kind at a time — the printer tray has to change between them.` });
     }
+    if (err?.code === 'field_too_long') {
+      return res.status(422).json({ status: false, code: 'field_too_long', message: 'The amount in words is too long to fit on one line of this cheque stock, even at the smallest legible size. Write this cheque by hand, or split the payment.' });
+    }
     if (err?.code === 'chrome_missing') {
       return res.status(500).json({ status: false, code: 'chrome_missing', message: err.message });
     }
@@ -667,6 +670,14 @@ async function renderChequePdf(cheques, tenantId) {
     html = cheques.length === 1 ? buildChequeHtml(cheques[0]) : buildChequeBatchHtml(cheques);
   }
 
+  return htmlToChequePdf(html);
+}
+
+/**
+ * The browser half of renderChequePdf, on its own so the PDF geometry test
+ * drives exactly the code that prints — fit script, refusal and page options.
+ */
+async function htmlToChequePdf(html) {
   const { launchBrowser, hardenPage } = require('../utils/puppeteer');
   let browser = null;
   try {
@@ -674,6 +685,18 @@ async function renderChequePdf(cheques, tenantId) {
     const page = await browser.newPage();
     await hardenPage(page);
     await page.setContent(html, { waitUntil: 'load', timeout: 20000 }).catch(() => {});
+    // The fit script has already shrunk what it could. A required field still
+    // overflowing (the amount in words, at its floor size) would print into
+    // the bank's scan area or be cut off — refuse rather than hand over a
+    // cheque whose legal amount is incomplete.
+    const tooLong = await page.evaluate(() => Array.from(document.querySelectorAll('[data-overflow][data-required]'))
+      .map((el) => el.getAttribute('data-fit'))).catch(() => []);
+    if (tooLong.length) {
+      const err = new Error('field_too_long');
+      err.code = 'field_too_long';
+      err.detail = [...new Set(tooLong)];
+      throw err;
+    }
     const pdfBuffer = await page.pdf({
       format: 'Letter',
       printBackground: true,
@@ -713,7 +736,7 @@ function stackGaps(chequeNos) {
   return gaps;
 }
 
-exports._test = { orderForStock, stackGaps };
+exports._test = { orderForStock, stackGaps, htmlToChequePdf: (...a) => htmlToChequePdf(...a) };
 
 // POST /cheques/print-batch {ids:[]} — one sheet per cheque, in the order the
 // caller listed them. Same gate, same tenant scope, same DOWNLOAD audit trail.
@@ -764,6 +787,9 @@ exports.printChequeBatch = catchAsync(async (req, res) => {
   } catch (err) {
     if (err?.code === 'mixed_stock') {
       return res.status(409).json({ status: false, code: 'mixed_stock', message: `These cheques are drawn on different kinds of paper (${(err.detail || []).join(', ')}). Print one kind at a time — the printer tray has to change between them.` });
+    }
+    if (err?.code === 'field_too_long') {
+      return res.status(422).json({ status: false, code: 'field_too_long', message: 'The amount in words is too long to fit on one line of this cheque stock, even at the smallest legible size. Write this cheque by hand, or split the payment.' });
     }
     if (err?.code === 'chrome_missing') {
       return res.status(500).json({ status: false, code: 'chrome_missing', message: err.message });

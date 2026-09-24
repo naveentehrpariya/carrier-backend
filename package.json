@@ -7,7 +7,8 @@
   "scripts": {
     "test:cheques": "node scripts/test-cheques.js",
     "test:payroll": "node scripts/test-payroll-matrix.js",
-    "test:orders": "node scripts/test-carrier-settlement.js && node scripts/test-order-shape-projection.js && node scripts/test-mixed-order.js && node scripts/test-payroll-matrix.js",
+    "test:orders": "node scripts/test-carrier-settlement.js && node scripts/test-order-shape-projection.js && node scripts/test-mixed-order.js && node scripts/test-payroll-matrix.js && node scripts/test-order-carrier-edit.js",
+    "test:carrier-edit": "node scripts/test-order-carrier-edit.js",
     "test:documents": "node scripts/test-documents.js",
     "start": "node index.js",
     "dev": "nodemon index.js",
@@ -24,7 +25,8 @@
     "push": "git add . && git commit -m 'update' && git push",
     "test:fuel-sheets": "node scripts/test-fuel-sheets.js",
     "test:fuel-api": "node scripts/test-fuel-api.js",
-    "test:fuel": "node scripts/test-fuel-sheets.js && node scripts/test-fuel-api.js"
+    "test:fuel": "node scripts/test-fuel-sheets.js && node scripts/test-fuel-api.js",
+    "test:cheque-pdf": "node scripts/test-cheque-pdf-geometry.js"
   },
   "author": "",
   "license": "ISC",
