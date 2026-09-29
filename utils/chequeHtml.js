@@ -468,6 +468,47 @@ const PAYEE_SIZE_LADDER = [11, 10, 9, 8, 7.5];
 const WORDS_MIN_PT = 7;
 
 /**
+ * Advance widths of the cheque font (Arial / Helvetica, 1/1000 em — the AFM
+ * metrics the two faces share). Characters are not all the same width: an
+ * amount full of M's and W's can be shorter in characters and still wider on
+ * paper, so the save-time warning measures WIDTH, never length.
+ */
+const WORDS_GLYPH_WIDTHS = (() => {
+  const w = { ' ': 278, '*': 389, '/': 278, '-': 333, ',': 278, '.': 278 };
+  '0123456789'.split('').forEach((c) => { w[c] = 556; });
+  Object.assign(w, {
+    A: 667, B: 667, C: 722, D: 722, E: 667, F: 611, G: 778, H: 722, I: 278, J: 500, K: 667, L: 556, M: 833,
+    N: 722, O: 778, P: 667, Q: 778, R: 722, S: 667, T: 611, U: 722, V: 667, W: 944, X: 667, Y: 667, Z: 611,
+    a: 556, b: 556, c: 500, d: 556, e: 556, f: 278, g: 556, h: 556, i: 222, j: 222, k: 500, l: 222, m: 833,
+    n: 556, o: 556, p: 556, q: 556, r: 333, s: 500, t: 278, u: 556, v: 500, w: 722, x: 500, y: 500, z: 500,
+  });
+  return w;
+})();
+
+/** Width of a string in 1/1000 em. An unknown glyph counts as the widest (W). */
+function wordsWidthUnits(text) {
+  let total = 0;
+  for (const ch of String(text || '')) total += WORDS_GLYPH_WIDTHS[ch] || 944;
+  return total;
+}
+
+/**
+ * How wide the amount in words (asterisks included) may be before the save
+ * warns. Measured in the rendered PDF at WORDS_MIN_PT: 1,777,777.77 (44,635
+ * units) prints and 3,777,777.77 (45,357) is refused. Set below the widest
+ * string KNOWN to print, so anything under it prints — the fit is monotonic in
+ * width. This only decides whether to WARN before a cheque number is spent;
+ * the in-browser fit is still the authority when it prints.
+ * test-cheque-pdf-geometry.js pins it, including wide-glyph amounts.
+ */
+const WORDS_SAFE_WIDTH = 44000;
+
+/** Whether this amount's words are at risk of not fitting on pre-printed stock. */
+function wordsTooLongForStock(amount) {
+  return wordsWidthUnits(fmtAmountWordsCPA(amountToWords(amount))) > WORDS_SAFE_WIDTH;
+}
+
+/**
  * Exact fit, measured by the browser that renders the PDF. The server-side
  * estimates (fitPayeeSize) pick a starting size; this shrinks any field still
  * overflowing its box in 0.25pt steps using the real glyph widths, and marks
@@ -819,6 +860,9 @@ module.exports.CPA = CPA;
 module.exports.NUDGE_MAX_MM = NUDGE_MAX_MM;
 module.exports.PRINTER_MARGIN_IN = PRINTER_MARGIN_IN;
 module.exports.WORDS_MIN_PT = WORDS_MIN_PT;
+module.exports.WORDS_SAFE_WIDTH = WORDS_SAFE_WIDTH;
+module.exports.wordsWidthUnits = wordsWidthUnits;
+module.exports.wordsTooLongForStock = wordsTooLongForStock;
 module.exports.layoutForBand = layoutForBand;
 module.exports.fitPayeeSize = fitPayeeSize;
 module.exports.DATE_FORMATS = DATE_FORMATS;

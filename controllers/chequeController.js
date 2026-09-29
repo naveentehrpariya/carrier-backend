@@ -18,7 +18,7 @@ const OwnerOperatorSalary = require('../db/OwnerOperatorSalary');
 const { logActivity, logChange } = require('../utils/activityLogger');
 const {
   buildChequeHtml, buildChequeBatchHtml, amountToWords,
-  buildPreprintedSheetsHtml, buildAlignmentSheetHtml,
+  buildPreprintedSheetsHtml, buildAlignmentSheetHtml, wordsTooLongForStock,
 } = require('../utils/chequeHtml');
 const { hasChequeAccess } = require('./vendorController');
 const { carrierOrderMatch, rollupCarrierPaymentStatus } = require('../utils/carrierSettlement');
@@ -245,6 +245,13 @@ exports.createCheque = catchAsync(async (req, res) => {
   }
   const accountId = account ? account._id : null;
 
+  // Refuse BEFORE a number is minted. Found in the browser: an amount whose
+  // words cannot fit the line was only refused at print time, after the
+  // cheque already held the next number in the book — voiding it then leaves
+  // an unused sheet in the stack, and every sheet after it misaligns.
+  const longWords = longWordsBlocker(account ? account.printMode : null, amount, req.body.confirm_long_amount);
+  if (longWords) return res.status(409).json(longWords);
+
   // Auto-minted, but a typed number (pre-printed cheque book) wins.
   const typedNo = String(req.body.chequeNo || '').trim();
   let chequeNo = typedNo;
@@ -444,6 +451,11 @@ exports.updateCheque = catchAsync(async (req, res) => {
   if (req.body.amount !== undefined) {
     const amount = parseAmount(req.body.amount);
     if (amount === null) return res.status(400).json({ status: false, code: 'negative_amount', message: 'Amount must be a positive number.' });
+    if (before.bankAccount) {
+      const acct = await BankAccount.findOne({ _id: before.bankAccount, tenantId }).select('printMode').lean();
+      const longWords = longWordsBlocker(acct && acct.printMode, amount, req.body.confirm_long_amount);
+      if (longWords) return res.status(409).json(longWords);
+    }
     update.amount = amount;
     update.amountInWords = amountToWords(amount);
   }
@@ -711,6 +723,21 @@ async function htmlToChequePdf(html) {
 }
 
 const MAX_BATCH_CHEQUES = 100;
+
+/**
+ * A pre-printed cheque whose amount in words will not fit on one line cannot
+ * be printed on that stock. Warn, never block: the operator may be writing
+ * this one by hand, which is what `confirm_long_amount` records.
+ */
+function longWordsBlocker(printMode, amount, confirmed) {
+  if (printMode !== 'preprinted' || confirmed) return null;
+  if (!wordsTooLongForStock(amount)) return null;
+  return {
+    status: false,
+    code: 'amount_words_too_long',
+    message: 'This amount written out in words is too long to fit on one line of your pre-printed cheque stock, so the app will not be able to print it. Split the payment, or save it and write this cheque by hand.',
+  };
+}
 
 /** Sheets come off the stack in number order, so the data must be in that order too. */
 function orderForStock(entries) {

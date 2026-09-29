@@ -281,7 +281,58 @@ exports.fuelSheetDetail = catchAsync(async (req, res) => {
 
   const doc = await FuelPriceSheet.findOne({ _id: req.params.id, tenantId, ...notDeleted }).lean();
   if (!doc) return res.status(404).json({ status: false, message: 'Sheet not found.' });
-  return res.json({ status: true, sheet: summarize(doc), rows: doc.rows, warnings: doc.warnings, unparsed: doc.unparsed, meta: doc.meta });
+
+  // The margin this vendor's last sheet went out on. A vendor sends a new sheet every
+  // day and the margin rarely changes, so re-choosing it every morning is the retyping
+  // this feature exists to remove. It is only a SUGGESTION — the preview still has to
+  // be looked at and Publish still has to be pressed.
+  //
+  // Resolved in two steps on purpose. `.populate()` hands back a profile that has since
+  // been DELETED — the populate has no filter of its own — so a margin the user removed
+  // was still being offered on tomorrow's sheet. And a margin later narrowed to another
+  // unit cannot price this sheet at all. So: take the recent publishes, then keep the
+  // first whose margin is still live and still applicable. If the very last one is gone,
+  // the one before it is the honest next answer rather than nothing.
+  //
+  // Two cases get NO suggestion rather than a wrong one:
+  //   - a generic (unrecognised) sheet: every unknown supplier is stored as vendor
+  //     'generic', so "this vendor's last margin" would be another supplier's margin.
+  //   - a margin tied to one customer: after a batch publish the "last used" is just
+  //     whichever customer went out last, and pre-selecting it would price everyone
+  //     else on that customer's terms.
+  const recent = doc.vendor === 'generic' ? [] : await FuelSheetOutput.find({
+    tenantId, vendor: doc.vendor, profile: { $ne: null }, ...notDeleted,
+  }).sort({ publishedAt: -1 }).limit(25).select('profile publishedAt title').lean();
+
+  let suggestedProfile = null;
+  if (recent.length) {
+    const live = await FuelMarginProfile.find({
+      _id: { $in: recent.map((r) => r.profile) },
+      tenantId,
+      customer: null,
+      ...notDeleted,
+      $and: [
+        { $or: [{ unit: 'any' }, { unit: doc.unit }] },
+        { $or: [{ vendor: null }, { vendor: doc.vendor }] },
+      ],
+    }).select('name unit vendor').lean();
+    const byId = new Map(live.map((pf) => [String(pf._id), pf]));
+    const hit = recent.find((r) => byId.has(String(r.profile)));
+    if (hit) {
+      const pf = byId.get(String(hit.profile));
+      suggestedProfile = { _id: pf._id, name: pf.name, lastUsedAt: hit.publishedAt, lastTitle: hit.title };
+    }
+  }
+
+  return res.json({
+    status: true,
+    sheet: summarize(doc),
+    rows: doc.rows,
+    warnings: doc.warnings,
+    unparsed: doc.unparsed,
+    meta: doc.meta,
+    suggestedProfile,
+  });
 });
 
 /**
@@ -1164,6 +1215,262 @@ exports.previewFuelSheetPdf = catchAsync(async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Sending the sheet — the last step that was still done by hand
+// ---------------------------------------------------------------------------
+
+const MAX_RECIPIENTS = 20;
+// Deliberately plain. An address the app cannot check is refused here rather than
+// silently dropped by the SMTP server, where nobody would ever see the failure.
+// Brackets and quotes are refused too: nodemailer parses `<`, `"` and `()` as address
+// syntax, so a string that passed this check could reach a different mailbox.
+const EMAIL_RE = /^[^\s@,;<>"'()[\]\\]+@[^\s@,;<>"'()[\]\\]+\.[a-z]{2,}$/i;
+// Addresses one published sheet may be sent to per hour. The route is gated, but it
+// sends from the company's own mailbox — a loop or a stuck button must not turn it
+// into a relay.
+const MAX_SENDS_PER_HOUR = 60;
+
+function parseRecipients(input) {
+  const raw = Array.isArray(input) ? input : String(input || '').split(/[,;\s]+/);
+  const seen = new Set();
+  const good = [];
+  const bad = [];
+  raw.map((x) => String(x || '').trim()).filter(Boolean).forEach((addr) => {
+    const key = addr.toLowerCase();
+    if (seen.has(key)) return;      // the same customer listed twice is one email
+    seen.add(key);
+    if (EMAIL_RE.test(addr)) good.push(addr); else bad.push(addr);
+  });
+  return { good, bad };
+}
+
+/** Every address we hold for a customer, so the sender does not retype them. */
+function customerEmails(customer) {
+  if (!customer) return [];
+  const list = [];
+  if (Array.isArray(customer.emails)) {
+    customer.emails.forEach((e) => { const v = (e?.email || e || '').trim(); if (v) list.push(v); });
+  }
+  [customer.email, customer.secondary_email].forEach((v) => { if (v && String(v).trim()) list.push(String(v).trim()); });
+  return parseRecipients(list).good;
+}
+
+/** Who the customer should reply to: the sender, then the company. */
+function replyToFor(req, company) {
+  // During a super-admin emulation req.user is the platform operator — a customer's
+  // reply must reach the company, not us.
+  if (req.isEmulating) return (company?.email || '').trim() || undefined;
+  return (req.user?.email || company?.email || '').trim() || undefined;
+}
+
+const esc = (v) => String(v === null || v === undefined ? '' : v)
+  .replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/**
+ * The covering email.
+ *
+ * It states the effective date and the unit in the body, not only inside the PDF: a
+ * price list whose covering note does not say which day or which unit it is for gets
+ * forwarded on its own and read as current forever.
+ */
+function buildSendHtml({ doc, company, note }) {
+  const { fmtSheetDate, unitHeading } = require('../utils/fuelSheetHtml');
+  const period = doc.effectiveTo && doc.effectiveTo !== doc.effectiveDate
+    ? `${fmtSheetDate(doc.effectiveDate)} – ${fmtSheetDate(doc.effectiveTo)}`
+    : fmtSheetDate(doc.effectiveDate);
+  return `<!doctype html><html><body style="margin:0;background:#f5f6f7;padding:24px;font:14px/1.5 -apple-system,'Segoe UI',Arial,sans-serif;color:#111">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e3e3e3;border-radius:10px;padding:24px">
+    <div style="font-size:17px;font-weight:700">${esc(company?.name || '')}</div>
+    <div style="font-size:13px;color:#555;margin-top:2px">${esc(doc.title || 'Fuel Price Sheet')}</div>
+    <table style="margin-top:16px;border-collapse:collapse;font-size:13px">
+      <tr><td style="padding:3px 14px 3px 0;color:#555">Effective</td><td style="padding:3px 0;font-weight:600">${esc(period || '—')}</td></tr>
+      <tr><td style="padding:3px 14px 3px 0;color:#555">Prices in</td><td style="padding:3px 0;font-weight:600">${esc(unitHeading(doc.unit, doc.currency))}</td></tr>
+      <tr><td style="padding:3px 14px 3px 0;color:#555">Locations</td><td style="padding:3px 0;font-weight:600">${esc(String((doc.rows || []).length))}</td></tr>
+    </table>
+    ${note ? `<div style="margin-top:16px;white-space:pre-wrap">${esc(note)}</div>` : ''}
+    <div style="margin-top:16px;color:#555;font-size:13px">The full price list is attached. Prices are subject to change.</div>
+    <div style="margin-top:18px;padding-top:12px;border-top:1px solid #eee;font-size:12px;color:#666">
+      ${esc(company?.name || '')}${company?.phone ? ` · ${esc(company.phone)}` : ''}${company?.email ? ` · ${esc(company.email)}` : ''}
+    </div>
+  </div>
+</body></html>`;
+}
+
+/**
+ * Email a published sheet to its customer.
+ *
+ * The document is re-rendered from the stored snapshot through the SAME renderer the
+ * View button uses, so what lands in the customer's inbox is byte-for-byte what was
+ * on screen. Building a second "email version" is how two documents claiming the same
+ * prices start to disagree.
+ */
+exports.sendFuelOutput = catchAsync(async (req, res) => {
+  if (!hasFuelPricingAccess(req.user)) return deny(res);
+  const tenantId = needTenant(req, res); if (!tenantId) return undefined;
+  if (!validId(req.params.id)) return res.status(400).json({ status: false, message: 'Invalid id.' });
+
+  // A server with no mailbox configured must say so, not throw a 500 the sender reads
+  // as "the app is broken".
+  if (!process.env.EMAIL_USERNAME || !process.env.EMAIL_PASSWORD || !process.env.EMAIL_FROM) {
+    return res.status(400).json({
+      status: false, code: 'email_not_configured',
+      message: 'This server has no outgoing mailbox configured, so the sheet cannot be emailed from here. Download it and send it yourself, or ask for EMAIL_USERNAME / EMAIL_PASSWORD / EMAIL_FROM to be set.',
+    });
+  }
+
+  const doc = await FuelSheetOutput.findOne({ _id: req.params.id, tenantId, ...notDeleted }).lean();
+  if (!doc) return res.status(404).json({ status: false, message: 'Published sheet not found.' });
+
+  const { good, bad } = parseRecipients(req.body?.to);
+  if (bad.length) {
+    return res.status(400).json({ status: false, code: 'invalid_recipient', message: `Not an email address: ${bad.slice(0, 3).join(', ')}`, invalid: bad });
+  }
+  if (!good.length) return res.status(400).json({ status: false, code: 'no_recipients', message: 'Add at least one email address.' });
+  if (good.length > MAX_RECIPIENTS) {
+    return res.status(400).json({ status: false, code: 'too_many_recipients', message: `Send to at most ${MAX_RECIPIENTS} addresses at a time.` });
+  }
+
+  const hourAgo = Date.now() - 60 * 60 * 1000;
+  const sentLastHour = (doc.sentTo || []).filter((r) => new Date(r.sentAt).getTime() > hourAgo).length;
+  if (sentLastHour + good.length > MAX_SENDS_PER_HOUR) {
+    return res.status(429).json({
+      status: false, code: 'send_rate_limited',
+      message: `This sheet has already gone to ${sentLastHour} addresses in the last hour. Wait a while before sending it again.`,
+    });
+  }
+
+  // A superseded sheet is one a NEWER version has replaced for this same customer.
+  // Sending it is nearly always a mistake, but "nearly" is why this warns instead of
+  // blocking — the same shape as the duplicate-reference rules elsewhere in this app.
+  if (doc.status === 'superseded' && !req.body?.confirm_superseded) {
+    const newer = await FuelSheetOutput.findOne({ _id: doc.supersededBy, tenantId }).select('_id title version publishedAt').lean();
+    return res.status(409).json({
+      status: false, code: 'superseded_sheet',
+      message: `This sheet was replaced by a newer version${newer ? ` (v${newer.version})` : ''}. Send it anyway only if you mean to.`,
+      newer: newer || null,
+    });
+  }
+
+  const company = doc.company
+    ? await Company.findOne({ _id: doc.company, tenantId }).lean()
+    : await Company.findOne({ tenantId }).lean();
+  const logo = await resolveCompanyLogoBase64(company).catch(() => '');
+
+  let pdf;
+  try {
+    pdf = await renderSheetPdf(outputForRender(doc), { logo, company: doc.brandingSnapshot || company, preview: false });
+  } catch (e) {
+    if (e.code === 'chrome_missing') return res.status(500).json({ status: false, code: e.code, message: e.message });
+    throw e;
+  }
+
+  const base = `${(doc.title || 'fuel-prices').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${doc.effectiveDate || ''}`;
+  const attachments = [{ filename: `${base}.pdf`, content: pdf, contentType: 'application/pdf' }];
+  if (req.body?.includeCsv) {
+    attachments.push({ filename: `${base}.csv`, content: Buffer.from(buildOutputCsv(doc), 'utf8'), contentType: 'text/csv' });
+  }
+
+  const subject = String(req.body?.subject || '').trim()
+    || `${company?.name ? `${company.name} — ` : ''}${doc.title || 'Fuel Price Sheet'}${doc.effectiveDate ? ` (${doc.effectiveDate})` : ''}`;
+  const note = String(req.body?.note || '').slice(0, 2000);
+
+  const sendEmail = require('../utils/Email');
+  const message = buildSendHtml({ doc, company, note });
+  const replyTo = replyToFor(req, company);
+
+  // One email PER recipient. A shared To: line shows every recipient everyone else's
+  // address, and one wrong address typed in would hand a customer's prices and contact
+  // list to another customer. Per-recipient also makes the record honest: an address
+  // is marked sent only when the mail server ACCEPTED it, never because it was in the
+  // list we handed over.
+  const accepted = [];
+  const failed = [];
+  for (const addr of good) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const result = await sendEmail({ email: [addr], subject, message, attachments, replyTo });
+      const ok = Array.isArray(result?.accepted)
+        ? result.accepted.some((a) => String(a?.address || a).toLowerCase() === addr.toLowerCase())
+        : true;
+      if (ok) accepted.push({ email: addr, messageId: result?.messageId });
+      else failed.push({ email: addr, reason: (result?.response || 'refused by the mail server') });
+    } catch (e) {
+      failed.push({ email: addr, reason: e.message });
+    }
+  }
+
+  if (!accepted.length) {
+    // The mail server's own words are far more useful than "could not send".
+    return res.status(502).json({
+      status: false, code: 'email_send_failed',
+      message: `The mail server refused it: ${failed[0]?.reason || 'unknown error'}. Nothing was sent — the sheet is unchanged and can be downloaded instead.`,
+      failed,
+    });
+  }
+
+  const sentAt = new Date();
+  const rows = accepted.map((a) => ({
+    email: a.email, sentAt, sentBy: req.user?._id,
+    messageId: a.messageId || undefined,
+    withCsv: !!req.body?.includeCsv,
+  }));
+
+  // The mail has LEFT by now. A failure to record it must not be reported as a failed
+  // send — the sender would send again — so it is reported as what it is.
+  let recordWarning = null;
+  try {
+    await FuelSheetOutput.updateOne({ _id: doc._id, tenantId }, { $push: { sentTo: { $each: rows } } });
+  } catch (e) {
+    console.error('[fuel] sheet emailed but sentTo not recorded', doc._id, e);
+    recordWarning = 'The email went out, but the app could not record it on this sheet. Do not send it again.';
+  }
+
+  const sentList = accepted.map((a) => a.email);
+  await logChange(req, {
+    model: 'FuelSheetOutput', module: 'fuel_pricing', action: 'SEND',
+    resourceId: doc._id, resourceName: `${doc.title} v${doc.version}`,
+    description: `Emailed ${doc.vendorLabel} price sheet v${doc.version} to ${sentList.join(', ')}`,
+    details: {
+      to: sentList, failed: failed.map((f) => f.email), subject,
+      withCsv: !!req.body?.includeCsv, superseded: doc.status === 'superseded',
+    },
+    logUnchanged: true,
+  }).catch(() => {});
+
+  const parts = [`Sent to ${sentList.length} address${sentList.length === 1 ? '' : 'es'}.`];
+  if (failed.length) parts.push(`Not delivered to: ${failed.map((f) => f.email).join(', ')}.`);
+  if (recordWarning) parts.push(recordWarning);
+  return res.json({
+    status: true,
+    message: parts.join(' '),
+    sentTo: sentList,
+    failed,
+    partial: failed.length > 0,
+    recordWarning,
+    sentAt,
+  });
+});
+
+/** The addresses a sheet would go to by default, so the form opens filled in. */
+exports.fuelOutputRecipients = catchAsync(async (req, res) => {
+  if (!hasFuelPricingAccess(req.user)) return deny(res);
+  const tenantId = needTenant(req, res); if (!tenantId) return undefined;
+  if (!validId(req.params.id)) return res.status(400).json({ status: false, message: 'Invalid id.' });
+
+  const doc = await FuelSheetOutput.findOne({ _id: req.params.id, tenantId, ...notDeleted })
+    .select('customer title version effectiveDate sentTo status brandingSnapshot').lean();
+  if (!doc) return res.status(404).json({ status: false, message: 'Published sheet not found.' });
+
+  const customer = doc.customer ? await Customer.findOne({ _id: doc.customer, tenantId }).lean() : null;
+  return res.json({
+    status: true,
+    customerName: customer ? (customer.company_name || customer.name || '') : '',
+    suggested: customerEmails(customer),
+    alreadySent: doc.sentTo || [],
+    canEmail: !!(process.env.EMAIL_USERNAME && process.env.EMAIL_PASSWORD && process.env.EMAIL_FROM),
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CSV — the back office wants the numbers, not a document
 // ---------------------------------------------------------------------------
 const csvCell = (v) => {
@@ -1173,14 +1480,12 @@ const csvCell = (v) => {
   return /[",\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 };
 
-exports.fuelOutputCsv = catchAsync(async (req, res) => {
-  if (!hasFuelPricingAccess(req.user)) return deny(res);
-  const tenantId = needTenant(req, res); if (!tenantId) return undefined;
-  if (!validId(req.params.id)) return res.status(400).json({ status: false, message: 'Invalid id.' });
-
-  const doc = await FuelSheetOutput.findOne({ _id: req.params.id, tenantId, ...notDeleted }).lean();
-  if (!doc) return res.status(404).json({ status: false, message: 'Published sheet not found.' });
-
+/**
+ * The CSV for a published sheet. ONE definition, so the file a customer receives by
+ * email and the file the back office downloads cannot drift into disagreeing — the
+ * same reason `renderSheetPdf` serves both the preview and the published document.
+ */
+function buildOutputCsv(doc) {
   const { fmtMoney } = require('../utils/fuelParsers/shared');
   const textCols = (doc.columns || []).filter((c) => c.kind === 'text');
   const taxCols = (doc.taxColumns || []).map((k) => (doc.columns || []).find((c) => c.key === k)).filter(Boolean);
@@ -1202,6 +1507,18 @@ exports.fuelOutputCsv = catchAsync(async (req, res) => {
       ...(doc.totalColumn ? [fmtMoney(r.totalInt, doc.dp)] : []),
     ].map(csvCell).join(','));
   });
+  return `﻿${lines.join('\n')}`;
+}
+
+
+exports.fuelOutputCsv = catchAsync(async (req, res) => {
+  if (!hasFuelPricingAccess(req.user)) return deny(res);
+  const tenantId = needTenant(req, res); if (!tenantId) return undefined;
+  if (!validId(req.params.id)) return res.status(400).json({ status: false, message: 'Invalid id.' });
+
+  const doc = await FuelSheetOutput.findOne({ _id: req.params.id, tenantId, ...notDeleted }).lean();
+  if (!doc) return res.status(404).json({ status: false, message: 'Published sheet not found.' });
+
 
   await logChange(req, {
     model: 'FuelSheetOutput', module: 'fuel_pricing', action: 'EXPORT',
@@ -1212,5 +1529,5 @@ exports.fuelOutputCsv = catchAsync(async (req, res) => {
   const name = `${(doc.title || 'fuel-prices').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${doc.effectiveDate || ''}-v${doc.version}.csv`;
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
-  return res.end(`﻿${lines.join('\n')}`);
+  return res.end(buildOutputCsv(doc));
 });

@@ -185,11 +185,28 @@ function checkSheet(name, items, spec) {
 
   // The largest "worst case" (all sevens — the longest words) that still prints.
   let largest = null;
-  for (const amount of [777.77, 7777.77, 77777.77, 777777.77, 7777777.77, 77777777.77]) {
+  for (const amount of [777.77, 7777.77, 77777.77, 777777.77, 1777777.77, 7777777.77, 77777777.77]) {
     try { await render([entry({ ...BASE, amount }, spec35)]); largest = amount; } catch (e) { break; }
   }
   ok('every cheque up to 777,777.77 (the longest six-figure words) prints', largest >= 777777.77, String(largest));
-  console.log(`  longest worst-case amount that fits on one words line: ${largest?.toLocaleString('en-US', { minimumFractionDigits: 2 })}`);
+  console.log(`  largest sampled long-words amount that prints: ${largest?.toLocaleString('en-US', { minimumFractionDigits: 2 })}`);
+
+  // ---- the save-time warning threshold is pinned to the measured line ---
+  {
+    const { WORDS_SAFE_WIDTH, wordsWidthUnits, fmtAmountWordsCPA } = require('../utils/chequeHtml');
+    // Wide-glyph amounts too: fewer characters, more ink (M, W, "Twenty Two").
+    const samples = [999999.99, 373373.73, 777777.77, 1111111.11, 1373373.73, 1777777.77, 3777777.77, 7777777.77, 77777777.77,
+      1222222.22, 2222222.22, 1323323.23, 1878878.78, 1383383.83, 1373777.77];
+    for (const amount of samples) {
+      const len = wordsWidthUnits(fmtAmountWordsCPA(amountToWords(amount)));
+      let fits = true;
+      try { await render([entry({ ...BASE, amount }, spec35)]); } catch (e) { fits = false; }
+      // Anything the save allows without asking must actually print.
+      if (len <= WORDS_SAFE_WIDTH) ok(`${amount} (${len} units, under the warning line) prints`, fits);
+      // Anything that will not print must have been warned about at save.
+      if (!fits) ok(`${amount} (${len} units) does not print, so the save warned`, len > WORDS_SAFE_WIDTH);
+    }
+  }
 
   // ---- a batch: one sheet per cheque, in number order -------------------
   const nos = ['0890', '0887', '0889', '0888'];

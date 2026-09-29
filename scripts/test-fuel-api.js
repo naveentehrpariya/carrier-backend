@@ -50,6 +50,26 @@ require.cache[uploadPath] = {
   exports: async (f) => ({ message: 'ok', mime: f.mimetype, filename: `stub-${f.originalname}`, url: `https://cdn.test/${f.originalname}`, file: f, size: f.size }),
 };
 
+// The real mailer talks to Hostinger. Stub it so the send path is testable offline,
+// and record what would have gone out.
+const mailPath = require.resolve('../utils/Email');
+global.__sentMail = [];
+require.cache[mailPath] = {
+  id: mailPath, filename: mailPath, loaded: true,
+  exports: async (opts) => {
+    if (global.__mailShouldFail) throw new Error('550 mailbox unavailable');
+    global.__sentMail.push(opts);
+    const to = [].concat(opts.email);
+    const rejected = to.filter((a) => (global.__mailReject || []).includes(a));
+    return {
+      messageId: `stub-${global.__sentMail.length}`,
+      accepted: to.filter((a) => !rejected.includes(a)),
+      rejected,
+      response: rejected.length ? '550 5.1.1 recipient unknown' : '250 OK',
+    };
+  },
+};
+
 const FuelPriceSheet = require('../db/FuelPriceSheet');
 const FuelMarginProfile = require('../db/FuelMarginProfile');
 const FuelSheetOutput = require('../db/FuelSheetOutput');
@@ -870,6 +890,270 @@ const upload = (fixture, body = {}) => run(fuel.uploadFuelSheet, mkReq({ files: 
   await t('a driver cannot download the CSV', async () => {
     const res = await run(fuel.fuelOutputCsv, mkReq({ user: driverOnly, params: { id: String(output._id) } }));
     assert.strictEqual(res.statusCode, 403);
+  });
+
+  // ---------------------------------------------------------------- sending it out
+  section('sending the sheet');
+  const MAIL_ENV = { EMAIL_USERNAME: 'u', EMAIL_PASSWORD: 'p', EMAIL_FROM: 'ops@crossmiles.com' };
+  const withMail = (fn) => async () => {
+    Object.assign(process.env, MAIL_ENV);
+    try { await fn(); } finally {
+      delete process.env.EMAIL_USERNAME; delete process.env.EMAIL_PASSWORD; delete process.env.EMAIL_FROM;
+      global.__mailShouldFail = false;
+    }
+  };
+
+  await t('a server with no mailbox says so instead of throwing', async () => {
+    delete process.env.EMAIL_USERNAME;
+    const res = await run(fuel.sendFuelOutput, mkReq({ params: { id: String(output._id) }, body: { to: ['a@b.com'] } }));
+    assert.strictEqual(res.statusCode, 400);
+    assert.strictEqual(res.body.code, 'email_not_configured');
+  });
+  await t('the form is pre-filled from the customer', withMail(async () => {
+    const res = await run(fuel.fuelOutputRecipients, mkReq({ params: { id: String(output._id) } }));
+    assert.strictEqual(res.statusCode, 200);
+    assert.strictEqual(res.body.customerName, 'Northbound Freight');
+    assert.deepStrictEqual(res.body.suggested, ['ops@northbound.test']);
+    assert.strictEqual(res.body.canEmail, true);
+  }));
+  await t('a malformed address is refused, not dropped', withMail(async () => {
+    const res = await run(fuel.sendFuelOutput, mkReq({
+      params: { id: String(output._id) }, body: { to: ['ops@northbound.test', 'not-an-email'] },
+    }));
+    assert.strictEqual(res.statusCode, 400);
+    assert.strictEqual(res.body.code, 'invalid_recipient');
+    assert.strictEqual(global.__sentMail.length, 0, 'it sent something anyway');
+  }));
+  await t('no recipients is refused', withMail(async () => {
+    const res = await run(fuel.sendFuelOutput, mkReq({ params: { id: String(output._id) }, body: { to: [] } }));
+    assert.strictEqual(res.body.code, 'no_recipients');
+  }));
+  await t('too many recipients is refused', withMail(async () => {
+    const many = Array.from({ length: 21 }, (_, i) => `a${i}@b.com`);
+    const res = await run(fuel.sendFuelOutput, mkReq({ params: { id: String(output._id) }, body: { to: many } }));
+    assert.strictEqual(res.body.code, 'too_many_recipients');
+  }));
+  await t('the sheet is emailed with the PDF attached', withMail(async () => {
+    global.__sentMail.length = 0;
+    const res = await run(fuel.sendFuelOutput, mkReq({
+      params: { id: String(output._id) },
+      body: { to: 'ops@northbound.test, books@northbound.test', note: 'Prices for next week.' },
+    }), 60000);
+    assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+    // one email PER recipient — nobody sees anyone else's address
+    assert.strictEqual(global.__sentMail.length, 2);
+    global.__sentMail.forEach((m) => assert.strictEqual([].concat(m.email).length, 1, 'a mail carried two recipients'));
+    assert.deepStrictEqual(global.__sentMail.map((m) => [].concat(m.email)[0]).sort(), ['books@northbound.test', 'ops@northbound.test']);
+    const mail = global.__sentMail[0];
+    assert.strictEqual(mail.attachments.length, 1);
+    assert.ok(/\.pdf$/.test(mail.attachments[0].filename));
+    assert.strictEqual(Buffer.from(mail.attachments[0].content).subarray(0, 4).toString('latin1'), '%PDF');
+    // the covering note must carry the date and the unit, not just an attachment
+    assert.ok(/Effective/.test(mail.message) && /per litre/i.test(mail.message));
+    assert.ok(/Prices for next week\./.test(mail.message));
+  }));
+  await t('who it went to is recorded on the sheet', async () => {
+    const doc = await FuelSheetOutput.findById(output._id).lean();
+    assert.strictEqual(doc.sentTo.length, 2);
+    assert.deepStrictEqual(doc.sentTo.map((x) => x.email).sort(), ['books@northbound.test', 'ops@northbound.test']);
+    assert.ok(doc.sentTo[0].sentAt && doc.sentTo[0].messageId);
+  });
+  await t('the send is audited with its recipients', () => {
+    const entry = global.__audit.filter((a) => a.action === 'SEND').pop();
+    assert.ok(entry, 'no SEND audit entry');
+    assert.strictEqual(entry.details.to.length, 2);
+  });
+  await t('the same address twice is one email', withMail(async () => {
+    global.__sentMail.length = 0;
+    const res = await run(fuel.sendFuelOutput, mkReq({
+      params: { id: String(output._id) }, body: { to: ['Ops@Northbound.test', 'ops@northbound.test'] },
+    }), 60000);
+    assert.strictEqual(res.body.sentTo.length, 1);
+  }));
+  await t('the CSV rides along when asked, and is the same CSV as the download', withMail(async () => {
+    global.__sentMail.length = 0;
+    await run(fuel.sendFuelOutput, mkReq({
+      params: { id: String(output._id) }, body: { to: ['ops@northbound.test'], includeCsv: true },
+    }), 60000);
+    const mail = global.__sentMail[0];
+    assert.strictEqual(mail.attachments.length, 2);
+    const csv = Buffer.from(mail.attachments[1].content).toString('utf8');
+    const dl = await run(fuel.fuelOutputCsv, mkReq({ params: { id: String(output._id) } }));
+    assert.strictEqual(csv, String(dl.raw), 'the emailed CSV is not the downloaded CSV');
+  }));
+  await t('a refusal from the mail server is reported, and nothing is recorded as sent', withMail(async () => {
+    const before = (await FuelSheetOutput.findById(output._id).lean()).sentTo.length;
+    global.__mailShouldFail = true;
+    const res = await run(fuel.sendFuelOutput, mkReq({
+      params: { id: String(output._id) }, body: { to: ['ops@northbound.test'] },
+    }), 60000);
+    assert.strictEqual(res.statusCode, 502);
+    assert.strictEqual(res.body.code, 'email_send_failed');
+    assert.ok(/mailbox unavailable/.test(res.body.message), 'it hid the mail server\'s own words');
+    const after = (await FuelSheetOutput.findById(output._id).lean()).sentTo.length;
+    assert.strictEqual(after, before, 'it recorded a send that never happened');
+  }));
+  await t('an address the server refuses is NOT recorded as sent', withMail(async () => {
+    const before = (await FuelSheetOutput.findById(output._id).lean()).sentTo.length;
+    global.__mailReject = ['ghost@northbound.test'];
+    try {
+      const res = await run(fuel.sendFuelOutput, mkReq({
+        params: { id: String(output._id) }, body: { to: ['ops@northbound.test', 'ghost@northbound.test'] },
+      }), 60000);
+      assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+      assert.strictEqual(res.body.partial, true);
+      assert.deepStrictEqual(res.body.sentTo, ['ops@northbound.test']);
+      assert.deepStrictEqual(res.body.failed.map((f) => f.email), ['ghost@northbound.test']);
+      assert.ok(/ghost@northbound\.test/.test(res.body.message), 'the refused address was not named');
+      const doc = await FuelSheetOutput.findById(output._id).lean();
+      assert.strictEqual(doc.sentTo.length, before + 1);
+      assert.ok(!doc.sentTo.some((x) => x.email === 'ghost@northbound.test'), 'it recorded a refused address as sent');
+    } finally { global.__mailReject = []; }
+  }));
+  await t('an address with bracket syntax is refused', withMail(async () => {
+    const res = await run(fuel.sendFuelOutput, mkReq({
+      params: { id: String(output._id) }, body: { to: ['"x" <evil@else.test>'] },
+    }));
+    assert.strictEqual(res.statusCode, 400);
+  }));
+  await t('a mail that left but could not be recorded is not reported as a failed send', withMail(async () => {
+    const orig = FuelSheetOutput.updateOne;
+    FuelSheetOutput.updateOne = async () => { throw new Error('db down'); };
+    try {
+      const res = await run(fuel.sendFuelOutput, mkReq({
+        params: { id: String(output._id) }, body: { to: ['ops@northbound.test'] },
+      }), 60000);
+      assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+      assert.ok(res.body.recordWarning && /Do not send it again/.test(res.body.message));
+    } finally { FuelSheetOutput.updateOne = orig; }
+  }));
+  await t('one sheet cannot be sent to more than the hourly cap', withMail(async () => {
+    const fake = Array.from({ length: 60 }, (_, i) => ({ email: `bulk${i}@b.test`, sentAt: new Date() }));
+    await FuelSheetOutput.updateOne({ _id: output._id }, { $push: { sentTo: { $each: fake } } });
+    try {
+      global.__sentMail.length = 0;
+      const res = await run(fuel.sendFuelOutput, mkReq({ params: { id: String(output._id) }, body: { to: ['ops@northbound.test'] } }));
+      assert.strictEqual(res.statusCode, 429);
+      assert.strictEqual(res.body.code, 'send_rate_limited');
+      assert.strictEqual(global.__sentMail.length, 0);
+    } finally {
+      await FuelSheetOutput.updateOne({ _id: output._id }, { $pull: { sentTo: { email: { $regex: '^bulk' } } } });
+    }
+  }));
+  await t('a replaced sheet warns before it is sent, and sends on confirmation', withMail(async () => {
+    const sup = await run(fuel.listFuelOutputs, mkReq({ query: { status: 'superseded' } }));
+    const old = sup.body.outputs[0];
+    const warn = await run(fuel.sendFuelOutput, mkReq({ params: { id: String(old._id) }, body: { to: ['ops@northbound.test'] } }));
+    assert.strictEqual(warn.statusCode, 409);
+    assert.strictEqual(warn.body.code, 'superseded_sheet');
+    global.__sentMail.length = 0;
+    const go = await run(fuel.sendFuelOutput, mkReq({
+      params: { id: String(old._id) }, body: { to: ['ops@northbound.test'], confirm_superseded: true },
+    }), 60000);
+    assert.strictEqual(go.statusCode, 200);
+    assert.strictEqual(global.__sentMail.length, 1);
+  }));
+  await t('a driver cannot email a price sheet', withMail(async () => {
+    const res = await run(fuel.sendFuelOutput, mkReq({ user: driverOnly, params: { id: String(output._id) }, body: { to: ['a@b.com'] } }));
+    assert.strictEqual(res.statusCode, 403);
+  }));
+  await t('another tenant cannot email it either', withMail(async () => {
+    const res = await run(fuel.sendFuelOutput, mkReq({
+      tenantId: OTHER, user: { ...admin, tenantId: OTHER },
+      params: { id: String(output._id) }, body: { to: ['a@b.com'] },
+    }));
+    assert.strictEqual(res.statusCode, 404);
+  }));
+
+  section('remembering the margin');
+  await t("today's sheet suggests the margin this vendor's last sheet went out on", async () => {
+    // Flying J was published earlier in this suite against a saved profile
+    const fj = await upload('flying-j-cad-2026-09-09.pdf', { confirm_duplicate: 'true' });
+    const detail = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(fj.body.sheet._id) } }));
+    assert.strictEqual(detail.statusCode, 200);
+    assert.ok(detail.body.suggestedProfile, 'no margin suggested for a vendor already published');
+    assert.strictEqual(String(detail.body.suggestedProfile._id), String(profile._id));
+    assert.ok(detail.body.suggestedProfile.lastUsedAt);
+    await run(fuel.removeFuelSheet, mkReq({ params: { id: String(fj.body.sheet._id) } }));
+  });
+  await t('a vendor only ever published on typed rules suggests nothing', async () => {
+    // every TA publish in this suite used ad-hoc rules, which are not a saved margin
+    const res = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.ta._id) } }));
+    assert.strictEqual(res.body.suggestedProfile, null);
+  });
+  await t('a batch on per-customer margins suggests none of them', async () => {
+    // Petro-Canada was batch-published on two margins; neither is customer-free
+    const res = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.petro._id) } }));
+    const sugg = res.body.suggestedProfile;
+    if (sugg) {
+      const pf = await FuelMarginProfile.findById(sugg._id).lean();
+      assert.strictEqual(pf.customer, null, "it pre-selected one customer's margin");
+    }
+  });
+  await t('setup: Petro-Canada goes out once on a margin for everyone', async () => {
+    const res = await run(fuel.publishFuelSheet, mkReq({
+      params: { id: String(sheets.petro._id) },
+      body: { profile: String(profile._id), title: 'Diesel Price List' },
+    }), 60000);
+    assert.strictEqual(res.statusCode, 200, JSON.stringify(res.body));
+  });
+  await t('a margin narrowed to another unit stops being suggested', async () => {
+    // Petro-Canada was batch-published against saved margins
+    const before = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.petro._id) } }));
+    assert.ok(before.body.suggestedProfile, 'expected a suggestion to start from');
+    const id = before.body.suggestedProfile._id;
+
+    await FuelMarginProfile.updateOne({ _id: id, tenantId: TENANT }, { $set: { unit: 'per_gallon' } });
+    const after = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.petro._id) } }));
+    assert.ok(
+      !after.body.suggestedProfile || String(after.body.suggestedProfile._id) !== String(id),
+      'it suggested a margin that cannot price this sheet',
+    );
+    await FuelMarginProfile.updateOne({ _id: id, tenantId: TENANT }, { $set: { unit: 'per_litre' } });
+  });
+  await t('a deleted margin is never suggested', async () => {
+    const before = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.petro._id) } }));
+    const id = before.body.suggestedProfile?._id;
+    assert.ok(id, 'expected a suggestion to start from');
+    await FuelMarginProfile.updateOne({ _id: id, tenantId: TENANT }, { $set: { deletedAt: new Date() } });
+    const after = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.petro._id) } }));
+    assert.ok(
+      !after.body.suggestedProfile || String(after.body.suggestedProfile._id) !== String(id),
+      'it suggested a margin that no longer exists',
+    );
+    await FuelMarginProfile.updateOne({ _id: id, tenantId: TENANT }, { $unset: { deletedAt: 1 } });
+  });
+
+  await t('a margin tied to one customer is never suggested for the next sheet', async () => {
+    const before = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.petro._id) } }));
+    const id = before.body.suggestedProfile?._id;
+    assert.ok(id, 'expected a suggestion to start from');
+    const cust = await Customer.findOne({ tenantId: TENANT }).lean();
+    await FuelMarginProfile.updateOne({ _id: id, tenantId: TENANT }, { $set: { customer: cust._id } });
+    try {
+      const after = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(sheets.petro._id) } }));
+      assert.ok(
+        !after.body.suggestedProfile || String(after.body.suggestedProfile._id) !== String(id),
+        "it pre-selected one customer's margin for everyone",
+      );
+    } finally {
+      await FuelMarginProfile.updateOne({ _id: id, tenantId: TENANT }, { $set: { customer: null } });
+    }
+  });
+  await t("an unrecognised sheet never borrows another supplier's margin", async () => {
+    const g = await upload('unknown-vendor-rack.xlsx', { confirm_duplicate: 'true' });
+    const gid = g.body.sheet._id;
+    // a different unknown supplier went out on a saved margin earlier
+    const any = await FuelSheetOutput.findOne({ tenantId: TENANT, profile: { $ne: null } }).lean();
+    const planted = await FuelSheetOutput.create({ ...any, _id: undefined, vendor: 'generic', sentTo: [], publishedAt: new Date() });
+    try {
+      const res = await run(fuel.fuelSheetDetail, mkReq({ params: { id: String(gid) } }));
+      assert.strictEqual(res.statusCode, 200);
+      assert.strictEqual(res.body.suggestedProfile, null);
+    } finally {
+      await FuelSheetOutput.deleteOne({ _id: planted._id });
+      await run(fuel.removeFuelSheet, mkReq({ params: { id: String(gid) } }));
+    }
   });
 
   // ---------------------------------------------------------------- listings

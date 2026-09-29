@@ -241,7 +241,13 @@ const createDoc = catchAsync(async (req, res) => {
       base.url = uploadResponse.url;
       base.size = String(uploadResponse.size || '');
     } else {
-      return res.status(500).json({ status: false, message: 'File upload failed.' });
+      // Storage is the one part of this that is not ours. The details alone are the
+      // point of the feature, so say exactly that instead of a dead end — the client
+      // offers to save without the scan and attach it later.
+      return res.status(502).json({
+        status: false, code: 'file_upload_failed',
+        message: 'The scan could not be stored, so nothing was saved. Save the details without it and attach the scan later.',
+      });
     }
   }
 
@@ -318,7 +324,13 @@ const updateDoc = catchAsync(async (req, res) => {
       fields.url = uploadResponse.url;
       fields.size = String(uploadResponse.size || '');
     } else {
-      return res.status(500).json({ status: false, message: 'File upload failed.' });
+      // Storage is the one part of this that is not ours. The details alone are the
+      // point of the feature, so say exactly that instead of a dead end — the client
+      // offers to save without the scan and attach it later.
+      return res.status(502).json({
+        status: false, code: 'file_upload_failed',
+        message: 'The scan could not be stored, so nothing was saved. Save the details without it and attach the scan later.',
+      });
     }
   }
 

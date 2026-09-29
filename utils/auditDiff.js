@@ -132,7 +132,7 @@ const AUDIT_FIELDS = {
   // trace of what the old margin was.
   FuelPriceSheet: ['vendor', 'unit', 'currency', 'dp', 'baseColumn', 'effectiveDate', 'effectiveTo', 'sheetName', 'status', 'deletedAt'],
   FuelMarginProfile: ['name', 'vendor', 'unit', 'customer', 'rules', 'taxMode', 'roundingDp', 'showVendorCost', 'deletedAt'],
-  FuelSheetOutput: ['sheet', 'profile', 'customer', 'title', 'version', 'unit', 'currency', 'dp', 'effectiveDate', 'showVendorCost', 'status', 'supersededBy', 'deletedAt'],
+  FuelSheetOutput: ['sheet', 'profile', 'customer', 'title', 'version', 'unit', 'currency', 'dp', 'effectiveDate', 'showVendorCost', 'status', 'supersededBy', 'sentTo', 'deletedAt'],
   BankAccount: ['name', 'bankName', 'accountNo', 'currency', 'chequeStart', 'active', 'printMode', 'chequePosition', 'chequeHeightIn', 'offsetXmm', 'offsetYmm', 'printChequeNumber', 'dateFormat', 'deletedAt'],
   // An application decides which order/payslip a cheque paid — moving it moves money.
   ChequeApplication: ['cheque', 'chequeNo', 'targetType', 'targetId', 'targetLabel', 'amount', 'currency', 'deletedAt'],

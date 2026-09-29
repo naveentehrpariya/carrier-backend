@@ -777,9 +777,27 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     r = await A.post('/cheques/print-batch', { ids: [stockCheque._id], preview: true }, { responseType: 'arraybuffer' });
     ok('single-stock batch still prints', pdfSkipped || isPdf(r), r.status);
 
+    // ...and it is caught BEFORE a number is spent, not at print time.
+    {
+      const nextBefore = (await add({ bankAccount: stockAcct._id, amount: 10, note: 'probe' })).data.cheque;
+      r = await add({ bankAccount: stockAcct._id, amount: 7777777.77 });
+      ok('a stock cheque whose words cannot fit is refused at save (409)', r.status === 409 && r.data.code === 'amount_words_too_long', `${r.status} ${r.data.code}`);
+      const nextAfter = (await add({ bankAccount: stockAcct._id, amount: 11, note: 'probe' })).data.cheque;
+      ok('the refused save spent no cheque number',
+        Number(nextAfter.chequeNo) === Number(nextBefore.chequeNo) + 1, `${nextBefore.chequeNo} -> ${nextAfter.chequeNo}`);
+      r = await add({ bankAccount: stockAcct._id, amount: 7777777.77, confirm_long_amount: true });
+      ok('confirming (to write it by hand) saves it', r.status === 200 && r.data.cheque, r.status);
+      r = await add({ amount: 7777777.77 });
+      ok('a long amount on plain paper is not questioned', r.status === 200, r.status);
+      r = await A.post(`/cheques/update/${nextAfter._id}`, { amount: 7777777.77 });
+      ok('editing a stock cheque to a too-long amount is refused too', r.status === 409 && r.data.code === 'amount_words_too_long', `${r.status} ${r.data.code}`);
+      r = await A.post(`/cheques/update/${nextAfter._id}`, { amount: 12.5 });
+      ok('editing it to a normal amount still works', r.status === 200, r.status);
+    }
+
     // A legal amount too long for the words line is refused, never clipped.
     if (!pdfSkipped) {
-      const huge = (await add({ bankAccount: stockAcct._id, amount: 777777777.77 })).data.cheque;
+      const huge = (await add({ bankAccount: stockAcct._id, amount: 777777777.77, confirm_long_amount: true })).data.cheque;
       r = await A.get(`/cheques/${huge._id}/pdf`, { responseType: 'arraybuffer' });
       const body = (() => { try { return JSON.parse(Buffer.from(r.data).toString()); } catch (e) { return {}; } })();
       ok('printing a cheque whose amount in words cannot fit is refused (422)', r.status === 422 && body.code === 'field_too_long', `${r.status} ${body.code}`);

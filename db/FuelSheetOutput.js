@@ -62,6 +62,17 @@ const schema = new mongoose.Schema({
         size: { type: Number },
     },
 
+    // Who this sheet was actually sent to, and when. A published sheet is a record of
+    // what was produced; this is the record of it LEAVING the building, which is the
+    // part a customer will later ask about ("you never sent me Tuesday's prices").
+    sentTo: [{
+        email: { type: String, required: true },
+        sentAt: { type: Date, default: Date.now },
+        sentBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
+        messageId: { type: String },
+        withCsv: { type: Boolean, default: false },
+    }],
+
     status: { type: String, enum: ['published', 'superseded'], default: 'published' },
     supersededBy: { type: mongoose.Schema.Types.ObjectId, ref: 'fuel_sheet_outputs', default: null },
 

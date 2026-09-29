@@ -48,7 +48,9 @@ require.cache[loggerPath] = {
 const uploadPath = require.resolve('../utils/fileupload');
 require.cache[uploadPath] = {
   id: uploadPath, filename: uploadPath, loaded: true,
-  exports: async (f) => ({
+  // The controller binds this at require time, so a later cache swap would not be seen.
+  // One stub, delegating to a switch the storage-failure test can flip.
+  exports: async (f) => (global.__storageDown ? null : {
     message: 'ok', mime: f.mimetype, filename: `stub-${f.originalname}`,
     url: `https://cdn.test/${f.originalname}`, file: f, size: f.size,
   }),
@@ -261,6 +263,35 @@ const numbersIn = (res) => (res.body?.items || []).map((i) => i.docNumber);
     }));
     assert.strictEqual(r.statusCode, 201, JSON.stringify(r.body));
     assert.strictEqual(r.body.document.type, 'owner_operator');
+  });
+
+  section('when the file store is down');
+  await t('a failed scan upload saves NOTHING and says so actionably', async () => {
+    // The details alone are what start the expiry alerts, so the client offers to keep
+    // them and attach the scan later — that offer needs a machine-readable code.
+    global.__storageDown = true;
+    try {
+      const req = mkReq({
+        params: { kind: 'truck', entityId: String(truck._id) },
+        body: { docType: 'insurance', docNumber: 'INS-CDN-DOWN', expiryDate: days(9).toISOString() },
+      });
+      req.files = attachment();
+      const r = await run(doc.createDoc, req);
+      assert.strictEqual(r.statusCode, 502, JSON.stringify(r.body));
+      assert.strictEqual(r.body.code, 'file_upload_failed');
+      const stored = await FleetDoc.findOne({ docNumber: 'INS-CDN-DOWN' }).lean();
+      assert.strictEqual(stored, null, 'a half-record was written');
+    } finally {
+      global.__storageDown = false;
+    }
+  });
+  await t('the same details save fine without the scan', async () => {
+    const r = await run(doc.createDoc, mkReq({
+      params: { kind: 'truck', entityId: String(truck._id) },
+      body: { docType: 'insurance', docNumber: 'INS-CDN-DOWN', expiryDate: days(9).toISOString() },
+    }));
+    assert.strictEqual(r.statusCode, 201, JSON.stringify(r.body));
+    assert.ok(!r.body.document.url);
   });
 
   section('employee documents — HR or self');

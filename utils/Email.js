@@ -9,8 +9,11 @@ const sendEmail = async (options) => {
            user: process.env.EMAIL_USERNAME, // Your Hostinger email username
            pass: process.env.EMAIL_PASSWORD, // Your Hostinger email password
          },
+         // Verify the server's certificate: this connection carries the mailbox
+         // password. EMAIL_TLS_INSECURE=true restores the old behaviour for a server
+         // whose certificate cannot be verified — never the default.
          tls: {
-           rejectUnauthorized: false,
+           rejectUnauthorized: process.env.EMAIL_TLS_INSECURE !== 'true',
          },
        });
       const mailOptions = { 
@@ -19,6 +22,12 @@ const sendEmail = async (options) => {
          subject: options.subject,
          html: options.message,
       };
+      // Optional, and additive: every existing caller omits these, and nodemailer
+      // ignores an undefined key. Attachments are what let a document (a priced fuel
+      // sheet, say) be sent instead of described.
+      if (options.attachments) mailOptions.attachments = options.attachments;
+      if (options.replyTo) mailOptions.replyTo = options.replyTo;
+      if (options.cc) mailOptions.cc = options.cc;
 
       
 

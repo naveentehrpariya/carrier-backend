@@ -41,5 +41,7 @@ router.route('/fuel/outputs').get(validateToken, resolveTenant, fuel.listFuelOut
 router.route('/fuel/outputs/:id').get(validateToken, resolveTenant, fuel.fuelOutputDetail);
 router.route('/fuel/outputs/:id/pdf').get(validateToken, resolveTenant, fuel.fuelOutputPdf);
 router.route('/fuel/outputs/:id/csv').get(validateToken, resolveTenant, fuel.fuelOutputCsv);
+router.route('/fuel/outputs/:id/recipients').get(validateToken, resolveTenant, fuel.fuelOutputRecipients);
+router.route('/fuel/outputs/:id/send').post(validateToken, resolveTenant, fuel.sendFuelOutput);
 
 module.exports = router;
