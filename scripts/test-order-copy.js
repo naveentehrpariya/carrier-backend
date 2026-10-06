@@ -172,6 +172,33 @@ const stops = (extra = []) => [{
       assert.ok(sent[1].message.includes(`Copied from CMC-${SRC.serial_no}`));
     });
 
+    // Documents, legs/splits and internal notes stay with the source.
+    const Files = require('../db/Files');
+    await Files.create([
+      { tenantId: TENANT, order: SRC._id, name: 'POD.pdf', url: 'https://x.test/pod.pdf' },
+      { tenantId: TENANT, order: SRC._id, name: 'BOL.pdf', url: 'https://x.test/bol.pdf' },
+    ]);
+    await Trip.create([
+      { tenantId: TENANT, order: SRC._id, trip_no: 2, start_stop_index: 0, end_stop_index: 1, carrier: CARRIER._id, carrier_amount: 900, carrier_payment_status: 'paid' },
+      { tenantId: TENANT, order: SRC._id, trip_no: 3, start_stop_index: 0, end_stop_index: 1, truck: TRUCK._id },
+    ]);
+    await Order.updateOne({ _id: SRC._id }, { $set: { notes: 'Customer paid by cheque', carrier_payment_notes: 'Paid early', customer_payment_notes: 'x' } });
+    const rDocs = await copy(SRC._id);
+    await t('documents, trips and notes are NOT copied; the source keeps all of its own', async () => {
+      assert.strictEqual(rDocs.body.status, true, JSON.stringify(rDocs.body));
+      const id = rDocs.body.order._id;
+      assert.strictEqual(await Files.countDocuments({ order: id }), 0, 'copy has no documents');
+      const legs = await Trip.find({ order: id }).lean();
+      assert.strictEqual(legs.length, 1, 'copy has one fresh leg');
+      assert.strictEqual(legs[0].trip_no, 1);
+      assert.ok(legs[0].carrier_amount == null, 'no frozen leg amount');
+      assert.notStrictEqual(legs[0].carrier_payment_status, 'paid');
+      const c = await Order.findById(id).lean();
+      assert.ok(!c.notes && !c.carrier_payment_notes && !c.customer_payment_notes, 'internal notes not copied');
+      assert.strictEqual(await Files.countDocuments({ order: SRC._id }), 2, 'source documents untouched');
+      assert.strictEqual(await Trip.countDocuments({ order: SRC._id }), 3, 'source legs untouched');
+    });
+
     // Payment state is never copied.
     await Order.updateOne({ _id: SRC._id }, { $set: { customer_payment_status: 'paid', carrier_payment_status: 'paid', lock: true } });
     const r2 = await copy(SRC._id);
