@@ -9,7 +9,17 @@
  * stores the version it was signed under, and its PDF is stored as rendered, so
  * an edit here never rewrites a contract somebody already signed.
  */
-const TEMPLATE_VERSION = 'broker-carrier-agreement-v1';
+const TEMPLATE_VERSION = 'broker-carrier-agreement-v2';
+
+// The broker party of the agreement, as printed in the packet. One company, one
+// admin — the client asked for this to be fixed rather than configurable, and the
+// agreement carries no broker signature line.
+const BROKER_PARTY = {
+  name: 'Cross Miles Carrier Inc',
+  mc: '1365834',
+  dot: '3797909',
+  phone: '437-383-3310',
+};
 
 function agreementClauses(broker) {
   const B = broker.name || 'the Broker';
@@ -117,4 +127,4 @@ function agreementClauses(broker) {
   ];
 }
 
-module.exports = { TEMPLATE_VERSION, agreementClauses };
+module.exports = { TEMPLATE_VERSION, BROKER_PARTY, agreementClauses };

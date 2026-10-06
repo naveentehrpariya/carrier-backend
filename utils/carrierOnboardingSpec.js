@@ -141,15 +141,16 @@ const SECTIONS = [
   },
 ];
 
-// Documents the carrier attaches. `requiredIf` uses the same condition shape.
+// Documents the carrier attaches. All optional (client decision 2026-10-07): a
+// missing scan is chased after review, it does not stop the packet being signed.
 const DOCUMENTS = [
-  { kind: 'coi', label: 'Certificate of insurance (cargo & liability)', required: true, docType: 'coi' },
-  { kind: 'w9', label: 'W-9 form', requiredIf: { field: 'country', in: ['USA'] }, docType: 'w9', hint: 'Required for US carriers.' },
-  { kind: 'authority', label: 'U.S. motor carrier authority (MC letter)', requiredIf: { field: 'usAuthority', in: ['yes'] }, showIf: { field: 'usAuthority', in: ['yes'] }, docType: 'authority' },
+  { kind: 'coi', label: 'Certificate of insurance (cargo & liability)', docType: 'coi' },
+  { kind: 'w9', label: 'W-9 form', docType: 'w9', hint: 'US carriers.' },
+  { kind: 'authority', label: 'U.S. motor carrier authority (MC letter)', showIf: { field: 'usAuthority', in: ['yes'] }, docType: 'authority' },
   { kind: 'workers_comp', label: "Workers' compensation certificate", showIf: { field: 'workersComp', in: ['yes'] }, docType: 'insurance' },
-  { kind: 'hazmat', label: 'Hazmat registration', requiredIf: { field: 'hazmat', in: ['yes'] }, showIf: { field: 'hazmat', in: ['yes'] }, docType: 'permit' },
-  { kind: 'noa', label: 'Notice of assignment / factoring letter', requiredIf: { field: 'usesFactoring', in: ['yes'] }, showIf: { field: 'usesFactoring', in: ['yes'] }, docType: 'noa' },
-  { kind: 'void_cheque', label: 'Voided cheque / bank letter', requiredIf: { field: 'paymentMethod', in: BANK_METHODS }, showIf: { field: 'paymentMethod', in: BANK_METHODS }, docType: 'other' },
+  { kind: 'hazmat', label: 'Hazmat registration', showIf: { field: 'hazmat', in: ['yes'] }, docType: 'permit' },
+  { kind: 'noa', label: 'Notice of assignment / factoring letter', showIf: { field: 'usesFactoring', in: ['yes'] }, docType: 'noa' },
+  { kind: 'void_cheque', label: 'Voided cheque / bank letter', showIf: { field: 'paymentMethod', in: BANK_METHODS }, docType: 'other' },
   { kind: 'other', label: 'Anything else', docType: 'other', multiple: true },
 ];
 

@@ -28,7 +28,7 @@ const { resolveCompanyLogoBase64 } = require('../utils/pdfBranding');
 const { hasCarrierAccess } = require('../utils/entityVisibility');
 const spec = require('../utils/carrierOnboardingSpec');
 const { buildCarrierPacketHtml, safeImg } = require('../utils/carrierPacketHtml');
-const { TEMPLATE_VERSION } = require('../utils/carrierAgreementText');
+const { TEMPLATE_VERSION, BROKER_PARTY } = require('../utils/carrierAgreementText');
 
 const TOKEN_RE = /^[A-Za-z0-9_-]{24,80}$/;
 const OPEN_STATUSES = ['sent', 'opened', 'in_progress'];
@@ -43,8 +43,6 @@ const permsOf = (u) => (Array.isArray(u?.permissions) ? u.permissions : []);
 const isFullAdmin = (u) => !!u && (u.is_admin === 1 || Number(u.role) === 3 || u.isTenantAdmin === true);
 // Sending a link creates a carrier on submit, so it needs carrier write access.
 const canManageOnboarding = (u) => isFullAdmin(u) || ['carriers_write', 'subadmin'].some((p) => permsOf(u).includes(p));
-// The broker signature signs a contract on the company's behalf.
-const canEditBrokerSettings = (u) => isFullAdmin(u) || permsOf(u).includes('subadmin');
 
 function tenantOf(req, res) {
   const tenantId = req.tenantId || req.user?.tenantId;
@@ -60,19 +58,12 @@ function tenantOf(req, res) {
  * ------------------------------------------------------------------ */
 async function loadBroker(tenantId) {
   const company = await Company.findOne({ tenantId }).lean();
-  const s = company?.carrier_onboarding || {};
   return {
     company,
     broker: {
-      name: company?.name || '',
-      mc: s.mc_number || '',
-      dot: s.dot_number || '',
-      phone: s.contact_phone || company?.phone || '',
-      email: s.packet_email || company?.email || '',
+      ...BROKER_PARTY,
+      email: company?.email || '',
       address: company?.address || '',
-      signerName: s.signer_name || '',
-      signerTitle: s.signer_title || '',
-      signature: s.signature || '',
     },
   };
 }
@@ -157,7 +148,7 @@ function emailBody({ data, files, doc, broker, masked }) {
     return `<li>${escHtml(label)}: <a href="${escHtml(f.url)}">${escHtml(f.name)}</a></li>`;
   }).join('');
   return `<div style="font:13px Arial;color:#111">
-    <p>A carrier has signed the setup packet${broker?.name ? ` for <b>${escHtml(broker.name)}</b>` : ''}.</p>
+    <p>A carrier has signed the setup packet${broker?.name ? ` for <b>${escHtml(broker.name)}</b>` : ''}. <b>It is waiting for approval</b> — open Carriers → Onboarding links in the dashboard to approve it; the carrier is added only then.</p>
     <p><b>${escHtml(data.legalName)}</b> — MC# ${escHtml(data.mcNumber)} · USDOT# ${escHtml(data.dotNumber)}<br/>
     Signed by ${escHtml(doc.signature?.name)}${doc.signature?.title ? `, ${escHtml(doc.signature.title)}` : ''} at ${escHtml(new Date(doc.submittedAt || Date.now()).toISOString())} (IP ${escHtml(doc.signature?.ip)})</p>
     ${masked ? '<p style="color:#a00"><b>Note:</b> this is a re-send — bank account and tax id are masked. The full values were in the original email only.</p>' : '<p style="color:#a00"><b>Keep this email safe:</b> it is the only place the full bank account and tax id numbers were sent. The app stores them masked.</p>'}
@@ -242,12 +233,12 @@ async function upsertCarrierFromPacket({ req, doc, data }) {
       zipcode: data.zip,
       location: data.address,
       carrierID,
-      created_by: doc.createdBy,
+      created_by: req?.user?._id || doc.createdBy,
       onboarding: doc._id,
     });
     logActivity(req, {
       tenantId, action: 'CREATE', module: 'carrier',
-      description: `Carrier "${carrier.name}" (MC: ${carrier.mc_code}) created from a signed setup packet`,
+      description: `Carrier "${carrier.name}" (MC: ${carrier.mc_code}) created by approving a signed setup packet`,
       resourceId: carrier._id, resourceName: carrier.name,
     });
   }
@@ -449,18 +440,9 @@ exports.publicSubmit = catchAsync(async (req, res) => {
   claimed.pdfHash = pdfHash;
   claimed.pdfSize = pdf.length;
   claimed.status = 'submitted';
+  // Signed is not approved: the carrier is created only when an admin approves.
+  claimed.review = 'pending';
   await claimed.save();
-
-  let carrierResult = null;
-  try {
-    carrierResult = await upsertCarrierFromPacket({ req, doc: claimed, data: masked });
-    await CarrierOnboarding.updateOne({ _id: claimed._id }, { $set: { carrier: carrierResult.carrier._id, carrierMatched: carrierResult.matched } });
-    await fileSignedAgreement({ doc: claimed, carrier: carrierResult.carrier, pdf, data: masked });
-  } catch (err) {
-    // The signed packet is the record; a carrier that could not be created is
-    // fixable by hand from the dashboard and must not undo the signature.
-    console.error('[carrierOnboarding] carrier create failed', err);
-  }
 
   logActivity(req, {
     tenantId: claimed.tenantId, action: 'CREATE', module: 'carrier_onboarding',
@@ -495,6 +477,11 @@ function summary(doc) {
     submittedAt: o.submittedAt,
     legalName: o.data?.legalName || '',
     mcNumber: o.data?.mcNumber || '',
+    // Packets submitted before approval existed created their carrier at once.
+    review: o.review || (o.status === 'submitted' ? (o.carrier ? 'approved' : 'pending') : null),
+    reviewedAt: o.reviewedAt,
+    reviewedBy: o.reviewedBy,
+    rejectReason: o.rejectReason,
     carrier: o.carrier,
     carrierMatched: o.carrierMatched,
     emailStatus: o.emailStatus,
@@ -535,20 +522,16 @@ exports.listLinks = catchAsync(async (req, res) => {
   const rows = await CarrierOnboarding.find({ tenantId, deletedAt: null })
     .select('-pdf -signature.image -brokerSnapshot')
     .populate('createdBy', 'name')
+    .populate('reviewedBy', 'name')
     .populate('carrier', 'name mc_code')
     .sort({ createdAt: -1 })
     .limit(300)
     .lean();
-  const settings = (await loadBroker(tenantId)).broker;
+  const { broker } = await loadBroker(tenantId);
   return res.json({
     status: true,
     links: rows.map(summary),
-    setup: {
-      emailTo: recipients(settings),
-      emailConfigured: sendEmail.isEmailConfigured(),
-      brokerSignature: !!settings.signature,
-      brokerMc: !!settings.mc,
-    },
+    setup: { emailTo: recipients(broker), emailConfigured: sendEmail.isEmailConfigured() },
   });
 });
 
@@ -558,7 +541,7 @@ exports.linkDetail = catchAsync(async (req, res) => {
   if (!tenantId) return;
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: 'Invalid id.' });
   const doc = await CarrierOnboarding.findOne({ _id: req.params.id, tenantId, deletedAt: null })
-    .select('-pdf').populate('createdBy', 'name').populate('carrier', 'name mc_code').lean();
+    .select('-pdf').populate('createdBy', 'name').populate('reviewedBy', 'name').populate('carrier', 'name mc_code').lean();
   if (!doc) return res.status(404).json({ status: false, message: 'Not found.' });
   return res.json({
     status: true,
@@ -621,35 +604,65 @@ exports.resendEmail = catchAsync(async (req, res) => {
   return res.json({ status: true, message: `Sent to ${out.to.join(', ')}.` });
 });
 
-exports.getSettings = catchAsync(async (req, res) => {
-  if (!hasCarrierAccess(req.user)) return res.status(403).json({ status: false, message: 'Not allowed.' });
+exports.approvePacket = catchAsync(async (req, res) => {
+  if (!canManageOnboarding(req.user)) return res.status(403).json({ status: false, message: 'You are not allowed to approve carriers.' });
   const tenantId = tenantOf(req, res);
   if (!tenantId) return;
-  const { broker } = await loadBroker(tenantId);
-  return res.json({ status: true, settings: broker, canEdit: canEditBrokerSettings(req.user), emailTo: recipients(broker), emailConfigured: sendEmail.isEmailConfigured() });
-});
-
-exports.saveSettings = catchAsync(async (req, res) => {
-  if (!canEditBrokerSettings(req.user)) return res.status(403).json({ status: false, message: 'Only an admin can change the broker signature.' });
-  const tenantId = tenantOf(req, res);
-  if (!tenantId) return;
-  const b = req.body || {};
-  const str = (v, max) => String(v ?? '').trim().slice(0, max);
-  const set = {};
-  const map = { mc_number: ['mc', 20], dot_number: ['dot', 20], contact_phone: ['phone', 30], packet_email: ['email', 160], signer_name: ['signerName', 120], signer_title: ['signerTitle', 80] };
-  for (const [col, [key, max]] of Object.entries(map)) if (b[key] !== undefined) set[`carrier_onboarding.${col}`] = str(b[key], max);
-  if (b.signature !== undefined) {
-    const sigImg = String(b.signature || '');
-    if (sigImg && !safeImg(sigImg)) return res.status(400).json({ status: false, message: 'The signature must be a PNG or JPG image.' });
-    if (Buffer.byteLength(sigImg) > MAX_SIGNATURE_BYTES) return res.status(400).json({ status: false, message: 'The signature image is too large.' });
-    set['carrier_onboarding.signature'] = sigImg;
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: 'Invalid id.' });
+  // Claim it: two clicks on Approve must not create the carrier twice.
+  const doc = await CarrierOnboarding.findOneAndUpdate(
+    { _id: req.params.id, tenantId, deletedAt: null, status: 'submitted', carrier: null, review: { $in: ['pending', 'rejected', null] } },
+    { $set: { review: 'approving' } },
+    { new: true },
+  ).select('+pdf');
+  if (!doc) {
+    const cur = await CarrierOnboarding.findOne({ _id: req.params.id, tenantId, deletedAt: null }).lean();
+    if (!cur) return res.status(404).json({ status: false, message: 'Not found.' });
+    if (cur.status !== 'submitted') return res.status(409).json({ status: false, code: 'not_signed', message: 'Only a signed packet can be approved.' });
+    return res.status(409).json({ status: false, code: 'already_approved', message: 'This packet is already approved.' });
   }
-  set['carrier_onboarding.updatedAt'] = new Date();
-  set['carrier_onboarding.updatedBy'] = req.user._id;
-  const company = await Company.findOneAndUpdate({ tenantId }, { $set: set }, { new: true });
-  if (!company) return res.status(404).json({ status: false, message: 'Company profile not found — complete the company details first.' });
-  logActivity(req, { action: 'UPDATE', module: 'carrier_onboarding', description: `Updated carrier packet broker settings${b.signature !== undefined ? ' (signature changed)' : ''}`, resourceId: company._id, resourceName: company.name });
-  return res.json({ status: true, settings: (await loadBroker(tenantId)).broker });
+  let result;
+  try {
+    result = await upsertCarrierFromPacket({ req, doc, data: doc.data || {} });
+  } catch (err) {
+    await CarrierOnboarding.updateOne({ _id: doc._id }, { $set: { review: 'pending' } });
+    console.error('[carrierOnboarding] approve failed', err);
+    return res.status(400).json({ status: false, code: 'carrier_create_failed', message: `The carrier could not be created: ${err.message}` });
+  }
+  await CarrierOnboarding.updateOne({ _id: doc._id }, {
+    $set: { review: 'approved', reviewedAt: new Date(), reviewedBy: req.user._id, rejectReason: '', carrier: result.carrier._id, carrierMatched: result.matched },
+  });
+  if (doc.pdf) await fileSignedAgreement({ doc, carrier: result.carrier, pdf: Buffer.from(doc.pdf), data: doc.data || {} });
+  logActivity(req, {
+    action: 'STATUS_CHANGE', module: 'carrier_onboarding',
+    description: `Approved setup packet of "${doc.data?.legalName || ''}" — ${result.matched ? 'linked to existing' : 'created'} carrier`,
+    resourceId: doc._id, resourceName: doc.data?.legalName || '',
+  });
+  return res.json({
+    status: true,
+    message: result.matched ? `Linked to the existing carrier "${result.carrier.name}".` : `Carrier "${result.carrier.name}" added.`,
+    carrier: { _id: result.carrier._id, name: result.carrier.name },
+  });
 });
 
-exports._internals = { effectiveStatus, recipients, canManageOnboarding, canEditBrokerSettings, TOKEN_RE };
+exports.rejectPacket = catchAsync(async (req, res) => {
+  if (!canManageOnboarding(req.user)) return res.status(403).json({ status: false, message: 'Not allowed.' });
+  const tenantId = tenantOf(req, res);
+  if (!tenantId) return;
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ status: false, message: 'Invalid id.' });
+  const reason = String(req.body?.reason || '').trim().slice(0, 500);
+  const doc = await CarrierOnboarding.findOneAndUpdate(
+    { _id: req.params.id, tenantId, deletedAt: null, status: 'submitted', carrier: null, review: { $in: ['pending', null] } },
+    { $set: { review: 'rejected', reviewedAt: new Date(), reviewedBy: req.user._id, rejectReason: reason } },
+    { new: true },
+  );
+  if (!doc) return res.status(409).json({ status: false, code: 'not_pending', message: 'Only a signed packet awaiting approval can be rejected.' });
+  logActivity(req, {
+    action: 'STATUS_CHANGE', module: 'carrier_onboarding',
+    description: `Rejected setup packet of "${doc.data?.legalName || ''}"${reason ? ` — ${reason}` : ''}`,
+    resourceId: doc._id, resourceName: doc.data?.legalName || '',
+  });
+  return res.json({ status: true, link: summary(doc) });
+});
+
+exports._internals = { effectiveStatus, recipients, canManageOnboarding, TOKEN_RE };

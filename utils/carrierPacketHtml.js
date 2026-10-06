@@ -93,7 +93,6 @@ function buildCarrierPacketHtml({ data = {}, files = [], broker = {}, signature 
   const carrierAddress = [data.address, data.city, data.state, data.zip, data.country].filter(Boolean).join(', ');
 
   const carrierSig = signatureBox({ image: signature.image, name: signature.name, title: signature.title, date: signDate, label: 'CARRIER', signed });
-  const brokerSig = signatureBox({ image: broker.signature, name: broker.signerName, title: broker.signerTitle, date: signDate, label: `BROKER — ${B}`, signed });
 
   const header = `
     <div class="head">
@@ -223,7 +222,7 @@ ${signed ? '' : '<div class="wm">PREVIEW — NOT SIGNED</div>'}
   ${clauses}
   <h2>Confirmations</h2>
   <ul class="acks">${acks}</ul>
-  <div class="sigs">${carrierSig}${brokerSig}</div>
+  <div class="sigs">${carrierSig}<div class="sig"></div></div>
 </section>
 
 ${signed ? `

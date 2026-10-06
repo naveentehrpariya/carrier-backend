@@ -75,19 +75,6 @@ const schema = new mongoose.Schema({
       type: String,
       default: null
    },
-   // Carrier setup packet: the broker side of the agreement. The signature is
-   // drawn once here and printed on every packet a carrier signs.
-   carrier_onboarding: {
-      mc_number: { type: String, default: '' },
-      dot_number: { type: String, default: '' },
-      contact_phone: { type: String, default: '' },
-      packet_email: { type: String, default: '' },
-      signer_name: { type: String, default: '' },
-      signer_title: { type: String, default: '' },
-      signature: { type: String, default: '' },
-      updatedAt: { type: Date, default: null },
-      updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users', default: null },
-   },
    rate_confirmation_terms: {
       type: String,
       default: `Carrier is responsible to confirm the actual weight and count received from the shipper before transit.

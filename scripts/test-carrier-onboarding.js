@@ -156,14 +156,9 @@ async function waitFor(fn, ms = 4000) {
     const l = await call(ctrl.listLinks, asUser(OTHER_ADMIN));
     assert.strictEqual(l.body.links.length, 0);
   });
-  await t('settings save the broker signature; a bad image is refused', async () => {
-    const bad = await call(ctrl.saveSettings, asUser(ADMIN, { body: { signature: 'javascript:alert(1)' } }));
-    assert.strictEqual(bad.statusCode, 400);
-    const ok = await call(ctrl.saveSettings, asUser(ADMIN, { body: { mc: '1365834', dot: '3797909', signerName: 'R. Owner', signerTitle: 'President', signature: SIG } }));
-    assert.strictEqual(ok.body.settings.mc, '1365834');
-    assert.strictEqual(ok.body.settings.signature, SIG);
-    const no = await call(ctrl.saveSettings, asUser({ ...DRIVER, permissions: ['carriers_write'] }, { body: { mc: 'x' } }));
-    assert.strictEqual(no.statusCode, 403, 'a carrier clerk must not change the broker signature');
+  await t('broker party is fixed to the packet (no settings to fill in)', async () => {
+    assert.strictEqual(typeof ctrl.saveSettings, 'undefined');
+    assert.strictEqual(typeof ctrl.getSettings, 'undefined');
   });
 
   console.log('\nPublic');
@@ -191,19 +186,18 @@ async function waitFor(fn, ms = 4000) {
     assert.strictEqual(cois.length, 1);
     assert.strictEqual(cois[0].name, 'new-coi.pdf');
   });
-  await t('submit with missing documents is refused and keeps the answers', async () => {
-    const r = await call(ctrl.publicSubmit, { params: { token }, body: { data: FULL_DATA, signature: { image: SIG, name: 'Jas Singh' } } });
-    assert.strictEqual(r.statusCode, 400);
-    assert.ok(r.body.errors.some((e) => e.key === 'file:w9'));
-    const doc = await CarrierOnboarding.findById(linkId).lean();
-    assert.strictEqual(doc.status, 'in_progress');
-    assert.strictEqual(doc.data.accountNumber, '5551234567', 'draft must keep the full value until submit');
+  await t('documents are optional: none required by validation', async () => {
+    const errs = spec.validate(spec.sanitize(FULL_DATA), []);
+    assert.ok(!errs.some((e) => e.key.startsWith('file:')), JSON.stringify(errs));
   });
-  await t('submit without a signature is refused', async () => {
-    await uploadAs(token, 'w9'); await uploadAs(token, 'authority'); await uploadAs(token, 'void_cheque');
+  await t('submit without a signature is refused and keeps the answers', async () => {
     const r = await call(ctrl.publicSubmit, { params: { token }, body: { data: FULL_DATA, signature: { image: '', name: 'Jas Singh' } } });
     assert.strictEqual(r.statusCode, 400);
     assert.ok(r.body.errors.some((e) => e.key === 'signature'));
+    const doc = await CarrierOnboarding.findById(linkId).lean();
+    assert.strictEqual(doc.status, 'in_progress');
+    assert.strictEqual(doc.data.accountNumber, '5551234567', 'draft must keep the full value until submit');
+    await uploadAs(token, 'w9');
   });
   await t('preview returns the filled packet with sensitive values masked', async () => {
     const r = await call(ctrl.publicPreview, { params: { token }, body: { data: FULL_DATA } });
@@ -220,7 +214,7 @@ async function waitFor(fn, ms = 4000) {
 
   console.log('\nSubmit');
   let submitRes;
-  await t('a complete packet signs, renders a PDF and creates the carrier', async () => {
+  await t('a complete packet signs and renders a PDF — but creates NO carrier', async () => {
     submitRes = await call(ctrl.publicSubmit, { params: { token }, body: { data: FULL_DATA, signature: { image: SIG, name: 'Jas Singh', title: 'Owner' } } });
     assert.strictEqual(submitRes.statusCode, 200, JSON.stringify(submitRes.body));
     const doc = await CarrierOnboarding.findById(linkId).select('+pdf').lean();
@@ -230,14 +224,30 @@ async function waitFor(fn, ms = 4000) {
     assert.strictEqual(buf.slice(0, 4).toString(), '%PDF');
     assert.strictEqual(crypto.createHash('sha256').update(buf).digest('hex'), doc.pdfHash);
     assert.strictEqual(doc.signature.ip, '203.0.113.9');
-    assert.ok(doc.carrier);
-    assert.strictEqual(doc.carrierMatched, false);
+    assert.strictEqual(doc.carrier, null);
+    assert.strictEqual(doc.review, 'pending');
+    assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT }), 0);
+    const buf2 = Buffer.from(doc.pdf.buffer || doc.pdf).toString('latin1');
+    assert.ok(!/Not signed yet/.test(buf2));
   });
   await t('the database keeps only masked bank and tax numbers', async () => {
     const doc = await CarrierOnboarding.findById(linkId).lean();
     assert.strictEqual(doc.data.accountNumber, '••••4567');
     assert.strictEqual(doc.data.taxId, '••••6789');
     assert.ok(!JSON.stringify(doc).includes('5551234567'));
+  });
+  await t('approval: a driver cannot, reject of an approved one fails, double approve creates one', async () => {
+    assert.strictEqual((await call(ctrl.approvePacket, asUser(DRIVER, { params: { id: linkId } }))).statusCode, 403);
+    const [a, b] = await Promise.all([
+      call(ctrl.approvePacket, asUser(ADMIN, { params: { id: linkId } })),
+      call(ctrl.approvePacket, asUser(ADMIN, { params: { id: linkId } })),
+    ]);
+    assert.deepStrictEqual([a.statusCode, b.statusCode].sort(), [200, 409]);
+    assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT }), 1);
+    const doc = await CarrierOnboarding.findById(linkId).lean();
+    assert.strictEqual(doc.review, 'approved');
+    assert.strictEqual(String(doc.reviewedBy), String(ADMIN._id));
+    assert.strictEqual((await call(ctrl.rejectPacket, asUser(ADMIN, { params: { id: linkId } }))).statusCode, 409);
   });
   await t('carrier record matches the packet and carries its documents', async () => {
     const doc = await CarrierOnboarding.findById(linkId).lean();
@@ -246,6 +256,7 @@ async function waitFor(fn, ms = 4000) {
     assert.strictEqual(c.mc_code, '998877');
     assert.strictEqual(String(c.company), String(COMPANY_ID));
     assert.strictEqual(String(c.onboarding), String(linkId));
+    assert.strictEqual(String(c.created_by), String(ADMIN._id), 'approver should own the carrier');
     const docs = await FleetDoc.find({ entityId: c._id, type: 'carrier' }).lean();
     const coi = docs.find((d) => d.docType === 'coi');
     assert.ok(coi, 'COI not filed');
@@ -258,6 +269,7 @@ async function waitFor(fn, ms = 4000) {
     const m = mails[mails.length - 1];
     assert.ok(m.message.includes('5551234567'), 'full account number missing from email');
     assert.ok(m.message.includes('12-3456789'), 'full tax id missing from email');
+    assert.ok(m.message.includes('waiting for approval'));
     assert.ok(m.attachments.some((a) => a.contentType === 'application/pdf' && a.content.length > 1000));
     assert.ok(m.attachments.some((a) => String(a.path || '').startsWith('https://cdn.test/')));
     assert.strictEqual(m.email, process.env.CARRIER_ONBOARDING_EMAIL || 'ops@cmc.test');
@@ -302,6 +314,8 @@ async function waitFor(fn, ms = 4000) {
     for (const k of ['coi', 'w9', 'authority', 'void_cheque']) await uploadAs(tk, k); // eslint-disable-line no-await-in-loop
     const r = await call(ctrl.publicSubmit, { params: { token: tk }, body: { data: { ...FULL_DATA, email: 'new@x.test' }, signature: { image: SIG, name: 'Jas Singh' } } });
     assert.strictEqual(r.statusCode, 200, JSON.stringify(r.body));
+    const ap = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.body.link._id } }));
+    assert.strictEqual(ap.statusCode, 200, JSON.stringify(ap.body));
     const doc = await CarrierOnboarding.findById(c.body.link._id).lean();
     assert.strictEqual(doc.carrierMatched, true);
     assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '998877' }), 1);
@@ -315,7 +329,27 @@ async function waitFor(fn, ms = 4000) {
     const codes = [a.statusCode, b.statusCode].sort();
     assert.strictEqual(codes[0], 200);
     assert.ok([409, 410].includes(codes[1]), `second submit answered ${codes[1]}`);
-    assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '111222' }), 1);
+    assert.strictEqual(await CarrierOnboarding.countDocuments({ _id: c.body.link._id, status: 'submitted' }), 1);
+    assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '111222' }), 0, 'no carrier before approval');
+  });
+  await t('reject keeps the packet, adds no carrier, and can still be approved later', async () => {
+    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
+    const tk = c.body.link.token;
+    const r = await call(ctrl.publicSubmit, { params: { token: tk }, body: { data: { ...FULL_DATA, mcNumber: '333444', email: 'rej@x.test' }, signature: { image: SIG, name: 'Jas Singh' } } });
+    assert.strictEqual(r.statusCode, 200, 'submit with no documents at all must pass');
+    const rj = await call(ctrl.rejectPacket, asUser(ADMIN, { params: { id: c.body.link._id }, body: { reason: 'Insurance too low' } }));
+    assert.strictEqual(rj.body.link.review, 'rejected');
+    assert.strictEqual(rj.body.link.rejectReason, 'Insurance too low');
+    assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '333444' }), 0);
+    const ap = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.body.link._id } }));
+    assert.strictEqual(ap.statusCode, 200);
+    assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '333444' }), 1);
+  });
+  await t('a packet not yet signed cannot be approved', async () => {
+    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
+    const r = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.body.link._id } }));
+    assert.strictEqual(r.statusCode, 409);
+    assert.strictEqual(r.body.code, 'not_signed');
   });
   await t('a revoked link is dead and its draft loses the full numbers', async () => {
     const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));

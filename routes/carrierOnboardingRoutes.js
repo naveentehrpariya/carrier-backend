@@ -41,11 +41,11 @@ router.post('/public/carrier-onboarding/:token/preview', limiter(60, 15), ctrl.p
 router.post('/public/carrier-onboarding/:token/submit', limiter(10, 15), ctrl.publicSubmit);
 
 // ---- dashboard ----
-router.get('/carrier-onboarding/settings', validateToken, resolveTenant, ctrl.getSettings);
-router.post('/carrier-onboarding/settings', validateToken, resolveTenant, ctrl.saveSettings);
 router.get('/carrier-onboarding', validateToken, resolveTenant, ctrl.listLinks);
 router.post('/carrier-onboarding/links', validateToken, resolveTenant, ctrl.createLink);
 router.post('/carrier-onboarding/revoke/:id', validateToken, resolveTenant, ctrl.revokeLink);
+router.post('/carrier-onboarding/:id/approve', validateToken, resolveTenant, ctrl.approvePacket);
+router.post('/carrier-onboarding/:id/reject', validateToken, resolveTenant, ctrl.rejectPacket);
 router.post('/carrier-onboarding/:id/resend-email', validateToken, resolveTenant, ctrl.resendEmail);
 router.get('/carrier-onboarding/:id/pdf', validateToken, resolveTenant, ctrl.linkPdf);
 router.get('/carrier-onboarding/:id', validateToken, resolveTenant, ctrl.linkDetail);

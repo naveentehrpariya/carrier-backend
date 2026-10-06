@@ -64,6 +64,13 @@ const schema = new mongoose.Schema({
   pdfHash: { type: String, default: '' },
   pdfSize: { type: Number, default: 0 },
 
+  // A signed packet is NOT a carrier yet — an admin reviews it first. `review` is
+  // only meaningful once status is 'submitted'.
+  review: { type: String, enum: ['pending', 'approving', 'approved', 'rejected', null], default: null, index: true },
+  reviewedAt: { type: Date, default: null },
+  reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users', default: null },
+  rejectReason: { type: String, default: '' },
+
   carrier: { type: mongoose.Schema.Types.ObjectId, ref: 'carriers', default: null },
   carrierMatched: { type: Boolean, default: false }, // linked to an existing carrier, not created
 
