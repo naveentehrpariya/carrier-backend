@@ -58,6 +58,8 @@ router.get('/subscription/status', validateToken, catchAsync(async (req, res) =>
 }));
 
 router.route('/order/add').post(validateToken, resolveTenant, requireActiveSubscription, checkOrderLimit(), checkOrderModuleAccess(), orderController.create_order);
+// Copy a load: prepareOrderCopy rewrites req.body from the source order, then the ordinary create path runs.
+router.route('/order/copy/:id').post(validateToken, resolveTenant, requireActiveSubscription, checkOrderLimit(), orderController.prepareOrderCopy, checkOrderModuleAccess(), orderController.create_order);
 router.route('/order/update/:id').put(validateToken, optionalTenant, resolveAllowedModulesMiddleware, restrictOrderMiddleware, orderController.update_order);
 router.route('/order/listings').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.order_listing);
 router.route('/order/needs-attention').get(validateToken, optionalTenant, resolveAllowedModulesMiddleware, orderController.orders_needing_attention);

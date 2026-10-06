@@ -18,6 +18,7 @@ const path = require('path');
 const mongoose = require('mongoose');
 const catchAsync = require('../utils/catchAsync');
 const CarrierOnboarding = require('../db/CarrierOnboarding');
+const CarrierOnboardingKey = require('../db/CarrierOnboardingKey');
 const Company = require('../db/Company');
 const Carrier = require('../db/Carrier');
 const FleetDoc = require('../db/FleetDoc');
@@ -128,9 +129,10 @@ async function renderPdf(html) {
   }
 }
 
-function recipients(broker) {
-  const list = String(process.env.CARRIER_ONBOARDING_EMAIL || '')
-    .split(',').map((s) => s.trim()).filter(Boolean);
+/** Who gets this company's signed packets: the dashboard setting, else the company email. */
+async function recipients(tenantId, broker) {
+  const k = await CarrierOnboardingKey.findOne({ tenantId }).select('notifyEmails').lean();
+  const list = (k?.notifyEmails || []).filter(Boolean);
   if (!list.length && broker?.email) list.push(broker.email);
   return [...new Set(list)];
 }
@@ -164,9 +166,9 @@ function emailBody({ data, files, doc, broker, masked }) {
  * submit, where they exist in memory and nowhere else. Never throws.
  */
 async function sendPacketEmail({ doc, fullData, broker, pdf }) {
-  const to = recipients(broker);
+  const to = await recipients(doc.tenantId, broker);
   if (!to.length || !sendEmail.isEmailConfigured()) {
-    await CarrierOnboarding.updateOne({ _id: doc._id }, { $set: { emailStatus: 'not_configured', emailError: !to.length ? 'No recipient: set CARRIER_ONBOARDING_EMAIL.' : 'SMTP is not configured.' } });
+    await CarrierOnboarding.updateOne({ _id: doc._id }, { $set: { emailStatus: 'not_configured', emailError: !to.length ? 'No recipient: add an email under "Signed packets are emailed to" on the onboarding page.' : 'SMTP is not configured.' } });
     return { ok: false, code: 'not_configured' };
   }
   const data = fullData || doc.data || {};
@@ -467,6 +469,7 @@ function summary(doc) {
     _id: o._id,
     token: o.token,
     status: effectiveStatus(o),
+    source: o.source || 'link',
     invitedName: o.invitedName,
     invitedEmail: o.invitedEmail,
     note: o.note,
@@ -492,34 +495,59 @@ function summary(doc) {
   };
 }
 
-exports.createLink = catchAsync(async (req, res) => {
-  if (!canManageOnboarding(req.user)) return res.status(403).json({ status: false, message: 'You are not allowed to send carrier setup links.' });
-  const tenantId = tenantOf(req, res);
-  if (!tenantId) return;
-  const days = Math.min(60, Math.max(1, parseInt(req.body?.expiresInDays, 10) || 14));
+const SHARED_SESSION_DAYS = 30;
+const newToken = () => crypto.randomBytes(24).toString('base64url');
+
+/** The tenant's one shared link — created on first use, then never changes. */
+async function ensureSharedKey(tenantId, user) {
+  const existing = await CarrierOnboardingKey.findOne({ tenantId }).lean();
+  if (existing) return existing;
+  try {
+    return (await CarrierOnboardingKey.create({
+      tenantId,
+      key: newToken(),
+      company: user?.company?._id || user?.company || null,
+      createdBy: user?._id || null,
+    })).toObject();
+  } catch (err) {
+    if (err?.code === 11000) return CarrierOnboardingKey.findOne({ tenantId }).lean(); // two first-opens raced
+    throw err;
+  }
+}
+
+/**
+ * A visitor of the shared link starts THEIR OWN packet. POST (not GET) so link
+ * previews and crawlers cannot create packets just by fetching the URL. The
+ * packet only appears on the dashboard once something is saved in it.
+ */
+exports.publicStart = catchAsync(async (req, res) => {
+  const key = String(req.params.key || '');
+  if (!TOKEN_RE.test(key)) return linkGone(res, null);
+  const k = await CarrierOnboardingKey.findOne({ key }).lean();
+  if (!k) return linkGone(res, null);
   const doc = await CarrierOnboarding.create({
-    tenantId,
-    company: req.user?.company?._id || req.user?.company || null,
-    token: crypto.randomBytes(24).toString('base64url'),
-    invitedName: String(req.body?.invitedName || '').trim().slice(0, 160),
-    invitedEmail: String(req.body?.invitedEmail || '').trim().toLowerCase().slice(0, 160),
-    note: String(req.body?.note || '').trim().slice(0, 500),
-    expiresAt: new Date(Date.now() + days * 86400000),
-    createdBy: req.user._id,
+    tenantId: k.tenantId,
+    company: k.company,
+    token: newToken(),
+    source: 'shared',
+    status: 'opened',
+    openedAt: new Date(),
+    expiresAt: new Date(Date.now() + SHARED_SESSION_DAYS * 86400000),
+    createdBy: k.createdBy,
   });
-  logActivity(req, {
-    action: 'CREATE', module: 'carrier_onboarding',
-    description: `Created carrier setup link${doc.invitedName ? ` for ${doc.invitedName}` : ''} (expires in ${days} days)`,
-    resourceId: doc._id, resourceName: doc.invitedName || 'Carrier setup link',
-  });
-  return res.json({ status: true, link: summary(doc) });
+  return res.json({ status: true, token: doc.token });
 });
 
 exports.listLinks = catchAsync(async (req, res) => {
   if (!hasCarrierAccess(req.user)) return res.status(403).json({ status: false, message: 'Not allowed.' });
   const tenantId = tenantOf(req, res);
   if (!tenantId) return;
-  const rows = await CarrierOnboarding.find({ tenantId, deletedAt: null })
+  const rows = await CarrierOnboarding.find({
+    tenantId,
+    deletedAt: null,
+    // Someone who opened the shared link and typed nothing is not a lead.
+    $nor: [{ source: 'shared', lastSavedAt: null, status: { $in: ['sent', 'opened'] } }],
+  })
     .select('-pdf -signature.image -brokerSnapshot')
     .populate('createdBy', 'name')
     .populate('reviewedBy', 'name')
@@ -531,7 +559,14 @@ exports.listLinks = catchAsync(async (req, res) => {
   return res.json({
     status: true,
     links: rows.map(summary),
-    setup: { emailTo: recipients(broker), emailConfigured: sendEmail.isEmailConfigured() },
+    sharedKey: (await ensureSharedKey(tenantId, req.user)).key,
+    setup: {
+      emailTo: await recipients(tenantId, broker),
+      notifyEmails: (await CarrierOnboardingKey.findOne({ tenantId }).select('notifyEmails').lean())?.notifyEmails || [],
+      companyEmail: broker.email,
+      emailConfigured: sendEmail.isEmailConfigured(),
+      canEdit: canManageOnboarding(req.user),
+    },
   });
 });
 
@@ -663,6 +698,27 @@ exports.rejectPacket = catchAsync(async (req, res) => {
     resourceId: doc._id, resourceName: doc.data?.legalName || '',
   });
   return res.json({ status: true, link: summary(doc) });
+});
+
+exports.saveNotifyEmails = catchAsync(async (req, res) => {
+  if (!canManageOnboarding(req.user)) return res.status(403).json({ status: false, message: 'You are not allowed to change this.' });
+  const tenantId = tenantOf(req, res);
+  if (!tenantId) return;
+  const raw = Array.isArray(req.body?.emails) ? req.body.emails : String(req.body?.emails || '').split(/[,;\s]+/);
+  const emails = [...new Set(raw.map((e) => String(e || '').trim().toLowerCase()).filter(Boolean))];
+  const bad = emails.find((e) => e.length > 160 || !/^[^\s@<>"'(),;:]+@[^\s@<>"'(),;:]+\.[^\s@<>"'(),;:]{2,}$/.test(e));
+  if (bad) return res.status(400).json({ status: false, code: 'invalid_email', message: `"${bad}" is not a valid email address.` });
+  if (emails.length > 5) return res.status(400).json({ status: false, code: 'too_many', message: 'At most 5 email addresses.' });
+  await ensureSharedKey(tenantId, req.user);
+  const before = await CarrierOnboardingKey.findOne({ tenantId }).lean();
+  await CarrierOnboardingKey.updateOne({ tenantId }, { $set: { notifyEmails: emails, notifyUpdatedAt: new Date(), notifyUpdatedBy: req.user._id } });
+  logActivity(req, {
+    action: 'UPDATE', module: 'carrier_onboarding',
+    description: `Signed carrier packets now emailed to ${emails.length ? emails.join(', ') : 'the company email'} (was ${before?.notifyEmails?.length ? before.notifyEmails.join(', ') : 'the company email'})`,
+    resourceId: before?._id, resourceName: 'Carrier packet email',
+  });
+  const { broker } = await loadBroker(tenantId);
+  return res.json({ status: true, notifyEmails: emails, emailTo: await recipients(tenantId, broker) });
 });
 
 exports._internals = { effectiveStatus, recipients, canManageOnboarding, TOKEN_RE };

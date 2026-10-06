@@ -33,6 +33,8 @@ const limiter = (limit, windowMinutes) => rateLimit({
 });
 
 // ---- public (the carrier) ----
+// The one shared link: each visitor starts their own packet.
+router.post('/public/carrier-onboarding/start/:key', limiter(20, 60), ctrl.publicStart);
 router.get('/public/carrier-onboarding/:token', limiter(120, 15), ctrl.publicGet);
 router.post('/public/carrier-onboarding/:token/draft', limiter(240, 15), ctrl.publicSaveDraft);
 router.post('/public/carrier-onboarding/:token/files', limiter(60, 15), uploadOne, ctrl.publicUploadFile);
@@ -42,7 +44,7 @@ router.post('/public/carrier-onboarding/:token/submit', limiter(10, 15), ctrl.pu
 
 // ---- dashboard ----
 router.get('/carrier-onboarding', validateToken, resolveTenant, ctrl.listLinks);
-router.post('/carrier-onboarding/links', validateToken, resolveTenant, ctrl.createLink);
+router.post('/carrier-onboarding/notify-emails', validateToken, resolveTenant, ctrl.saveNotifyEmails);
 router.post('/carrier-onboarding/revoke/:id', validateToken, resolveTenant, ctrl.revokeLink);
 router.post('/carrier-onboarding/:id/approve', validateToken, resolveTenant, ctrl.approvePacket);
 router.post('/carrier-onboarding/:id/reject', validateToken, resolveTenant, ctrl.rejectPacket);

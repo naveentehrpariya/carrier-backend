@@ -30,6 +30,13 @@ const schema = new mongoose.Schema({
       enum: ['domestic_only', 'fastest'],
       default: 'domestic_only',
    },
+   // Who receives the internal "new load" email (utils/orderNotifyEmail.js) for THIS company.
+   // Per company, never an env var: one address for the whole platform would send every tenant's
+   // revenue and profit to one inbox. Empty = no email.
+   order_notification_emails: {
+      type: [String],
+      default: [],
+   },
    logo: {
       type:String,
    },

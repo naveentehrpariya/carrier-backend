@@ -115,7 +115,13 @@ async function waitFor(fn, ms = 4000) {
   await Company.create({ _id: COMPANY_ID, tenantId: TENANT, name: 'Cross Miles Carrier Inc', email: 'ops@cmc.test', phone: '437-383-3310', address: '1 Main St' });
   await CarrierOnboarding.init();
 
-  let token; let linkId;
+  let token; let linkId; let SHARED_KEY;
+  const startPacket = async () => {
+    const r = await call(ctrl.publicStart, { params: { key: SHARED_KEY } });
+    assert.strictEqual(r.statusCode, 200, JSON.stringify(r.body));
+    const d = await CarrierOnboarding.findOne({ token: r.body.token }).lean();
+    return { token: r.body.token, id: String(d._id) };
+  };
 
   console.log('\nSpec');
   await t('sanitize drops unknown keys, bad options and hidden answers', async () => {
@@ -138,17 +144,35 @@ async function waitFor(fn, ms = 4000) {
   });
 
   console.log('\nDashboard');
-  await t('a driver cannot create a link', async () => {
-    const r = await call(ctrl.createLink, asUser(DRIVER, { body: {} }));
+  await t('a driver cannot see the shared link', async () => {
+    const r = await call(ctrl.listLinks, asUser(DRIVER));
     assert.strictEqual(r.statusCode, 403);
   });
-  await t('admin creates a link with an unguessable token', async () => {
-    const r = await call(ctrl.createLink, asUser(ADMIN, { body: { invitedName: 'Northern', expiresInDays: '500' } }));
-    assert.strictEqual(r.body.status, true);
-    token = r.body.link.token; linkId = r.body.link._id;
-    assert.ok(ctrl._internals.TOKEN_RE.test(token) && token.length >= 32);
-    const days = (new Date(r.body.link.expiresAt) - Date.now()) / 86400000;
-    assert.ok(days <= 60.01, 'expiry not capped');
+  await t('admin gets ONE shared link — the same every time, different per tenant', async () => {
+    const a1 = await call(ctrl.listLinks, asUser(ADMIN));
+    const a2 = await call(ctrl.listLinks, asUser(ADMIN));
+    SHARED_KEY = a1.body.sharedKey;
+    assert.ok(ctrl._internals.TOKEN_RE.test(SHARED_KEY) && SHARED_KEY.length >= 32);
+    assert.strictEqual(a2.body.sharedKey, SHARED_KEY);
+    const o = await call(ctrl.listLinks, asUser(OTHER_ADMIN));
+    assert.notStrictEqual(o.body.sharedKey, SHARED_KEY);
+    assert.strictEqual(typeof ctrl.createLink, 'undefined', 'per-carrier link creation must be gone');
+  });
+  await t('each visitor of the shared link gets their own packet; empty ones stay off the list', async () => {
+    const p1 = await startPacket();
+    const p2 = await startPacket();
+    assert.notStrictEqual(p1.token, p2.token);
+    const d = await CarrierOnboarding.findById(p1.id).lean();
+    assert.strictEqual(d.source, 'shared');
+    assert.strictEqual(d.tenantId, TENANT);
+    assert.strictEqual(String(d.company), String(COMPANY_ID));
+    const l = await call(ctrl.listLinks, asUser(ADMIN));
+    assert.strictEqual(l.body.links.length, 0, 'opened-but-empty packets must not clutter the list');
+    token = p1.token; linkId = p1.id;
+  });
+  await t('an unknown shared key is a 404', async () => {
+    assert.strictEqual((await call(ctrl.publicStart, { params: { key: 'B'.repeat(32) } })).statusCode, 404);
+    assert.strictEqual((await call(ctrl.publicStart, { params: { key: 'x' } })).statusCode, 404);
   });
   await t('another tenant cannot see the link', async () => {
     const r = await call(ctrl.linkDetail, asUser(OTHER_ADMIN, { params: { id: linkId } }));
@@ -272,7 +296,7 @@ async function waitFor(fn, ms = 4000) {
     assert.ok(m.message.includes('waiting for approval'));
     assert.ok(m.attachments.some((a) => a.contentType === 'application/pdf' && a.content.length > 1000));
     assert.ok(m.attachments.some((a) => String(a.path || '').startsWith('https://cdn.test/')));
-    assert.strictEqual(m.email, process.env.CARRIER_ONBOARDING_EMAIL || 'ops@cmc.test');
+    assert.strictEqual(m.email, 'ops@cmc.test', 'with nothing set, packets go to the company email');
   });
   await t('the link stops working after submit', async () => {
     const g = await call(ctrl.publicGet, { params: { token } });
@@ -288,12 +312,24 @@ async function waitFor(fn, ms = 4000) {
     const d = await call(ctrl.linkPdf, asUser(DRIVER, { params: { id: linkId } }));
     assert.strictEqual(d.statusCode, 403);
   });
+  await t('notify emails: set on the dashboard, per company, validated', async () => {
+    assert.strictEqual((await call(ctrl.saveNotifyEmails, asUser(DRIVER, { body: { emails: ['x@y.test'] } }))).statusCode, 403);
+    const bad = await call(ctrl.saveNotifyEmails, asUser(ADMIN, { body: { emails: ['mark@cmc.test', 'not-an-email'] } }));
+    assert.strictEqual(bad.statusCode, 400);
+    const ok = await call(ctrl.saveNotifyEmails, asUser(ADMIN, { body: { emails: 'Mark@CMC.test, ops2@cmc.test, mark@cmc.test' } }));
+    assert.deepStrictEqual(ok.body.notifyEmails, ['mark@cmc.test', 'ops2@cmc.test']);
+    const l = await call(ctrl.listLinks, asUser(ADMIN));
+    assert.deepStrictEqual(l.body.setup.emailTo, ['mark@cmc.test', 'ops2@cmc.test']);
+    const o = await call(ctrl.listLinks, asUser(OTHER_ADMIN));
+    assert.ok(!o.body.setup.emailTo.includes('mark@cmc.test'), 'another company must not inherit the setting');
+  });
   await t('resend works and says the values are masked', async () => {
     const before = mails.length;
     const r = await call(ctrl.resendEmail, asUser(ADMIN, { params: { id: linkId } }));
     assert.strictEqual(r.body.status, true);
     assert.strictEqual(mails.length, before + 1);
     assert.ok(!mails[mails.length - 1].message.includes('5551234567'));
+    assert.strictEqual(mails[mails.length - 1].email, 'mark@cmc.test, ops2@cmc.test', 'resend must use the dashboard setting');
   });
   await t('a failed email is recorded, not lost', async () => {
     mailFails = true;
@@ -309,65 +345,66 @@ async function waitFor(fn, ms = 4000) {
 
   console.log('\nSecond packet');
   await t('same MC links to the existing carrier instead of duplicating it', async () => {
-    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
-    const tk = c.body.link.token;
+    const c = await startPacket();
+    const tk = c.token;
     for (const k of ['coi', 'w9', 'authority', 'void_cheque']) await uploadAs(tk, k); // eslint-disable-line no-await-in-loop
     const r = await call(ctrl.publicSubmit, { params: { token: tk }, body: { data: { ...FULL_DATA, email: 'new@x.test' }, signature: { image: SIG, name: 'Jas Singh' } } });
     assert.strictEqual(r.statusCode, 200, JSON.stringify(r.body));
-    const ap = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.body.link._id } }));
+    const ap = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.id } }));
     assert.strictEqual(ap.statusCode, 200, JSON.stringify(ap.body));
-    const doc = await CarrierOnboarding.findById(c.body.link._id).lean();
+    const doc = await CarrierOnboarding.findById(c.id).lean();
     assert.strictEqual(doc.carrierMatched, true);
     assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '998877' }), 1);
   });
   await t('two concurrent submits sign once', async () => {
-    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
-    const tk = c.body.link.token;
+    const c = await startPacket();
+    const tk = c.token;
     for (const k of ['coi', 'w9', 'authority', 'void_cheque']) await uploadAs(tk, k); // eslint-disable-line no-await-in-loop
     const body = { data: { ...FULL_DATA, mcNumber: '111222', email: 'race@x.test' }, signature: { image: SIG, name: 'Jas Singh' } };
     const [a, b] = await Promise.all([call(ctrl.publicSubmit, { params: { token: tk }, body }), call(ctrl.publicSubmit, { params: { token: tk }, body })]);
     const codes = [a.statusCode, b.statusCode].sort();
     assert.strictEqual(codes[0], 200);
     assert.ok([409, 410].includes(codes[1]), `second submit answered ${codes[1]}`);
-    assert.strictEqual(await CarrierOnboarding.countDocuments({ _id: c.body.link._id, status: 'submitted' }), 1);
+    assert.strictEqual(await CarrierOnboarding.countDocuments({ _id: c.id, status: 'submitted' }), 1);
     assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '111222' }), 0, 'no carrier before approval');
   });
   await t('reject keeps the packet, adds no carrier, and can still be approved later', async () => {
-    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
-    const tk = c.body.link.token;
+    const c = await startPacket();
+    const tk = c.token;
     const r = await call(ctrl.publicSubmit, { params: { token: tk }, body: { data: { ...FULL_DATA, mcNumber: '333444', email: 'rej@x.test' }, signature: { image: SIG, name: 'Jas Singh' } } });
     assert.strictEqual(r.statusCode, 200, 'submit with no documents at all must pass');
-    const rj = await call(ctrl.rejectPacket, asUser(ADMIN, { params: { id: c.body.link._id }, body: { reason: 'Insurance too low' } }));
+    const rj = await call(ctrl.rejectPacket, asUser(ADMIN, { params: { id: c.id }, body: { reason: 'Insurance too low' } }));
     assert.strictEqual(rj.body.link.review, 'rejected');
     assert.strictEqual(rj.body.link.rejectReason, 'Insurance too low');
     assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '333444' }), 0);
-    const ap = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.body.link._id } }));
+    const ap = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.id } }));
     assert.strictEqual(ap.statusCode, 200);
     assert.strictEqual(await Carrier.countDocuments({ tenantId: TENANT, mc_code: '333444' }), 1);
   });
   await t('a packet not yet signed cannot be approved', async () => {
-    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
-    const r = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.body.link._id } }));
+    const c = await startPacket();
+    const r = await call(ctrl.approvePacket, asUser(ADMIN, { params: { id: c.id } }));
     assert.strictEqual(r.statusCode, 409);
     assert.strictEqual(r.body.code, 'not_signed');
   });
   await t('a revoked link is dead and its draft loses the full numbers', async () => {
-    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
-    const tk = c.body.link.token;
+    const c = await startPacket();
+    const tk = c.token;
     await call(ctrl.publicSaveDraft, { params: { token: tk }, body: { data: FULL_DATA } });
-    const r = await call(ctrl.revokeLink, asUser(ADMIN, { params: { id: c.body.link._id } }));
+    const r = await call(ctrl.revokeLink, asUser(ADMIN, { params: { id: c.id } }));
     assert.strictEqual(r.body.status, true);
     assert.strictEqual((await call(ctrl.publicGet, { params: { token: tk } })).body.code, 'link_revoked');
-    const doc = await CarrierOnboarding.findById(c.body.link._id).lean();
+    const doc = await CarrierOnboarding.findById(c.id).lean();
     assert.strictEqual(doc.data.accountNumber, '••••4567');
   });
-  await t('an expired link is dead', async () => {
-    const c = await call(ctrl.createLink, asUser(ADMIN, { body: {} }));
-    await CarrierOnboarding.updateOne({ _id: c.body.link._id }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
-    const g = await call(ctrl.publicGet, { params: { token: c.body.link.token } });
+  await t('an expired packet is dead (and shows once it holds data)', async () => {
+    const c = await startPacket();
+    await call(ctrl.publicSaveDraft, { params: { token: c.token }, body: { data: { legalName: 'Lapsed Co' } } });
+    await CarrierOnboarding.updateOne({ _id: c.id }, { $set: { expiresAt: new Date(Date.now() - 1000) } });
+    const g = await call(ctrl.publicGet, { params: { token: c.token } });
     assert.strictEqual(g.body.code, 'link_expired');
     const l = await call(ctrl.listLinks, asUser(ADMIN));
-    assert.strictEqual(l.body.links.find((x) => String(x._id) === String(c.body.link._id)).status, 'expired');
+    assert.strictEqual(l.body.links.find((x) => String(x._id) === String(c.id)).status, 'expired');
   });
 
   // Write the signed PDF out so a person can look at it.

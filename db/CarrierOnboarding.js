@@ -25,6 +25,9 @@ const schema = new mongoose.Schema({
   tenantId: { type: String, required: true, index: true },
   company: { type: mongoose.Schema.Types.ObjectId, ref: 'companies', default: null },
   token: { type: String, required: true, unique: true },
+  // 'shared' = started from the tenant's one shared link (CarrierOnboardingKey);
+  // 'link' = an older one-carrier link.
+  source: { type: String, enum: ['link', 'shared'], default: 'link' },
   status: {
     type: String,
     enum: ['sent', 'opened', 'in_progress', 'submitting', 'submitted', 'revoked'],

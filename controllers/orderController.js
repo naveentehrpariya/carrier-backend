@@ -45,6 +45,8 @@ const { logActivity, logChange } = require("../utils/activityLogger");
 const mongooseLib = require("mongoose");
 const { createOrderFxConverter, resolveDisplayCurrency, orderMoneyIn } = require("../utils/orderMoney");
 const { kmToMiles } = require("../utils/distance");
+const { notifyNewOrder } = require("../utils/orderNotifyEmail");
+const { getOrderNumber: getOrderNumberServer } = require("../utils/orderNumber");
 
 const DISTANCE_SOURCES = ['auto_fastest', 'auto_domestic', 'auto_corridor', 'auto_selected', 'manual'];
 const normalizeDistanceSource = (value) =>
@@ -509,6 +511,133 @@ function findNegativeMoney({ revenue_items, carrier_revenue_items, total_amount,
    return bad;
 }
 
+/* COPY A LOAD — POST /order/copy/:id
+ *
+ * Middleware, not a handler: it reads the source order and REWRITES req.body into exactly what the
+ * Add Order form would have posted, then hands over to the ordinary create path
+ * (checkOrderModuleAccess → create_order). So a copy passes every guard a typed order passes —
+ * subscription, monthly limit, module access, customer visibility, negative money, backwards
+ * dates — and gets its serial, its default leg, its audit row and its new-load email from the one
+ * place that already does that. A second "insert a clone" path would be a second definition of
+ * what a valid order is.
+ *
+ * What is carried: customer, stops, shipment details, revenue + carrier lines, who runs it,
+ * amounts (the TYPED amounts in the currency they were typed in, so nothing is converted twice),
+ * distance + route, instructions.
+ * What is NOT: the serial, status (starts `added`), payments, documents, legs/splits, lock,
+ * creator (whoever copies owns the copy), history, the FX snapshot (today's rate applies).
+ * Relay stops are dropped — they belong to the source order's legs, which are not copied.
+ * A mixed order is copied with its fleet side only; the split is redone in Trip Planning.
+ * A carrier/truck/trailer/driver that has since been deleted or deactivated is left blank rather
+ * than assigning new work to a record that no longer appears in any picker.
+ */
+exports.prepareOrderCopy = catchAsync(async (req, res, next) => {
+   const tenantId = getTenantId(req);
+   if (!tenantId) return res.status(400).json({ status: false, message: "Tenant context is required." });
+   if (!mongooseLib.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ status: false, code: 'invalid_order_id', message: 'Invalid order id.' });
+   }
+   const criteria = { _id: req.params.id, tenantId, $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
+   await applyOrderReadScope(req, criteria);
+   const src = await Order.findOne(criteria)
+      .populate([
+         { path: 'carrier', select: '_id deletedAt' },
+         { path: 'truck', select: '_id deletedAt' },
+         { path: 'trailer', select: '_id deletedAt isActive' },
+         // The Users pre-find hook hides inactive drivers, so an inactive one populates as null.
+         { path: 'driver', select: '_id' },
+         { path: 'drivers', select: '_id' },
+      ])
+      .lean();
+   if (!src) return res.status(404).json({ status: false, message: 'Order not found.' });
+
+   const live = (doc) => (doc && !doc.deletedAt && doc.isActive !== false ? String(doc._id) : null);
+   const fx = Number(src.fx_to_usd) > 0 ? Number(src.fx_to_usd) : 1;
+   // Typed value when there is one; a legacy order only has the base column, divided back by its
+   // own snapshot rate (base = typed × fx_to_usd).
+   const typed = (inputField, baseField) => {
+      const v = Number(src[inputField] || 0);
+      if (v > 0) return v;
+      return Number((Number(src[baseField] || 0) / fx).toFixed(2));
+   };
+   const backItems = (items, inputTotal, baseTotal) => {
+      const factor = Number(baseTotal) > 0 && Number(inputTotal) > 0 ? Number(inputTotal) / Number(baseTotal) : 1 / fx;
+      return (Array.isArray(items) ? items : []).map((it) => {
+         const { _id, ...rest } = it || {};
+         return { ...rest, rate: Number((Number(rest.rate || 0) * factor).toFixed(2)) };
+      });
+   };
+   const stripIds = (v) => {
+      if (Array.isArray(v)) return v.map(stripIds);
+      if (v && typeof v === 'object' && !(v instanceof Date) && !mongooseLib.Types.ObjectId.isValid(v)) {
+         const out = {};
+         Object.entries(v).forEach(([k, x]) => { if (k !== '_id') out[k] = stripIds(x); });
+         return out;
+      }
+      return v;
+   };
+   const shipping = stripIds(Array.isArray(src.shipping_details) ? src.shipping_details : []).map((b) => ({
+      ...b,
+      locations: (Array.isArray(b?.locations) ? b.locations : [])
+         .filter((l) => String(l?.type || l?.location_type || '').toLowerCase() !== 'relay'),
+   }));
+
+   // A deleted carrier cannot be handed new work, and an outsourcing order without one fails
+   // validation — so the copy is booked unassigned and the response says why.
+   const carrierDropped = src.order_type === 'outsourcing' && !src.isMixedType && !live(src.carrier);
+   const carrierSide = src.order_type === 'outsourcing' && !src.isMixedType && !carrierDropped;
+   const fleetSide = !carrierSide && (src.truck || src.driver || (src.drivers || []).length);
+   const drivers = fleetSide ? (src.drivers || []).map(live).filter(Boolean) : [];
+   const totalTyped = typed('input_total_amount', 'total_amount');
+
+   req.body = {
+      company_name: src.company_name,
+      customer_order_no: src.customer_order_no,
+      shipping_details: shipping,
+      instructions: src.instructions || '',
+      customer: src.customer ? String(src.customer) : null,
+      total_amount: totalTyped,
+      revenue_items: backItems(src.revenue_items, src.input_total_amount, src.total_amount),
+      revenue_currency: String(src.input_currency || src.revenue_currency || BASE_ORDER_CURRENCY).toLowerCase(),
+      carrier: carrierSide ? live(src.carrier) : null,
+      carrier_amount: carrierSide ? typed('input_carrier_amount', 'carrier_amount') : 0,
+      carrier_revenue_items: carrierSide
+         ? backItems(src.carrier_revenue_items, src.input_carrier_amount, src.carrier_amount)
+         : [],
+      order_type: carrierSide ? 'outsourcing' : (carrierDropped ? undefined : 'regular'),
+      truck: fleetSide ? live(src.truck) : null,
+      trailer: fleetSide ? live(src.trailer) : null,
+      drivers,
+      driver: drivers[0] || null,
+      settle_amount: carrierSide ? 0 : typed('input_settle_amount', 'settle_amount'),
+      driver_assignment_mode: src.driver_assignment_mode || 'company_driver',
+      totalDistance: src.totalDistance,
+      route_crosses_border: src.route_crosses_border,
+      route_countries: src.route_countries,
+      distance_source: src.distance_source,
+      route_summary: src.route_summary,
+      route_polyline: src.route_polyline,
+      route_duration_sec: src.route_duration_sec,
+      route_options: src.route_options,
+      order_status: 'added',
+      // A copy repeats the reference on purpose — the duplicate-reference warning exists to catch
+      // an accidental double entry, and this is a deliberate one.
+      confirm_duplicate: true,
+   };
+
+   const company = await Company.findOne({ _id: src.company, tenantId }).lean().catch(() => null);
+   req.orderCopySource = {
+      _id: src._id,
+      serial_no: src.serial_no,
+      orderNo: getOrderNumberServer({ order: src, company, tenantId }),
+      droppedRelayStops: shipping.reduce((n, b, i) => n
+         + ((src.shipping_details?.[i]?.locations || []).length - b.locations.length), 0),
+      wasMixed: !!src.isMixedType,
+      carrierDropped,
+   };
+   next();
+});
+
 exports.create_order = catchAsync(async (req, res, next) => {
    try {
       const tenantId = getTenantId(req);
@@ -835,7 +964,15 @@ exports.create_order = catchAsync(async (req, res, next) => {
       res.json({
          status:true,
          order,
-         message: "Order has been created."
+         copiedFrom: req.orderCopySource || null,
+         message: req.orderCopySource ? `Copied from #${req.orderCopySource.serial_no}.` : "Order has been created."
+      });
+      // After the response: a notification is never a reason for the save to wait or fail.
+      notifyNewOrder({
+         orderId: order._id,
+         tenantId,
+         creator: req.user,
+         copiedFromNo: req.orderCopySource?.orderNo || null,
       });
    } catch (err) {
       // A missing exchange rate is the dispatcher's problem to see, not a 500 — see

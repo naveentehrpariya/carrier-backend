@@ -980,12 +980,40 @@ const resetpassword = catchAsync ( async (req, res, next) => {
   }); 
 });
 
+const MAX_NOTIFICATION_EMAILS = 10;
+// Array or comma/space/semicolon list → lower-cased, de-duplicated addresses, or an error naming the bad one.
+function parseNotificationEmails(value) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(/[,;\s]+/);
+  const emails = [...new Set(raw.map((e) => String(e || '').trim().toLowerCase()).filter(Boolean))];
+  const bad = emails.find((e) => e.length > 254 || !/^[^\s@<>"',;]+@[^\s@<>"',;]+\.[^\s@<>"',;]+$/.test(e));
+  if (bad) return { error: `"${bad}" is not a valid email address.` };
+  if (emails.length > MAX_NOTIFICATION_EMAILS) return { error: `At most ${MAX_NOTIFICATION_EMAILS} addresses can receive new-load emails.` };
+  return { emails };
+}
+
 const addCompanyInfo = catchAsync ( async (req, res, next) => {
   const tenantIdForCompany = req.tenantId || req.user?.tenantId;
   if (!tenantIdForCompany) {
     return res.status(400).json({ status: false, message: "Tenant context is required." });
   }
-  const {name, email, phone, address, companyID, bank_name, account_name, account_number, routing_number, remittance_primary_email, remittance_secondary_email, rate_confirmation_terms, order_prefix, route_country_policy} = req.body;
+  const {name, email, phone, address, companyID, bank_name, account_name, account_number, routing_number, remittance_primary_email, remittance_secondary_email, rate_confirmation_terms, order_prefix, route_country_policy, order_notification_emails} = req.body;
+  // Absent = leave alone; [] or '' clears. A bad address is refused by name rather than dropped —
+  // a silently discarded recipient is a mail nobody notices never arrives.
+  let notifyEmails;
+  if (order_notification_emails !== undefined) {
+    // These addresses receive every load's revenue and profit. The company form itself is open to
+    // any tenant user, so this one field is held to admins — otherwise a driver could add their own
+    // address and read the company's margins.
+    const u = req.user || {};
+    const canSet = u.is_admin === 1 || Number(u.role) === 3 || u.isTenantAdmin === true
+      || (Array.isArray(u.permissions) && u.permissions.includes('subadmin'));
+    if (!canSet) {
+      return res.status(403).json({ status: false, code: 'not_allowed', message: 'Only an admin can change who receives new-load emails.' });
+    }
+    const parsed = parseNotificationEmails(order_notification_emails);
+    if (parsed.error) return res.status(400).json({ status: false, code: 'invalid_email', message: parsed.error });
+    notifyEmails = parsed.emails;
+  }
   if(companyID){
     // Find company by ID and ensure it belongs to the current tenant
     const filter = { _id: companyID, tenantId: tenantIdForCompany };
@@ -1008,6 +1036,7 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
       if (route_country_policy !== undefined) {
         existing.route_country_policy = normalizeRoutePolicy(route_country_policy);
       }
+      if (notifyEmails !== undefined) existing.order_notification_emails = notifyEmails;
       await existing.save();
       logActivity(req, {
         action: 'UPDATE',
@@ -1036,6 +1065,7 @@ const addCompanyInfo = catchAsync ( async (req, res, next) => {
     remittance_secondary_email: remittance_secondary_email,
     rate_confirmation_terms: rate_confirmation_terms,
     route_country_policy: normalizeRoutePolicy(route_country_policy),
+    order_notification_emails: notifyEmails || [],
     tenantId: tenantIdForCompany,
   }).then(result => {
     logActivity(req, {
