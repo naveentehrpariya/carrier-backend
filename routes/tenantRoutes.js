@@ -10,6 +10,7 @@ const {
   ensureTenantContext
 } = require('../middleware/tenantResolver');
 const { validateToken } = require('../controllers/multiTenantAuthController');
+const { requireTenantReportAccess } = require('../middlewares/tenantReportAccess');
 
 // Tenant data filtering middleware - automatically filters all queries by tenantId
 const tenantDataFilter = (req, res, next) => {
@@ -273,7 +274,7 @@ router.post('/getdistance', carrierController.getDistance);
 router.get('/tenant/info', validateToken, tenantAdminController.getTenantInfo);
 router.patch('/tenant/settings', validateToken, tenantAdminController.updateTenantSettings);
 router.get('/tenant/usage', validateToken, tenantAdminController.getTenantUsage);
-router.get('/tenant/analytics', validateToken, tenantAdminController.getTenantAnalytics);
+router.get('/tenant/analytics', validateToken, requireTenantReportAccess, tenantAdminController.getTenantAnalytics);
 router.get('/tenant/billing', validateToken, tenantAdminController.getBillingInfo);
 router.post('/tenant/upgrade-plan', validateToken, tenantAdminController.upgradePlan);
 
@@ -289,11 +290,11 @@ router.post('/tenant/integrations/:type/configure', validateToken, tenantAdminCo
 router.delete('/tenant/integrations/:type', validateToken, tenantAdminController.removeIntegration);
 
 // Tenant reports and exports
-router.get('/tenant/reports/orders', validateToken, tenantAdminController.getOrdersReport);
-router.get('/tenant/reports/customers', validateToken, tenantAdminController.getCustomersReport);
-router.get('/tenant/reports/carriers', validateToken, tenantAdminController.getCarriersReport);
-router.get('/tenant/reports/financial', validateToken, tenantAdminController.getFinancialReport);
-router.post('/tenant/reports/export', validateToken, tenantAdminController.exportData);
+router.get('/tenant/reports/orders', validateToken, requireTenantReportAccess, tenantAdminController.getOrdersReport);
+router.get('/tenant/reports/customers', validateToken, requireTenantReportAccess, tenantAdminController.getCustomersReport);
+router.get('/tenant/reports/carriers', validateToken, requireTenantReportAccess, tenantAdminController.getCarriersReport);
+router.get('/tenant/reports/financial', validateToken, requireTenantReportAccess, tenantAdminController.getFinancialReport);
+router.post('/tenant/reports/export', validateToken, requireTenantReportAccess, tenantAdminController.exportData);
 
 router.patch('/admin/users/:id/modules', validateToken, async (req, res) => {
   try {

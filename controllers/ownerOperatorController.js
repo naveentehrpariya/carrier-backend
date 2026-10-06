@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { ownerAutoChargeReview, syncOwnerAutoCharges } = require('../utils/ownerAutoCharges');
 const { ORDER_SHAPE_FIELDS } = require('../utils/orderParty');
 const https = require('https');
 const puppeteer = require('puppeteer');
@@ -605,8 +606,19 @@ exports.ownerOperatorListings = catchAsync(async (req, res, next) => {
     const filter = { tenantId, ...normalizeDeletedFilter() };
     if (companyId) filter.company = companyId;
     if (status === 'active' || status === 'inactive') filter.status = status;
+    const truckNotDeleted = { $or: [{ deletedAt: null }, { deletedAt: { $exists: false } }] };
     if (search && String(search).trim().length > 0) {
       const q = escapeRegex(String(search).trim());
+      // An owner is usually looked up by the truck they run ("who owns 1313?"), so a truck
+      // number / unit / plate hit finds its owner too.
+      const truckHits = await Truck.find({
+        tenantId, ownerOperator: { $ne: null }, ...truckNotDeleted,
+        $and: [{ $or: [
+          { truckNumber: { $regex: q, $options: 'i' } },
+          { unitNumber: { $regex: q, $options: 'i' } },
+          { plateNumber: { $regex: q, $options: 'i' } },
+        ] }],
+      }).select('ownerOperator').limit(200).lean();
       filter.$and = filter.$and || [];
       filter.$and.push({
         $or: [
@@ -615,6 +627,7 @@ exports.ownerOperatorListings = catchAsync(async (req, res, next) => {
           { email: { $regex: q, $options: 'i' } },
           { phone: { $regex: q, $options: 'i' } },
           { ownerOperatorId: { $regex: q, $options: 'i' } },
+          ...(truckHits.length ? [{ _id: { $in: truckHits.map((t) => t.ownerOperator) } }] : []),
         ],
       });
     }
@@ -622,6 +635,21 @@ exports.ownerOperatorListings = catchAsync(async (req, res, next) => {
     const sort = {};
     sort[sortBy] = String(sortOrder).toLowerCase() === 'asc' ? 1 : -1;
     const lists = await OwnerOperator.find(filter).sort(sort).lean();
+
+    // The trucks each owner runs, in one query (client, 2026-08-28: the owner list must show which
+    // trucks are theirs — one row per owner, all of their trucks in a column).
+    if (lists.length) {
+      const trucks = await Truck.find({
+        tenantId, ownerOperator: { $in: lists.map((o) => o._id) }, ...truckNotDeleted,
+      }).select('truckNumber unitNumber plateNumber ownerOperator').sort({ truckNumber: 1 }).lean();
+      const byOwner = new Map();
+      trucks.forEach((t) => {
+        const k = String(t.ownerOperator);
+        if (!byOwner.has(k)) byOwner.set(k, []);
+        byOwner.get(k).push({ _id: t._id, truckNumber: t.truckNumber || t.unitNumber || '', plateNumber: t.plateNumber || '' });
+      });
+      lists.forEach((o) => { o.trucks = byOwner.get(String(o._id)) || []; });
+    }
     return res.json({ status: true, lists, totalDocuments: lists.length });
   } catch (err) {
     JSONerror(res, err, next);
@@ -1033,6 +1061,24 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
       return res.json({ status: true, message: 'No owner operators found for salary generation', salaries: [] });
     }
 
+    // Fixed truck expenses and our driver's empty miles are charged to the owner automatically,
+    // and are reviewed BEFORE generating (client, 2026-10-06). When any owner in this run has
+    // something to review, generating requires the confirmation.
+    const reviewed = req.body?.autoChargesReviewed === true || req.body?.autoChargesReviewed === 'true';
+    const reviews = new Map();
+    for (const owner of ownerOperators) {
+      reviews.set(String(owner._id), await ownerAutoChargeReview(tenantId, owner._id, range));
+    }
+    const toReview = [...reviews.values()].reduce((a, r) => a + r.itemCount, 0);
+    if (toReview > 0 && !reviewed) {
+      return res.status(409).json({
+        status: false,
+        code: 'auto_charges_not_reviewed',
+        message: `Check the ${toReview} fixed expense / empty move line${toReview === 1 ? '' : 's'} for this month and tick "I have checked these" before generating the payslip.`,
+        items: toReview,
+      });
+    }
+
     const ownerIds = ownerOperators.map((o) => o._id);
     const orders = await Order.find({
       tenantId,
@@ -1118,6 +1164,11 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
       // into this one BEFORE the ledger is summed, so the payslip is complete on generate
       // instead of waiting for someone to remember.
       await syncRecurringAdjustments(tenantId, owner._id, range.month, range.year, req.user?._id);
+      const review = reviews.get(String(owner._id));
+      await syncOwnerAutoCharges({
+        tenantId, company: req.user?.company?._id || req.user?.company || null,
+        ownerId: owner._id, range, review, userId: req.user?._id,
+      });
       // Immediately previous month only (not any prior month) so a skipped/old due isn't
       // repeatedly carried forward. Matches the driver salary carry-forward semantics.
       const prevRange = buildDateRange(range.month === 1 ? 12 : range.month - 1, range.month === 1 ? range.year - 1 : range.year);
@@ -1195,6 +1246,8 @@ exports.generateMonthlySalary = catchAsync(async (req, res, next) => {
         orderBreakdown: breakdown,
         generatedAt: new Date(),
         generatedBy: req.user?._id,
+        autoChargesReviewedAt: review.itemCount > 0 ? new Date() : null,
+        autoChargesReviewedBy: review.itemCount > 0 ? (req.user?._id || null) : null,
       };
 
       const salary = await OwnerOperatorSalary.findOneAndUpdate(
@@ -2365,6 +2418,17 @@ exports.updateSalaryAdjustment = catchAsync(async (req, res, next) => {
 
     const adjustment = await OwnerAdjustment.findOne({ _id: req.params.id, tenantId, ...normalizeDeletedFilter() });
     if (!adjustment) return res.status(404).json({ status: false, message: 'Adjustment not found' });
+    // A line the system wrote (fixed truck expense / our driver's empty miles) is changed in the
+    // review panel, not here — two editable copies of one fact is how they start to disagree.
+    if (adjustment.autoSource) {
+      return res.status(400).json({
+        status: false,
+        code: 'auto_generated_row',
+        message: adjustment.autoSource === 'empty_move'
+          ? 'This empty-miles line comes from the driver\'s empty moves. Remove the move in the review panel above Generate, then regenerate.'
+          : 'This line comes from the truck\'s fixed monthly expenses. Remove it in the review panel above Generate (or edit the truck), then regenerate.',
+      });
+    }
 
     const parsed = parseAdjustmentBody({ ...req.body, kind: req.body?.kind || adjustment.kind });
     if (parsed.error) return res.status(400).json({ status: false, message: parsed.error });
@@ -2435,6 +2499,17 @@ exports.removeSalaryAdjustment = catchAsync(async (req, res, next) => {
 
     const adjustment = await OwnerAdjustment.findOne({ _id: req.params.id, tenantId, ...normalizeDeletedFilter() });
     if (!adjustment) return res.status(404).json({ status: false, message: 'Adjustment not found' });
+    // A line the system wrote (fixed truck expense / our driver's empty miles) is changed in the
+    // review panel, not here — two editable copies of one fact is how they start to disagree.
+    if (adjustment.autoSource) {
+      return res.status(400).json({
+        status: false,
+        code: 'auto_generated_row',
+        message: adjustment.autoSource === 'empty_move'
+          ? 'This empty-miles line comes from the driver\'s empty moves. Remove the move in the review panel above Generate, then regenerate.'
+          : 'This line comes from the truck\'s fixed monthly expenses. Remove it in the review panel above Generate (or edit the truck), then regenerate.',
+      });
+    }
 
     const ctx = await resolveAdjustmentContext(
       req, tenantId, adjustment.ownerOperator, adjustment.month, adjustment.year, adjustment.currency
@@ -3248,6 +3323,67 @@ exports.removeSalaryPaymentRecord = catchAsync(async (req, res, next) => {
     const result = await removeOwnerPaymentRecordCore(req, req.params.id);
     if (!result.ok) return res.status(result.status).json(result.body);
     return res.json({ status: true, message: 'Payment reversed', salary: result.salary, totals: result.totals });
+  } catch (err) {
+    JSONerror(res, err, next);
+    logger(err);
+  }
+});
+
+
+// GET /owner-operators/salary/review?ownerOperatorId&month&year
+// What will be charged to this owner automatically when the payslip is generated: the fixed
+// monthly expenses of their trucks and our driver's empty miles on them — each with whether it
+// has been taken off. Feeds the review panel above Generate.
+exports.salaryAutoChargeReview = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasOwnerOperatorAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to view owner operator salary' });
+    }
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
+    const { ownerOperatorId } = req.query || {};
+    if (!ownerOperatorId || !mongoose.Types.ObjectId.isValid(String(ownerOperatorId))) {
+      return res.status(400).json({ status: false, message: 'ownerOperatorId is required' });
+    }
+    const range = buildDateRange(req.query?.month, req.query?.year);
+    if (!range) return res.status(400).json({ status: false, message: 'Valid month and year are required' });
+    const owner = await OwnerOperator.findOne({ _id: ownerOperatorId, tenantId, ...normalizeDeletedFilter() }).select('_id').lean();
+    if (!owner) return res.status(404).json({ status: false, message: 'Owner operator not found' });
+    const review = await ownerAutoChargeReview(tenantId, owner._id, range);
+    return res.json({ status: true, ...review });
+  } catch (err) {
+    JSONerror(res, err, next);
+    logger(err);
+  }
+});
+
+// POST /owner-operators/salary/fixed-expense/exclude { expenseId, excluded }
+// Takes one fixed truck expense off the owner's payslip (or puts it back). The expense itself is
+// untouched and still counts against the truck's own earnings.
+exports.setFixedExpenseExcluded = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasOwnerOperatorAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to change owner operator salary' });
+    }
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
+    const { expenseId } = req.body || {};
+    if (typeof expenseId !== 'string' || !mongoose.Types.ObjectId.isValid(expenseId)) {
+      return res.status(400).json({ status: false, message: 'expenseId is required' });
+    }
+    const excluded = req.body?.excluded === true || req.body?.excluded === 'true';
+    const TruckExpense = require('../db/TruckExpense');
+    const before = await TruckExpense.findOne({ _id: expenseId, tenantId, isFixed: true, deletedAt: null }).lean();
+    if (!before) return res.status(404).json({ status: false, message: 'Fixed expense not found' });
+    const after = await TruckExpense.findOneAndUpdate(
+      { _id: expenseId, tenantId }, { $set: { excludeFromOwnerPay: excluded } }, { new: true }
+    ).lean();
+    logActivity(req, {
+      action: 'UPDATE', module: 'payroll',
+      description: `${excluded ? 'Removed' : 'Restored'} a fixed ${before.type} expense on the owner payslip`,
+      details: { expenseId, truck: before.truck, excluded, amount: before.amount, currency: before.currency },
+    });
+    return res.json({ status: true, excluded: !!after.excludeFromOwnerPay, message: excluded ? 'Removed from the owner payslip.' : 'Restored on the owner payslip.' });
   } catch (err) {
     JSONerror(res, err, next);
     logger(err);

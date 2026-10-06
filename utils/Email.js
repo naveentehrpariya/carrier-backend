@@ -1,23 +1,35 @@
 const nodemailer = require('nodemailer');
+// SMTP_* (e.g. Gmail with an app password) wins when set; otherwise the original
+// Hostinger mailbox via EMAIL_*. Gmail refuses a From that is not the account.
+function transportOptions() {
+   if (process.env.SMTP_HOST && process.env.SMTP_USER) {
+      const port = Number(process.env.SMTP_PORT) || 587;
+      return {
+         host: process.env.SMTP_HOST,
+         port,
+         secure: port === 465,
+         auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+         tls: { rejectUnauthorized: process.env.EMAIL_TLS_INSECURE !== 'true' },
+      };
+   }
+   return {
+      host: 'smtp.hostinger.com',
+      port: 587,
+      secure: false,
+      auth: { user: process.env.EMAIL_USERNAME, pass: process.env.EMAIL_PASSWORD },
+      // Verify the server's certificate: this connection carries the mailbox
+      // password. EMAIL_TLS_INSECURE=true restores the old unverified behaviour.
+      tls: { rejectUnauthorized: process.env.EMAIL_TLS_INSECURE !== 'true' },
+   };
+}
+
+const isEmailConfigured = () => Boolean((process.env.SMTP_HOST && process.env.SMTP_USER) || (process.env.EMAIL_USERNAME && process.env.EMAIL_PASSWORD));
+
 const sendEmail = async (options) => { 
    try {
-      const transporter = nodemailer.createTransport({
-         host: 'smtp.hostinger.com', // Use your Hostinger SMTP server address
-         port: 587, // Usually 587 for TLS or 465 for SSL
-         secure: false, // Set to true if using port 465
-         auth: {
-           user: process.env.EMAIL_USERNAME, // Your Hostinger email username
-           pass: process.env.EMAIL_PASSWORD, // Your Hostinger email password
-         },
-         // Verify the server's certificate: this connection carries the mailbox
-         // password. EMAIL_TLS_INSECURE=true restores the old behaviour for a server
-         // whose certificate cannot be verified — never the default.
-         tls: {
-           rejectUnauthorized: process.env.EMAIL_TLS_INSECURE !== 'true',
-         },
-       });
+      const transporter = nodemailer.createTransport(transportOptions());
       const mailOptions = { 
-         from: process.env.EMAIL_FROM,
+         from: process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER,
          to: options.email,
          subject: options.subject,
          html: options.message,
@@ -42,3 +54,4 @@ const sendEmail = async (options) => {
 };
 
 module.exports = sendEmail;
+module.exports.isEmailConfigured = isEmailConfigured;

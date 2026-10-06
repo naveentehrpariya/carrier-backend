@@ -619,13 +619,17 @@ async function run() {
     assert.ok(!/Line Haul/.test(rows[0].label), 'the order-level line belongs to the whole cost');
   });
 
-  await t('the number is deterministic and names the leg', async () => {
+  await t('the number is the order number, deterministic, and names the leg only when split', async () => {
     const order = { serial_no: 1013 };
     const company = { order_prefix: 'CMC' };
-    const a = buildRateConNo({ order, trip: { trip_no: 2 }, company, tenantId: 't' });
-    const b = buildRateConNo({ order, trip: { trip_no: 2 }, company, tenantId: 't' });
+    const single = buildRateConNo({ order, trip: { trip_no: 2 }, company, tenantId: 't' });
+    assert.strictEqual(single, 'CMC-1013', 'one carrier leg: the rate-con carries the order number itself');
+    const a = buildRateConNo({ order, trip: { trip_no: 2 }, company, tenantId: 't', carrierLegCount: 2 });
+    const b = buildRateConNo({ order, trip: { trip_no: 2 }, company, tenantId: 't', carrierLegCount: 2 });
     assert.strictEqual(a, b, 'the same leg must always carry the same number');
-    assert.strictEqual(a, 'CMC-1013-L2');
+    assert.strictEqual(a, 'CMC-1013-L2', 'two carrier legs: the leg is named so the carriers can tell them apart');
+    const { buildInvoiceNo } = require('../utils/invoiceHtml');
+    assert.strictEqual(buildInvoiceNo(order, { company, tenantId: 't' }), 'CMC-1013', 'invoice number = order number');
   });
 
   await t('the order number uses the tenant\'s own prefix, never a hardcoded one', async () => {

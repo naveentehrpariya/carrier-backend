@@ -72,6 +72,8 @@ const schema = new mongoose.Schema({
        default: Date.now
    },
    deletedAt: {type: Date},
+   // Set when the carrier was created from a signed setup packet.
+   onboarding: { type: mongoose.Schema.Types.ObjectId, ref: 'carrier_onboardings', default: null },
    created_by: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
 },{
     toJSON: { virtuals: true },

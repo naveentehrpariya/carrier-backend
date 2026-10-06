@@ -66,6 +66,10 @@ const ownerOperatorSalarySchema = new mongoose.Schema(
     orderBreakdown: [orderBreakdownSchema],
     generatedAt: { type: Date, default: Date.now },
     generatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
+    // Who confirmed the auto charges (fixed truck expenses + our driver's empty miles) were checked
+    // before this payslip was generated, and when (client, 2026-10-06).
+    autoChargesReviewedAt: { type: Date, default: null },
+    autoChargesReviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users', default: null },
     notes: { type: String, default: '' },
   },
   {

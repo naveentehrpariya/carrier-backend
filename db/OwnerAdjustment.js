@@ -50,6 +50,13 @@ const ownerAdjustmentSchema = new mongoose.Schema(
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
     // Soft delete, like the rest of the app. A hard delete would silently rewrite a
     // payslip a client already received with no trace of what was removed.
+    // Lines the system writes itself at generate time (client, 2026-10-06): the truck's fixed
+    // monthly expenses and our driver's empty-mile pay on this owner's truck. `autoKey` makes the
+    // sync idempotent and retractable — `fixed:<truckExpenseId>` / `empty:<driverId>_<after>_<before>`.
+    // They are not editable from the ledger; they are taken off in the review panel instead.
+    autoSource: { type: String, enum: [null, 'truck_fixed_expense', 'empty_move'], default: null },
+    autoKey: { type: String, default: null },
+    truckExpense: { type: mongoose.Schema.Types.ObjectId, ref: 'truckexpenses', default: null },
     deletedAt: { type: Date, default: null, index: true },
   },
   { timestamps: true }
@@ -57,5 +64,6 @@ const ownerAdjustmentSchema = new mongoose.Schema(
 
 ownerAdjustmentSchema.index({ tenantId: 1, ownerOperator: 1, year: 1, month: 1, deletedAt: 1 });
 ownerAdjustmentSchema.index({ tenantId: 1, salary: 1 });
+ownerAdjustmentSchema.index({ tenantId: 1, ownerOperator: 1, autoKey: 1 });
 
 module.exports = mongoose.model('owneradjustments', ownerAdjustmentSchema);

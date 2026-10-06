@@ -47,6 +47,20 @@ async function launchBrowser(options = {}) {
   try {
     return await puppeteer.launch(launchOptions);
   } catch (err) {
+    // A system Chrome that EXISTS can still refuse to start: the snap Chromium on the API box
+    // began hanging the DevTools socket ("socket hang up") after a snapd auto-refresh, and every
+    // PDF route answered 500 while a working bundled build sat unused in ~/.cache/puppeteer.
+    // So a failed system launch gets one more try on Puppeteer's own build before giving up.
+    if (executablePath) {
+      console.error(`[puppeteer] ${executablePath} failed to launch (${err?.message}); retrying with the bundled Chrome`);
+      try {
+        const { executablePath: _dropped, ...bundled } = launchOptions;
+        return await puppeteer.launch(bundled);
+      } catch (bundledErr) {
+        console.error(`[puppeteer] bundled Chrome failed too: ${bundledErr?.message}`);
+        throw err;
+      }
+    }
     // Bundled build missing AND nothing found above: say what to do instead of leaking the
     // "Could not find Chrome" stack to the user.
     if (!executablePath && /Could not find Chrome|Browser was not found/i.test(String(err?.message || ''))) {

@@ -7,6 +7,7 @@ const Carrier = require('../db/Carrier');
 const Customer = require('../db/Customer');
 const Users = require('../db/Users');
 const OwnerOperator = require('../db/OwnerOperator');
+const DriverProfile = require('../db/DriverProfile');
 const Counter = require('../db/Counter');
 const BankAccount = require('../db/BankAccount');
 const ChequeApplication = require('../db/ChequeApplication');
@@ -69,11 +70,14 @@ const PAYEE_RESOLVERS = {
       // flagged so nobody picks a leaver by accident.
       const rows = await Users.find({ tenantId, permissions: 'driver', ...notDeletedUser })
         .setOptions({ includeInactive: true }).sort({ name: 1 }).lean();
-      return rows.map(personPayee);
+      const corps = await driverCorpNames(tenantId, rows.map((u) => u._id));
+      return rows.map((u) => withDriverCorp(personPayee(u), corps.get(String(u._id))));
     },
     async one(tenantId, id) {
       const u = await Users.findOne({ _id: id, tenantId, permissions: 'driver' }).setOptions({ includeInactive: true }).lean();
-      return u && { name: u.name, address: joinAddress([u.address]).join('\n') };
+      if (!u) return null;
+      const corps = await driverCorpNames(tenantId, [u._id]);
+      return withDriverCorp({ name: u.name, address: joinAddress([u.address]).join('\n') }, corps.get(String(u._id)), { asPrinted: true });
     },
   },
   employee: {
@@ -116,6 +120,43 @@ const personPayee = (u) => ({
   address: joinAddress([u.address]).join('\n'),
   inactive: u.status !== 'active',
 });
+
+// A driver who charges HST invoices us under their corporation, so the cheque is payable to that
+// corporation, not to the person (client, 2026-08-28: "if he takes HST the cheque is in his
+// company's name, otherwise in his own"). The person's name is kept beside it so the operator can
+// switch back on the cheque form.
+async function driverCorpNames(tenantId, userIds) {
+  const profiles = await DriverProfile.find({ tenantId, user: { $in: userIds }, taxEnabled: true })
+    .select('user taxCompanyName').lean();
+  const map = new Map();
+  profiles.forEach((p) => {
+    const corp = String(p.taxCompanyName || '').trim();
+    if (corp) map.set(String(p.user), corp);
+  });
+  return map;
+}
+// `printName` is what the cheque defaults to. In a picker the person stays the label (`name`) so
+// the dispatcher finds the driver they know; on a resolved payee (`asPrinted`) the name IS the
+// printed one, because that is what a cheque saved without an override must carry.
+function withDriverCorp(payee, corpName, { asPrinted = false } = {}) {
+  if (!corpName) return payee;
+  const out = { ...payee, personName: payee.name, corpName, printName: corpName };
+  if (asPrinted) out.name = corpName;
+  else out.sub = corpName;
+  return out;
+}
+
+// The name printed on the cheque may be overridden by the operator (a driver's corporation, a
+// trading name, "John Smith o/a Smith Trucking"). Blank means "use the payee's own name".
+const PRINT_NAME_MAX = 120;
+const PRINT_ADDRESS_MAX = 400;
+function cleanPrintName(v) {
+  return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, PRINT_NAME_MAX);
+}
+function cleanPrintAddress(v) {
+  return String(v == null ? '' : v).split('\n').map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean).join('\n').slice(0, PRINT_ADDRESS_MAX);
+}
 
 function addr(r) {
   const line2 = joinAddress([r.city, r.state, r.zipcode]).join(' ');
@@ -274,8 +315,8 @@ exports.createCheque = catchAsync(async (req, res) => {
     company: req.user?.company?._id || req.user?.company || null,
     payeeType,
     payeeId,
-    payeeName: payee.name,
-    payeeAddress: payee.address || '',
+    payeeName: cleanPrintName(req.body.payeeName) || payee.name,
+    payeeAddress: req.body.payeeAddress !== undefined ? cleanPrintAddress(req.body.payeeAddress) : (payee.address || ''),
     bankAccount: accountId,
     chequeNo,
     referenceNo: referenceNo || '',
@@ -488,7 +529,14 @@ exports.updateCheque = catchAsync(async (req, res) => {
     const periodError = checkPeriod(from, to);
     if (periodError) return res.status(400).json({ status: false, code: 'period_backwards', message: periodError });
   }
-  // payee is never editable — void and re-issue instead.
+  // WHO is paid (payeeType/payeeId) is never editable — void and re-issue instead. The name and
+  // address PRINTED on an issued cheque are, e.g. switching a driver's cheque to their corporation.
+  if (req.body.payeeName !== undefined) {
+    const name = cleanPrintName(req.body.payeeName);
+    if (!name) return res.status(400).json({ status: false, code: 'payee_name_required', message: 'The name on the cheque cannot be empty.' });
+    update.payeeName = name;
+  }
+  if (req.body.payeeAddress !== undefined) update.payeeAddress = cleanPrintAddress(req.body.payeeAddress);
 
   let cheque;
   try {

@@ -39,6 +39,7 @@ const {
 
 const { validateToken, emulateEmployee, stopEmployeeEmulation } = require('../controllers/multiTenantAuthController');
 const { resolveTenant } = require('../middleware/tenant');
+const { requireTenantReportAccess } = require('../middlewares/tenantReportAccess');
 
 // Apply middleware to all tenant admin routes (emulation-aware)
 router.use(validateToken);
@@ -53,7 +54,7 @@ router.get('/info', getTenantInfo);
 router.get('/subscription', getSubscriptionDetails);
 router.put('/settings', updateTenantSettings);
 router.get('/usage', getTenantUsage);
-router.get('/analytics', getTenantAnalytics);
+router.get('/analytics', requireTenantReportAccess, getTenantAnalytics);
 
 // Billing & Subscription Routes
 router.get('/billing', getBillingInfo);
@@ -85,14 +86,14 @@ router.get('/activity-logs/export', exportActivityLogs);
 router.get('/activity-logs/resource/:module/:id', getResourceHistory);
 
 // Reports Routes
-router.get('/reports/orders', getOrdersReport);
-router.get('/reports/customers', getCustomersReport);
-router.get('/reports/carriers', getCarriersReport);
-router.get('/reports/financial', getFinancialReport);
-router.post('/export', exportData);
+router.get('/reports/orders', requireTenantReportAccess, getOrdersReport);
+router.get('/reports/customers', requireTenantReportAccess, getCustomersReport);
+router.get('/reports/carriers', requireTenantReportAccess, getCarriersReport);
+router.get('/reports/financial', requireTenantReportAccess, getFinancialReport);
+router.post('/export', requireTenantReportAccess, exportData);
 
 // Finance Report Routes
-router.get('/finance/report', getFinanceReport);
-router.get('/finance/report/pdf', getFinanceReportPdf);
+router.get('/finance/report', requireTenantReportAccess, getFinanceReport);
+router.get('/finance/report/pdf', requireTenantReportAccess, getFinanceReportPdf);
 
 module.exports = router;

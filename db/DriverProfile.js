@@ -48,6 +48,9 @@ const driverProfileSchema = new mongoose.Schema({
   ratePerMile: { type: Number, default: 0 },
   ratePerMileSolo: { type: Number, default: 0 },
   ratePerMileTeam: { type: Number, default: 0 },
+  // Pay per EMPTY mile (truck driving between loads with nothing on it), in rateCurrency.
+  // null/0 ⇒ the solo rate is used — see utils/emptyMovePay.js#emptyRateFor.
+  ratePerEmptyMile: { type: Number, default: null },
   cityHoursRate: { type: Number, default: 0 },
   // Contractor tax (HST/GST). An incorporated driver registered for HST invoices the company
   // under their corp name and charges tax on top of earnings; the payslip must print the HST

@@ -261,6 +261,40 @@ async function run() {
     assert.strictEqual(res.body.code, 'leg_party_locked');
   });
 
+  console.log('\n══ driver / carrier instructions ══\n');
+
+  await t('instructions are saved, edited and cleared through the order form', async () => {
+    const o = await outsourcingOrder();
+    let r = await edit(o, { instructions: 'Call 30 min before arrival.\nNo lumper.' });
+    assert.strictEqual(r.statusCode, 200, r.body?.message);
+    assert.strictEqual((await Order.findById(o._id).lean()).instructions, 'Call 30 min before arrival.\nNo lumper.');
+    r = await edit(o, { instructions: '' });
+    assert.strictEqual(r.statusCode, 200, r.body?.message);
+    assert.strictEqual((await Order.findById(o._id).lean()).instructions, '');
+  });
+
+  await t('a save that does not mention instructions leaves them alone', async () => {
+    const o = await outsourcingOrder();
+    await edit(o, { instructions: 'Seal must stay intact' });
+    await edit(o, { customer_order_no: 'unrelated' });
+    assert.strictEqual((await Order.findById(o._id).lean()).instructions, 'Seal must stay intact');
+  });
+
+  await t('more than 2000 characters is refused, nothing written', async () => {
+    const o = await outsourcingOrder();
+    const r = await edit(o, { instructions: 'x'.repeat(2001) });
+    assert.notStrictEqual(r.statusCode, 200, 'an over-long instruction was accepted');
+    assert.ok(!(await Order.findById(o._id).lean()).instructions);
+  });
+
+  await t('instructions are on the audit trail', async () => {
+    global.__audit = [];
+    const o = await outsourcingOrder();
+    await edit(o, { instructions: 'Dock 4 only' });
+    const e = global.__audit.find((a) => a.model === 'Order');
+    assert.ok(e && e.after.instructions === 'Dock 4 only', 'the change left no trail');
+  });
+
   console.log(`\n${pass} passed, ${fail} failed\n`);
   if (fail) failures.forEach(([n, m]) => console.log(`  - ${n}\n      ${m}`));
   await mongoose.connection.dropDatabase();

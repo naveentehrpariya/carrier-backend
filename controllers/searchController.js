@@ -8,6 +8,7 @@ const DriverProfile = require('../db/DriverProfile');
 const OwnerOperator = require('../db/OwnerOperator');
 const Vendor = require('../db/Vendor');
 const { hasChequeAccess } = require('./vendorController');
+const { orderReadClause } = require('../utils/orderVisibility');
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -525,6 +526,10 @@ exports.globalSearch = async (req, res) => {
       else if (orderTypes.length === 0) orderQuery.order_type = 'none';
 
       orderQuery.$and = [];
+      // Same read scope as the order list. Without it, searching a carrier or driver name
+      // listed every load on it — customer, amount and all — to any employee.
+      const readClause = await orderReadClause(req);
+      if (readClause) orderQuery.$and.push(readClause);
       if (companyId) {
         orderQuery.$and.push({
           $or: [{ company: companyId }, { company: null }, { company: { $exists: false } }]

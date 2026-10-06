@@ -1310,7 +1310,7 @@ exports.sendFuelOutput = catchAsync(async (req, res) => {
 
   // A server with no mailbox configured must say so, not throw a 500 the sender reads
   // as "the app is broken".
-  if (!process.env.EMAIL_USERNAME || !process.env.EMAIL_PASSWORD || !process.env.EMAIL_FROM) {
+  if (!require('../utils/Email').isEmailConfigured()) {
     return res.status(400).json({
       status: false, code: 'email_not_configured',
       message: 'This server has no outgoing mailbox configured, so the sheet cannot be emailed from here. Download it and send it yourself, or ask for EMAIL_USERNAME / EMAIL_PASSWORD / EMAIL_FROM to be set.',

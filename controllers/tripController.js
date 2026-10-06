@@ -21,6 +21,19 @@ const { resyncOrderFromLegs, loadOrderLegsAndTrucks } = require('../utils/orderF
 const { createOrderFxConverter, resolveDisplayCurrency, pickOrderAmount } = require('../utils/orderMoney');
 const { resolveRouteDistance } = require('../utils/routeDistance');
 const driverSalaryController = require('./driverSalaryController');
+const { canReadOrder, orderSeesAll } = require('../utils/orderVisibility');
+
+// Truck / driver trip logs list every load that truck or driver ran — order numbers, stops,
+// customer and gross. Whose work that is depends on who booked each load, so the logs are for
+// privileged users (admin / sub-admin / accounting); a driver may read their own.
+function canReadTripLogs(req, driverId) {
+    if (orderSeesAll(req)) return true;
+    return Boolean(driverId && req.user?._id && String(req.user._id) === String(driverId));
+}
+const tripLogsForbidden = (res) => res.status(403).json({
+    status: false, forbidden: true,
+    message: "You don't have permission to view these trip logs.",
+});
 
 const emptyDistanceCache = new Map();
 
@@ -482,6 +495,16 @@ exports.getOrderTrips = async (req, res) => {
     try {
         const { orderId } = req.params;
         const tenantId = req.user.tenantId;
+        if (!mongoose.Types.ObjectId.isValid(orderId)) {
+            return res.status(400).json({ status: false, message: 'Invalid order id.' });
+        }
+
+        // Legs carry the carrier, its rate and driver pay — same visibility as the order itself.
+        const scopeOrder = await Order.findOne({ _id: orderId, tenantId })
+            .select('created_by customer driver drivers').lean();
+        if (!scopeOrder || !(await canReadOrder(req, scopeOrder))) {
+            return res.status(403).json({ status: false, forbidden: true, trips: [], message: "You don't have permission to view this order." });
+        }
 
         const trips = await Trip.find({ order: orderId, tenantId, deletedAt: null })
             .populate('driver', 'name email corporateID phone')
@@ -665,6 +688,7 @@ exports.getDriverTrips = async (req, res) => {
         const { driverId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
+        if (!canReadTripLogs(req, driverId)) return tripLogsForbidden(res);
         const filter = { tenantId, drivers: driverId, deletedAt: null };
         if (from || to) {
             filter.createdAt = {};
@@ -794,6 +818,7 @@ exports.getTruckTripLogs = async (req, res) => {
         const { truckId } = req.params;
         const { from, to, limit, includeEmptyMiles } = req.query;
         const tenantId = req.user.tenantId;
+        if (!canReadTripLogs(req, null)) return tripLogsForbidden(res);
         const companyId = normalizeCompanyId(req);
 
         const filter = { tenantId, truck: truckId, deletedAt: null };
@@ -863,6 +888,7 @@ exports.getDriverTripLogs = async (req, res) => {
         const { driverId } = req.params;
         const { from, to, limit, includeEmptyMiles } = req.query;
         const tenantId = req.user.tenantId;
+        if (!canReadTripLogs(req, driverId)) return tripLogsForbidden(res);
         const companyId = normalizeCompanyId(req);
 
         const driverObjId = new mongoose.Types.ObjectId(driverId);
@@ -937,6 +963,7 @@ exports.getDriverTripSummary = async (req, res) => {
         const { driverId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
+        if (!canReadTripLogs(req, driverId)) return tripLogsForbidden(res);
 
         // Reuse the single driver-pay engine (real miles from order KM, order-month attribution,
         // all-trips proportioning denominator) so this matches the saved driver salary + owner payslip.
@@ -988,6 +1015,7 @@ exports.getTruckTripSummary = async (req, res) => {
         const { truckId } = req.params;
         const { from, to } = req.query;
         const tenantId = req.user.tenantId;
+        if (!canReadTripLogs(req, null)) return tripLogsForbidden(res);
         const companyId = normalizeCompanyId(req);
         
         const match = { tenantId, truck: new mongoose.Types.ObjectId(truckId), deletedAt: null };
@@ -1652,6 +1680,10 @@ exports.legRateConfirmationPdf = async (req, res) => {
         if (!order) {
             return res.status(404).json({ status: false, message: 'Order not found.' });
         }
+        // Names the customer, the carrier and the rate — only for someone who may read the order.
+        if (!(await canReadOrder(req, order))) {
+            return res.status(403).json({ status: false, message: "You don't have permission to view this order." });
+        }
 
         // The leg must belong to THIS order — never trust the trip id alone to carry the scope.
         const trip = await Trip.findOne({ _id: req.params.tripId, order: order._id, tenantId, deletedAt: null })
@@ -1691,7 +1723,8 @@ exports.legRateConfirmationPdf = async (req, res) => {
         const logoBase64 = await resolveCompanyLogoBase64(company);
 
         const issuedAt = new Date();
-        const rateConNo = buildRateConNo({ order, trip, company, tenantId });
+        const carrierLegCount = allLegs.filter((t) => t.carrier).length;
+        const rateConNo = buildRateConNo({ order, trip, company, tenantId, carrierLegCount });
         const html = buildRateConHtml({
             order, trip, company, rateConNo, issuedAt, logoBase64, legMiles, isPartial, tenantId,
         });
@@ -1740,3 +1773,8 @@ exports.legRateConfirmationPdf = async (req, res) => {
 };
 
 exports._canDownloadRateCon = canDownloadRateCon;
+
+// Shared with utils/emptyMovePay.js, which builds the empty moves a payslip pays for. One
+// definition of "what is an empty move" — the logs, the driver payslip and the owner deduction
+// must never disagree about which gaps exist.
+exports._emptyMoveHelpers = { withEmptyMoves, buildOrderRawTotals, getMilesBetweenLocations };

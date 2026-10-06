@@ -22,6 +22,8 @@ const ADJUSTMENT_CATEGORIES = {
     { value: 'advance', label: 'Advance' },
     { value: 'fuel', label: 'Fuel' },
     { value: 'insurance', label: 'Insurance' },
+    { value: 'parking', label: 'Parking / Yard' },
+    { value: 'empty_miles', label: 'Empty Miles (our driver)' },
     { value: 'escrow', label: 'Escrow Hold' },
     { value: 'repair', label: 'Repair / Maintenance' },
     { value: 'lease', label: 'Lease / Truck Payment' },

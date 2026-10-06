@@ -68,6 +68,17 @@ const createCorporateId = async () => {
   return corporateID;
 };
 
+// Empty-mile rate: absent ⇒ leave alone (edit) / none (add); '' or null ⇒ cleared (falls back to the
+// solo rate); otherwise a finite number ≥ 0. Anything else is refused rather than stored as 0 — a
+// silent 0 would stop paying empty miles with nothing on screen saying why.
+function parseEmptyRate(v) {
+  if (v === undefined) return { value: undefined };
+  if (v === null || String(v).trim() === '') return { value: null };
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return { error: 'Empty rate must be a number of 0 or more.' };
+  return { value: Math.round(n * 10000) / 10000 };
+}
+
 exports.addDriver = catchAsync(async (req, res, next) => {
   try {
     const tenantId = req.tenantId || req.user?.tenantId;
@@ -81,9 +92,12 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       ratePerMileSolo,
       ratePerMileTeam,
       cityHoursRate,
+      ratePerEmptyMile,
       licenseNumber, licenseState, licenseIssueDate, licenseExpiry,
       emails = [], phones = []
     } = req.body;
+    const emptyRate = parseEmptyRate(ratePerEmptyMile);
+    if (emptyRate.error) return res.status(400).json({ status: false, code: 'invalid_empty_rate', message: emptyRate.error });
 
     const trimmedName = String(name || '').trim();
     const trimmedEmail = String(email || '').trim().toLowerCase();
@@ -164,6 +178,7 @@ exports.addDriver = catchAsync(async (req, res, next) => {
       ratePerMileSolo: Number(ratePerMileSolo ?? ratePerMile) || 0,
       ratePerMileTeam: Number(ratePerMileTeam ?? ratePerMile) || 0,
       cityHoursRate: Number(cityHoursRate) || 0,
+      ratePerEmptyMile: emptyRate.value === undefined ? null : emptyRate.value,
       licenseNumber,
       licenseState,
       licenseIssueDate: licenseIssueDate ? new Date(licenseIssueDate) : undefined,
@@ -202,9 +217,12 @@ exports.editDriver = catchAsync(async (req, res, next) => {
       ratePerMileSolo,
       ratePerMileTeam,
       cityHoursRate,
+      ratePerEmptyMile,
       notes, licenseNumber, licenseState, licenseIssueDate, licenseExpiry,
       emails = [], phones = []
     } = req.body;
+    const emptyRate = parseEmptyRate(ratePerEmptyMile);
+    if (emptyRate.error) return res.status(400).json({ status: false, code: 'invalid_empty_rate', message: emptyRate.error });
 
     const trimmedName = name ? String(name).trim() : undefined;
     const trimmedEmail = email ? String(email).trim().toLowerCase() : undefined;
@@ -269,6 +287,7 @@ exports.editDriver = catchAsync(async (req, res, next) => {
         ratePerMileSolo: Number(ratePerMileSolo ?? ratePerMile) || 0,
         ratePerMileTeam: Number(ratePerMileTeam ?? ratePerMile) || 0,
         cityHoursRate: Number(cityHoursRate) || 0,
+        ...(emptyRate.value !== undefined ? { ratePerEmptyMile: emptyRate.value } : {}),
         notes,
         licenseNumber,
         licenseState,

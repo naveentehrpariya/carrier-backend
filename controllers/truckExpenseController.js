@@ -500,3 +500,6 @@ exports.getTruckProfitSummary = catchAsync(async (req, res, next) => {
     JSONerror(res, err, next);
   }
 });
+
+// Owner payroll materializes a truck's fixed monthly expenses before charging them to the owner.
+exports.ensureFixedExpenses = ensureFixedExpenses;

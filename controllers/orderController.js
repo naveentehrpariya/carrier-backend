@@ -13,6 +13,24 @@ const Charges = require("../db/Charges");
 const PaymentLogs = require("../db/PaymentLogs");
 const Trip = require("../db/Trip");
 const { legPartyChangeBlockers } = require("../utils/legPartyLock");
+const { applyOrderReadScope, canReadOrder, orderSeesAll } = require("../utils/orderVisibility");
+const { customerVisibilityOr } = require("../utils/entityVisibility");
+const Customer = require("../db/Customer");
+
+// An order may only be booked against a customer this user can see. Without it, a customer
+// id taken from anywhere books a load on someone else's account (and the order then
+// becomes readable to its creator — customer name, terms and all).
+async function assertCustomerVisible(req, tenantId, customerId) {
+   if (!customerId) return null;
+   if (!mongooseLib.isValidObjectId(String(customerId))) {
+      return { status: 400, message: 'Invalid customer.' };
+   }
+   const criteria = { _id: customerId, tenantId, deletedAt: null };
+   const scope = customerVisibilityOr(req.user);
+   if (scope) criteria.$or = scope;
+   const found = await Customer.exists(criteria);
+   return found ? null : { status: 403, message: "You don't have access to that customer." };
+}
 const Truck = require("../db/Truck");
 const Users = require("../db/Users");
 const OwnerOperator = require("../db/OwnerOperator");
@@ -497,10 +515,15 @@ exports.create_order = catchAsync(async (req, res, next) => {
       if (!tenantId) {
          return res.status(400).json({ status: false, message: "Tenant context is required." });
       }
+      {
+         const denied = await assertCustomerVisible(req, tenantId, req.body?.customer);
+         if (denied) return res.status(denied.status).json({ status: false, code: 'customer_not_visible', message: denied.message });
+      }
 
       const { company_name,
          customer_order_no,
          shipping_details,
+         instructions,
 
          // Customer
          customer,
@@ -684,6 +707,7 @@ exports.create_order = catchAsync(async (req, res, next) => {
          serial_no : finalSerialNo,
          customer_order_no: customer_order_no ? String(customer_order_no).trim() : null,
          shipping_details,
+         instructions: instructions ? String(instructions).trim() : '',
 
          customer : customer,
          customer_payment_date,
@@ -941,7 +965,7 @@ exports.update_order = catchAsync(async (req, res, next) => {
          'customer', 'carrier', 'driver', 'truck', 'trailer', 'drivers',
          'customer_order_no', 'company_name', 'reference_no',
          'total_amount', 'carrier_amount', 'profit',
-         'shipping_details', 'totalDistance', 'notes',
+         'shipping_details', 'totalDistance', 'notes', 'instructions',
          'route_crosses_border', 'route_countries', 'distance_source',
          'route_summary', 'route_polyline', 'route_duration_sec', 'route_options',
          'order_status', 'pickup_date', 'delivery_date',
@@ -1016,12 +1040,18 @@ exports.update_order = catchAsync(async (req, res, next) => {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
       applyOrderOwnershipScope(req, criteria);
+      await applyOrderReadScope(req, criteria);
       const existingOrder = await Order.findOne(criteria);
       if(!existingOrder) {
          return res.status(404).json({
             status: false,
             message: "Order not found."
          });
+      }
+      // Moving the order to another customer: that customer must be one this user can see.
+      if (req.body?.customer && String(req.body.customer?._id || req.body.customer) !== String(existingOrder.customer || '')) {
+         const denied = await assertCustomerVisible(req, tenantId, req.body.customer?._id || req.body.customer);
+         if (denied) return res.status(denied.status).json({ status: false, code: 'customer_not_visible', message: denied.message });
       }
 
       // Amounts in the body are the user's TYPED values, in the order's input currency. A caller that
@@ -1444,7 +1474,7 @@ exports.orders_needing_attention = catchAsync(async (req, res) => {
    if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
       criteria.order_type = { $in: req.allowedOrderTypes };
    }
-   applyOrderOwnershipScope(req, criteria);
+   await applyOrderReadScope(req, criteria);
    const companyId = normalizeCompanyId(req);
    if (companyId) {
       criteria.$and = (criteria.$and || []).concat([{
@@ -1684,17 +1714,8 @@ exports.order_listing = catchAsync(async (req, res, next) => {
       queryObj.order_status = status;
    }
 
-   // Scope listings for non-admin users to their own records/assignments
-   const isEmulating = req.isEmulating || req.isSuperAdminUser;
-   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || req.user?.permissions?.includes('subadmin') || isEmulating;
-   if (req.user && !isAdminUser) {
-      if (Number(req.user.role) === 0 || req.user?.permissions?.includes('driver')) {
-         queryObj.$and = queryObj.$and || [];
-         queryObj.$and.push({ $or: [{ driver: req.user._id }, { drivers: req.user._id }] });
-      } else {
-         queryObj.created_by = req.user._id;
-      }
-   }
+   // Non-privileged users see only orders they created or whose customer is assigned to them.
+   await applyOrderReadScope(req, queryObj);
 
    applyOrderSearch(queryObj, search);
 
@@ -1960,8 +1981,8 @@ exports.order_listing_account = catchAsync(async (req, res) => {
          queryObj.order_type = { $in: req.allowedOrderTypes };
       }
 
-      // Non-admin users only see their own orders (mirror order_listing)
-      applyOrderOwnershipScope(req, queryObj);
+      // Non-privileged users only see their own orders (accounting sees all)
+      await applyOrderReadScope(req, queryObj);
 
    // Set default sort to serial_no descending if not provided
    if (!req.query.sort) {
@@ -2033,7 +2054,11 @@ exports.updateOrderPaymentStatus = catchAsync(async (req, res) => {
       if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
-      applyOrderOwnershipScope(req, criteria);
+      // Accounting records payments on every order; everyone else only on their own.
+      if (!orderSeesAll(req)) {
+         applyOrderOwnershipScope(req, criteria);
+         await applyOrderReadScope(req, criteria);
+      }
       // Payment state before the write — "who marked this paid, and when" is the single most
       // asked question when a receivables report and the bank do not agree.
       const beforePayment = await Order.findOne(criteria).lean();
@@ -2197,6 +2222,7 @@ exports.updateOrderStatus = catchAsync(async (req, res) => {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
       applyOrderOwnershipScope(req, criteria);
+      await applyOrderReadScope(req, criteria);
       const order  = await Order.findOneAndUpdate(criteria, {
          order_status : status,
          updatedAt : Date.now(),
@@ -2244,6 +2270,7 @@ exports.addnote = catchAsync(async (req, res) => {
          criteria.order_type = { $in: req.allowedOrderTypes };
       }
       applyOrderOwnershipScope(req, criteria);
+      await applyOrderReadScope(req, criteria);
       const order  = await Order.findOneAndUpdate(criteria, {
          notes : notes,
          updatedAt : Date.now(),
@@ -2283,32 +2310,8 @@ exports.overview = catchAsync(async (req, res) => {
       ]
    };
    
-   let queryFilter;
-   
-   // Check if this is a super admin emulating a tenant
-   const isEmulating = req.isEmulating || req.isSuperAdminUser;
-   
-   // A user is regular (staff) if they are NOT an admin (role 3) and NOT is_admin=1
-   const isRegularUser = req.user.role !== 3 && req.user.is_admin !== 1 && !isEmulating;
-   
-   if(isRegularUser){
-      // For regular users (non-admin, non-emulating), include created_by filter
-      // Or if they are a driver (role 0), filter by driver assignment
-      if (req.user.role === 0 || req.user?.permissions?.includes('driver')) {
-         queryFilter = {
-            $or: [{ driver: req.user._id }, { drivers: req.user._id }],
-            ...baseDeletedFilter
-         };
-      } else {
-         queryFilter = {
-            created_by: req.user._id,
-            ...baseDeletedFilter
-         };
-      }
-   } else {
-      // For admin users or super admins emulating, only apply deleted filter
-      queryFilter = baseDeletedFilter;
-   }
+   // Same read scope as the order list: creator / assigned customer / driver; privileged sees all.
+   let queryFilter = await applyOrderReadScope(req, { ...baseDeletedFilter });
 
    // Scope dashboard counts by tenant — mandatory
    const overviewTenantId = getTenantId(req);
@@ -2533,6 +2536,8 @@ exports.customerInvoicePdf = catchAsync(async (req, res) => {
    if (Array.isArray(req.allowedOrderTypes) && req.allowedOrderTypes.length > 0) {
       criteria.order_type = { $in: req.allowedOrderTypes };
    }
+   // An invoice names the customer and the money — same visibility as the order itself.
+   await applyOrderReadScope(req, criteria);
    const order = await Order.findOne(criteria)
       .populate({ path: 'created_by', options: { includeInactive: true } })
       .populate(['customer'])
@@ -2553,7 +2558,7 @@ exports.customerInvoicePdf = catchAsync(async (req, res) => {
    const logoBase64 = await resolveCompanyLogoBase64(company);
 
    const issuedAt = new Date();
-   const invoiceNo = buildInvoiceNo(order, issuedAt);
+   const invoiceNo = buildInvoiceNo(order, { company, tenantId });
    const html = buildCustomerInvoiceHtml({ order, company, invoiceNo, issuedAt, logoBase64, tenantId });
 
    const { launchBrowser, hardenPage } = require('../utils/puppeteer');
@@ -2627,21 +2632,9 @@ exports.order_detail = catchAsync(async (req, res) => {
        });
     }
 
-   // Authorize: non-admin users may only view their own records (mirror order_listing).
-   // Never rely on `role` alone — not set on signup users.
-   const isEmulating = req.isEmulating || req.isSuperAdminUser;
-   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || req.user?.permissions?.includes('subadmin') || isEmulating;
-   if (req.user && !isAdminUser) {
-      const uid = String(req.user._id);
-      const isDriverUser = Number(req.user.role) === 0 || req.user?.permissions?.includes('driver');
-      let allowed;
-      if (isDriverUser) {
-         const driverIds = [order.driver, ...(Array.isArray(order.drivers) ? order.drivers : [])]
-            .filter(Boolean).map(d => String(d._id || d));
-         allowed = driverIds.includes(uid);
-      } else {
-         allowed = String(order.created_by?._id || order.created_by) === uid;
-      }
+   // Authorize: creator, assignee of the order's customer, its driver, or a privileged user.
+   {
+      const allowed = await canReadOrder(req, order);
       if (!allowed) {
          return res.status(403).json({
             status: false,
@@ -2664,7 +2657,7 @@ exports.order_docs = catchAsync(async (req, res) => {
    if (!tenantId) {
       return res.status(400).json({ status: false, message: "Tenant context is required.", files: [], paymentLogs: [] });
    }
-      const orderCriteria = applyOrderOwnershipScope(req, { _id: id, tenantId });
+   const orderCriteria = await applyOrderReadScope(req, { _id: id, tenantId });
 
    const order = await Order.findOne(orderCriteria).select('_id').lean();
    if (!order) {
@@ -3168,13 +3161,8 @@ exports.orderPayments = catchAsync(async (req, res, next) => {
       }
    }
 
-   // Scope payments to own records for non-admin users.
-   // Mirror order_listing: never rely on `role` alone (not set on signup users).
-   const isEmulating = req.isEmulating || req.isSuperAdminUser;
-   const isAdminUser = req.user?.role === 3 || req.user?.is_admin === 1 || req.user?.permissions?.includes('subadmin') || isEmulating;
-   if (req.user && !isAdminUser) {
-      queryObj.created_by = req.user._id;
-   }
+   // Scope payments to what this user may read (creator / assigned customer; accounting sees all).
+   await applyOrderReadScope(req, queryObj);
 
    // Sanitize search parameter
    applyOrderSearch(queryObj, search);
@@ -3229,6 +3217,8 @@ exports.all_payments_status = catchAsync(async (req, res, next) => {
    }
 
    applyOrderSearch(queryObj, search);
+   // Was tenant-only: any employee could list every order's customer, carrier and amounts.
+   await applyOrderReadScope(req, queryObj);
 
    // Set default sort to serial_no descending if not provided
    if (!req.query.sort) {

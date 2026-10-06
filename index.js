@@ -43,6 +43,22 @@ app.use(cors({
 app.use(morgan('dev'));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json({ limit: '50mb' }));
+// Files stored by utils/fileupload with STORAGE_DRIVER=local. Names are
+// unguessable; `sandbox` + nosniff stop an uploaded HTML/SVG from running script
+// on the API's origin.
+app.use('/uploads', express.static(require('./utils/fileupload').UPLOADS_DIR, {
+  dotfiles: 'deny',
+  index: false,
+  setHeaders: (res, filePath) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // PDFs and images open inline (Chrome's PDF viewer refuses a sandboxed
+    // document); anything else is a download that cannot run on this origin.
+    if (!/\.(pdf|png|jpe?g|webp|gif|heic)$/i.test(filePath)) {
+      res.setHeader('Content-Disposition', 'attachment');
+      res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
+    }
+  },
+}));
 app.use("/user", require('./routes/authRoutes'));
 app.use("/user", require('./routes/userRoutes'));
 app.use("", require('./routes/carrierRoutes'));
@@ -55,6 +71,7 @@ app.use("", require('./routes/tripRoutes'));
 app.use("", require('./routes/searchRoutes'));
 app.use("", require('./routes/chequeRoutes'));
 app.use("", require('./routes/fuelPriceRoutes'));
+app.use("", require('./routes/carrierOnboardingRoutes'));
 app.use("/api/migration", require('./routes/migrationRoutes'));
 app.use("/api/tenant-admin", require('./routes/tenantAdmin'));
 app.use("/api/super-admin", require('./routes/superAdmin'));

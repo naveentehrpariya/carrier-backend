@@ -49,11 +49,14 @@ const fmtDate = (d) => {
  * number, because that number is what the carrier quotes back on their invoice. (The old
  * client-side invoice number mixed in Math.random(); do not repeat that here.)
  *
- * Shape: `<ORDER NUMBER>-L<leg no>`, e.g. `CMC-1013-L2`. An order with a single carrier leg still
- * reads naturally, and a second carrier's document is visibly a different one.
+ * Shape: the ORDER NUMBER (`CMC-1013`) — the client wants the rate confirmation, the invoice and
+ * the order to carry one number. Only when the order is split across two or more carrier legs is
+ * `-L<leg no>` appended (`CMC-1013-L2`), because two carriers holding contracts with the same number
+ * could not tell their paperwork apart.
  */
-function buildRateConNo({ order, trip, company, tenantId }) {
+function buildRateConNo({ order, trip, company, tenantId, carrierLegCount = 1 }) {
   const orderNo = getOrderNumber({ order, company, tenantId });
+  if (Number(carrierLegCount) <= 1) return orderNo;
   const legNo = Number(trip?.trip_no || 1);
   return `${orderNo}-L${legNo}`;
 }
@@ -346,6 +349,12 @@ function buildRateConHtml({
       </tbody>
     </table>
   </div>
+
+  ${String(order?.instructions || '').trim() ? `
+  <div style="${NOBREAK}padding:0 36px 18px;">
+    <div style="${SECTION}">Driver / Carrier Instructions</div>
+    <div style="font-size:11px;color:#111827;line-height:1.6;white-space:pre-wrap;border:1px solid #e5e7eb;border-radius:6px;padding:10px 12px;background:#fafafa;">${esc(String(order.instructions).trim())}</div>
+  </div>` : ''}
 
   <div style="${NOBREAK}padding:0 36px 18px;">
     <div style="${SECTION}">Terms &amp; Conditions</div>

@@ -25,6 +25,9 @@ router.route('/driver/:driverId/deduction/:deductionId').delete(validateToken, r
 // Driver monthly salary (parity with owner-operator salary): generate / view / history / adjust / pdf
 router.route('/driver/salaries/list').get(validateToken, resolveTenant, driverSalaryController.listDriverSalaries);
 router.route('/driver/:driverId/salary/generate').post(validateToken, resolveTenant, driverSalaryController.generateDriverSalary);
+// Empty moves reviewed before a payslip is generated (driver + owner payroll share them).
+router.route('/driver/:driverId/salary/empty-moves').get(validateToken, resolveTenant, driverSalaryController.getDriverEmptyMoves);
+router.route('/payroll/empty-moves/ignore').post(validateToken, resolveTenant, driverSalaryController.setEmptyMoveIgnored);
 router.route('/driver/:driverId/salary/history').get(validateToken, resolveTenant, driverSalaryController.getDriverSalaryHistory);
 router.route('/driver/:driverId/salary/pdf').get(validateToken, resolveTenant, driverSalaryController.getDriverSalaryPdf);
 // Payments against a payslip. Declared BEFORE the `/:salaryId` route so the literal

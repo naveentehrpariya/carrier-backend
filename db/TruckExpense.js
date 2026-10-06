@@ -25,6 +25,9 @@ const truckExpenseSchema = new mongoose.Schema({
   fixedMonth: { type: Number, default: null },  // 0-11
   fixedYear: { type: Number, default: null },
   isFixed: { type: Boolean, default: false },
+  // A fixed expense the admin took off the OWNER's payslip (it still counts against the truck's
+  // own earnings). Only meaningful on owner-operated trucks.
+  excludeFromOwnerPay: { type: Boolean, default: false },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users' },
   createdAt: { type: Date, default: Date.now },
   deletedAt: { type: Date, default: null }

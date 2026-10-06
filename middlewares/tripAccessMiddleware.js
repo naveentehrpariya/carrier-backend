@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Order = require('../db/Order');
 const Trip = require('../db/Trip');
 const catchAsync = require('../utils/catchAsync');
+const { canReadOrder } = require('../utils/orderVisibility');
 
 // Trip planning is a money write, not a scheduling detail: the truck on a leg decides which owner
 // operator gets settled for it, and the drivers on a leg decide what payroll owes. These routes
@@ -48,8 +49,14 @@ const requireTripWriteAccess = catchAsync(async (req, res, next) => {
   if (!mongoose.isValidObjectId(orderId)) {
     return res.status(400).json({ status: false, message: 'Invalid order id.' });
   }
-  const order = await Order.findOne({ _id: orderId, tenantId }).select('lock').lean();
+  const order = await Order.findOne({ _id: orderId, tenantId }).select('lock created_by customer driver drivers').lean();
   if (!order) {
+    return res.status(404).json({ status: false, message: 'Order not found.' });
+  }
+  // Permission to plan trips is not permission to plan SOMEONE ELSE's load: the order must be
+  // one this user may read (creator / assigned customer / privileged). Same 404 as a missing
+  // order, so the id does not confirm that the load exists.
+  if (!(await canReadOrder(req, order))) {
     return res.status(404).json({ status: false, message: 'Order not found.' });
   }
   if (order.lock) {

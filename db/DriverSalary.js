@@ -25,6 +25,29 @@ const driverOrderBreakdownSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// One empty move (truck driving between two loads, unloaded) — snapshot of what was paid for it.
+// Ignored moves are kept, unpaid, so the payslip records what was reviewed and taken off.
+const driverEmptyMoveSchema = new mongoose.Schema(
+  {
+    after_trip: { type: mongoose.Schema.Types.ObjectId, ref: 'trips' },
+    before_trip: { type: mongoose.Schema.Types.ObjectId, ref: 'trips' },
+    from_location: { type: String, default: '' },
+    to_location: { type: String, default: '' },
+    after_order_serial: { type: Number, default: null },
+    before_order_serial: { type: Number, default: null },
+    truck: { type: mongoose.Schema.Types.ObjectId, ref: 'trucks', default: null },
+    truckNumber: { type: String, default: '' },
+    date: { type: Date, default: null },
+    miles: { type: Number, default: null },        // full move; null = could not be measured
+    driverMiles: { type: Number, default: 0 },      // this driver's share (team moves are split)
+    rate: { type: Number, default: 0 },             // in rateCurrency
+    pay: { type: Number, default: 0 },              // in rateCurrency
+    ignored: { type: Boolean, default: false },
+    unmeasured: { type: Boolean, default: false },
+  },
+  { _id: false }
+);
+
 const driverSalarySchema = new mongoose.Schema(
   {
     tenantId: { type: String, required: true, index: true },
@@ -47,6 +70,14 @@ const driverSalarySchema = new mongoose.Schema(
     totalMiles: { type: Number, default: 0 },
     totalKm: { type: Number, default: 0 },
     tripPay: { type: Number, default: 0 },         // converted
+    // Empty miles (client, 2026-10-06): paid at the driver's empty rate, reviewed before generate.
+    emptyMiles: { type: Number, default: 0 },
+    emptyRate: { type: Number, default: 0 },       // in rateCurrency
+    emptyPay: { type: Number, default: 0 },        // converted
+    emptyMoves: { type: [driverEmptyMoveSchema], default: [] },
+    // Who confirmed the empty moves were checked before this payslip was generated, and when.
+    emptyMovesReviewedAt: { type: Date, default: null },
+    emptyMovesReviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'users', default: null },
     cityHours: { type: Number, default: 0 },
     cityPay: { type: Number, default: 0 },         // converted
     deductionTotal: { type: Number, default: 0 },  // per-date DriverDeduction 'deduct' rows, converted

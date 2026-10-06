@@ -220,9 +220,18 @@ const schema = new mongo.Schema({
         type: String,
         default:"added",
     },
-    // Notes
+    // Notes — the INTERNAL note (Accounts → Add Note). Never printed on carrier/driver paperwork.
     notes : {
         type: String,
+    },
+    // Instructions FOR the driver/carrier running the load ("call 30 min before arrival", "no
+    // lumper", "seal on trailer"). Deliberately a separate column from `notes`: that one is an
+    // internal comment, and this one is printed on the rate confirmation the carrier receives —
+    // sharing a column would put the office's own remarks on someone else's contract.
+    instructions : {
+        type: String,
+        trim: true,
+        maxlength: [2000, 'Driver/carrier instructions can be at most 2000 characters.'],
     },
     carrier_payment_notes : { 
         type: String

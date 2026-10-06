@@ -45,16 +45,14 @@ const fmtDateTime = (d) => {
 };
 
 /**
- * Invoice number for an order. DETERMINISTIC on purpose: the old client-side version mixed in
- * Math.random(), so the same invoice downloaded twice carried two different numbers — and the
- * footer tells the customer that number must appear on all payments. Shape is unchanged
- * (`<serial>-<MMDD><3 digits>`); the last three digits now come from the order id instead.
+ * Invoice number for an order: the ORDER NUMBER itself (e.g. `CMC-1003`). The client asked for one
+ * number across the order, the carrier's rate confirmation and the customer's invoice — the old
+ * `<serial>-<MMDD><3 digits>` shape put a second, unrelated number on the invoice, so a payment
+ * quoting it could not be matched to the load without a lookup. Deterministic (never random, never
+ * the issue date), and identical to `frontend/.../CustomerInvoice.jsx`.
  */
-function buildInvoiceNo(order, issuedAt = new Date()) {
-  const d = issuedAt instanceof Date ? issuedAt : new Date(issuedAt);
-  const stamp = `${d.getMonth() + 1}${d.getDate()}`;
-  const idTail = String(order?._id || '').replace(/\D/g, '').slice(-3).padStart(3, '0');
-  return `${order?.serial_no ?? ''}-${stamp}${idTail}`;
+function buildInvoiceNo(order, { company, tenantId } = {}) {
+  return getOrderNumber({ order, company, tenantId });
 }
 
 /**

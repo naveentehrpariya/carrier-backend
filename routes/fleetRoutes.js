@@ -114,6 +114,10 @@ router.get('/fleet/docs/:type/:id', validateToken, resolveTenant, catchAsync(asy
   if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required.', documents: [] });
   if (!FLEET_DOC_TYPES.includes(type)) return res.status(400).json({ status: false, message: 'Invalid document type.', documents: [] });
   if (!mongoose.Types.ObjectId.isValid(String(id))) return res.status(400).json({ status: false, message: 'Invalid entity id.', documents: [] });
+  // A customer's documents follow the customer's assignment rules — listing them was tenant-only.
+  if (!(await docController.canReadEntityDocs(req, type, id, tenantId))) {
+    return res.status(403).json({ status: false, message: "You don't have permission to view these documents.", documents: [] });
+  }
   const docs = await FleetDoc.find({ tenantId, type, entityId: id, deletedAt: null }).sort({ createdAt: -1 });
   res.json({ status: true, documents: docs });
 }));

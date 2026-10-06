@@ -565,4 +565,15 @@ const documentExpiryAlerts = catchAsync(async (req, res) => {
   return res.json({ status: true, items, counts, byEntity });
 });
 
-module.exports = { createDoc, updateDoc, removeDoc, documentExpiryAlerts, parseDocMeta, DOC_TYPES, DOC_FIELD_KEYS };
+/**
+ * May this user LIST the documents of a commercial record? Same audience as the record:
+ * a customer must be visible to them (assignment rules), a carrier / vendor needs that
+ * record's permission. Fleet kinds (truck/trailer/owner) are not per-user and pass.
+ */
+async function canReadEntityDocs(req, kind, entityId, tenantId) {
+  if (!COMMERCIAL_KINDS.includes(kind)) return true;
+  if (!canWriteCommercialDoc(req, kind)) return false;
+  return Boolean(await resolveKind(kind, entityId, tenantId, req.user));
+}
+
+module.exports = { createDoc, updateDoc, removeDoc, documentExpiryAlerts, parseDocMeta, canReadEntityDocs, DOC_TYPES, DOC_FIELD_KEYS };

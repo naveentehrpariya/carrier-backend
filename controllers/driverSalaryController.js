@@ -14,11 +14,13 @@ const DriverProfile = require('../db/DriverProfile');
 const DriverDeduction = require('../db/DriverDeduction');
 const DriverSalary = require('../db/DriverSalary');
 const DriverPayment = require('../db/DriverPayment');
+const IgnoredEmptyMove = require('../db/IgnoredEmptyMove');
 const { logActivity, logChange } = require('../utils/activityLogger');
 const { round2, EPSILON, computePayslipTotals, previousMonthOf } = require('../utils/payslipMath');
 const { MI_PER_KM, deriveTripMiles, pickDriverRate, getDriverRateCurrency } = require('../utils/distance');
 const { normalizeCurrency, buildDateRange, getFxRatesMap, convertAmount, missingFxSources } = require('../utils/fx');
 const { ensureMonthlyFxRates } = require('./ownerOperatorController');
+const { driverEmptyMovePay } = require('../utils/emptyMovePay');
 
 function getTenantId(req) {
   return req.tenantId || req.user?.tenantId || null;
@@ -220,6 +222,8 @@ async function computeDriverDeductions(tenantId, driverId, range) {
 async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCurrency, opts = {}) {
   const tp = await computeDriverTripPay(tenantId, driverId, range);
   const dd = await computeDriverDeductions(tenantId, driverId, range);
+  // Empty moves are priced in the driver's own pay currency (same as trip pay).
+  const em = await driverEmptyMovePay(tenantId, driverId, range);
 
   // Everything that needs converting INTO targetCurrency: the driver's own pay currency, the
   // currencies its deduction rows were entered in, plus the currencies of the records we carry
@@ -260,6 +264,7 @@ async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCu
   });
 
   const tripPay = fromRate(tp.totalPay);
+  const emptyPay = round2(fromRate(em.emptyPay));
 
   const orderBreakdown = tp.byOrder.map((b) => {
     const conv = convertAmount(b.pay, tp.rateCurrency, targetCurrency, fxRatesMap);
@@ -299,14 +304,16 @@ async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCu
   const manualAddition = 0;
   const manualDeduction = 0;
 
-  const basePayable = round2(tripPay + cityPay - deductionTotal);
+  // Empty miles are driving the driver did for us — they join trip pay in the base.
+  const basePayable = round2(tripPay + emptyPay + cityPay - deductionTotal);
 
   // Contractor tax (HST/GST): charged ON TOP of what the period's driving earned — trip pay +
   // city pay only. Additions/deductions and carry-forward balances are deliberately outside the
   // base (additions unconfirmed with the client; carry-forwards were taxed in their own month).
   const taxEnabled = tp.tax?.enabled === true;
   const taxRate = taxEnabled ? Number(tp.tax.rate || 0) : 0;
-  const taxableBase = taxEnabled ? round2(tripPay + cityPay) : 0;
+  // Empty miles are driving too, so they are part of the service the driver invoices.
+  const taxableBase = taxEnabled ? round2(tripPay + emptyPay + cityPay) : 0;
   const taxAmount = taxEnabled ? round2(taxableBase * (taxRate / 100)) : 0;
 
   const totals = computePayslipTotals({
@@ -331,6 +338,15 @@ async function buildDriverSalaryPayload(req, tenantId, driverId, range, targetCu
     soloRate: tp.soloRate, teamRate: tp.teamRate, cityRate: tp.cityRate,
     totalTrips: tp.totalTrips, totalMiles: tp.totalMiles, totalKm: tp.totalKm,
     tripPay, cityHours: dd.cityHours, cityPay, deductionTotal, additionTotal,
+    emptyMiles: em.emptyMiles, emptyRate: em.emptyRate, emptyPay,
+    emptyMoves: em.moves.map((m) => ({
+      after_trip: m.after_trip_id, before_trip: m.before_trip_id,
+      from_location: m.from_location, to_location: m.to_location,
+      after_order_serial: m.after_order_serial, before_order_serial: m.before_order_serial,
+      truck: m.truck?._id || null, truckNumber: m.truck?.number || '',
+      date: m.date, miles: m.miles, driverMiles: m.driverMiles,
+      rate: m.rate, pay: m.pay, ignored: m.ignored, unmeasured: m.unmeasured,
+    })),
     taxEnabled, taxRate, taxNumber: taxEnabled ? tp.tax.number : '',
     taxCompanyName: taxEnabled ? tp.tax.companyName : '',
     taxableBase, taxAmount, payableBeforeTax: round2(finalPayable - taxAmount),
@@ -356,6 +372,20 @@ exports.generateDriverSalary = catchAsync(async (req, res, next) => {
     if (!driver) return res.status(404).json({ status: false, message: 'Driver not found' });
 
     const targetCurrency = await resolveSalaryCurrency(req, tenantId, driverId, req.body?.currency);
+
+    // The empty moves are reviewed BEFORE the payslip is generated (client, 2026-10-06): a gap
+    // between two loads is pay, and a wrong one (a yard move, a gap the logs invented) must be
+    // taken off first. When there is anything to review, generating requires the confirmation.
+    const reviewed = req.body?.emptyMovesReviewed === true || req.body?.emptyMovesReviewed === 'true';
+    const review = await driverEmptyMovePay(tenantId, driverId, range);
+    if (review.moves.length > 0 && !reviewed) {
+      return res.status(409).json({
+        status: false,
+        code: 'empty_moves_not_reviewed',
+        message: `Check the ${review.moves.length} empty move${review.moves.length === 1 ? '' : 's'} for this month and tick "I have checked these empty moves" before generating the payslip.`,
+        emptyMoves: review.moves.length,
+      });
+    }
     // Insurance, escrow and a lease payment repeat every month. Materialize last month's
     // recurring rows BEFORE the payslip is built, so it is complete on generate instead of
     // waiting for someone to remember.
@@ -365,6 +395,9 @@ exports.generateDriverSalary = catchAsync(async (req, res, next) => {
       previousDueAdded: req.body?.previousDueAdded,
       paidAmount: req.body?.paidAmount,
     });
+
+    payload.emptyMovesReviewedAt = review.moves.length > 0 ? new Date() : null;
+    payload.emptyMovesReviewedBy = review.moves.length > 0 ? (req.user?._id || null) : null;
 
     const salary = await DriverSalary.findOneAndUpdate(
       { tenantId, driver: driverId, month: range.month, year: range.year },
@@ -382,12 +415,85 @@ exports.generateDriverSalary = catchAsync(async (req, res, next) => {
     logActivity(req, {
       action: 'PAYMENT', module: 'payment',
       description: `Generated driver salary for ${range.month}/${range.year}`,
-      details: { driverId, finalPayable: payload.finalPayable },
+      details: {
+        driverId, finalPayable: payload.finalPayable,
+        emptyMoves: review.moves.length, emptyMiles: payload.emptyMiles, emptyPay: payload.emptyPay,
+        emptyMovesReviewed: review.moves.length > 0,
+      },
     });
 
     return res.json({ status: true, message: 'Driver salary generated', salary });
   } catch (err) {
     if (isFxMissing(err)) return res.status(400).json({ status: false, code: 'fx_missing', message: err.message });
+    JSONerror(res, err, next);
+    logger(err);
+  }
+});
+
+// GET /driver/:driverId/salary/empty-moves?month&year
+// The live empty moves for the month — including removed ones, so they can be put back — priced
+// at the driver's empty rate in their own pay currency. Feeds the review panel above Generate.
+exports.getDriverEmptyMoves = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasDriverSalaryAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to view driver salary' });
+    }
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
+    const { driverId } = req.params;
+    const range = buildDateRange(req.query?.month, req.query?.year);
+    if (!range) return res.status(400).json({ status: false, message: 'Valid month and year are required' });
+    const driver = await Users.findOne({ _id: driverId, tenantId }).setOptions({ includeInactive: true }).select('_id').lean();
+    if (!driver) return res.status(404).json({ status: false, message: 'Driver not found' });
+    const review = await driverEmptyMovePay(tenantId, driverId, range);
+    return res.json({ status: true, ...review });
+  } catch (err) {
+    JSONerror(res, err, next);
+    logger(err);
+  }
+});
+
+// POST /payroll/empty-moves/ignore  { driverId, after_trip_id, before_trip_id, ignored: true|false }
+// Takes one empty move off the payslips (ignored: true) or puts it back (false). ONE switch: the
+// same IgnoredEmptyMove the trip logs use, so removing a move here also removes it from the logs,
+// from this driver's payslip and from the owner deduction for it. Putting it back clears every
+// ignore on that move, including one set from a truck's log.
+exports.setEmptyMoveIgnored = catchAsync(async (req, res, next) => {
+  try {
+    if (!hasDriverSalaryAccess(req)) {
+      return res.status(403).json({ status: false, message: 'You are not allowed to change payroll empty moves' });
+    }
+    const tenantId = getTenantId(req);
+    if (!tenantId) return res.status(400).json({ status: false, message: 'Tenant context is required' });
+    const { driverId, after_trip_id: afterId, before_trip_id: beforeId } = req.body || {};
+    const ignored = req.body?.ignored === true || req.body?.ignored === 'true';
+    const ids = [driverId, afterId, beforeId];
+    if (ids.some((v) => typeof v !== 'string' || !mongoose.Types.ObjectId.isValid(v))) {
+      return res.status(400).json({ status: false, code: 'invalid_empty_move', message: 'driverId, after_trip_id and before_trip_id are required.' });
+    }
+    // Both legs must be this tenant's, and the driver must be on the leg the move drove to.
+    const legs = await Trip.find({ tenantId, _id: { $in: [afterId, beforeId] } }).select('_id driver drivers').lean();
+    const before = legs.find((t) => String(t._id) === String(beforeId));
+    if (legs.length !== 2 || !before) {
+      return res.status(404).json({ status: false, message: 'That empty move was not found.' });
+    }
+    const onLeg = String(before.driver || '') === String(driverId)
+      || (before.drivers || []).some((d) => String(d) === String(driverId));
+    if (!onLeg) return res.status(404).json({ status: false, message: 'That empty move is not this driver\'s.' });
+
+    if (ignored) {
+      const exists = await IgnoredEmptyMove.findOne({ tenantId, driver: driverId, after_trip: afterId, before_trip: beforeId }).lean();
+      if (!exists) await IgnoredEmptyMove.create({ tenantId, driver: driverId, truck: null, after_trip: afterId, before_trip: beforeId });
+    } else {
+      await IgnoredEmptyMove.deleteMany({ tenantId, after_trip: afterId, before_trip: beforeId });
+    }
+    logActivity(req, {
+      action: 'UPDATE', module: 'payroll',
+      description: `${ignored ? 'Removed' : 'Restored'} an empty move on the payslip`,
+      details: { driverId, after_trip: afterId, before_trip: beforeId, ignored },
+    });
+    return res.json({ status: true, ignored, message: ignored ? 'Empty move removed.' : 'Empty move restored.' });
+  } catch (err) {
     JSONerror(res, err, next);
     logger(err);
   }
@@ -634,6 +740,18 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
       return `<span class="stop">${safe(place || '—')}</span>${date ? `<span class="when">${safe(fmtDate(date))}</span>` : ''}`;
     };
 
+    // Paid empty moves only — removed or unmeasured ones are not part of this statement's money.
+    const emptyRows = (salary.emptyMoves || [])
+      .filter((m) => !m.ignored && !m.unmeasured && Number(m.pay || 0) > 0)
+      .map((m) => `<tr>
+        <td>#${safe(m.after_order_serial ?? '')} → #${safe(m.before_order_serial ?? '')}</td>
+        <td>${safe(m.truckNumber || '—')}</td>
+        <td>${safe(shortStop(m.from_location))}</td>
+        <td>${safe(shortStop(m.to_location))}</td>
+        <td style="text-align:right;">${Number(m.driverMiles || 0).toFixed(2)} mi</td>
+        <td style="text-align:right;">${fmtRate(m.rate)}/mi</td>
+        <td style="text-align:right;">${fmtRate(m.pay)}</td>
+      </tr>`).join('');
     const rows = (salary.orderBreakdown || []).map((b) => `
       <tr>
         <td class="ord">#${safe(b.serial_no ?? '—')}</td>
@@ -720,9 +838,22 @@ exports.getDriverSalaryPdf = catchAsync(async (req, res, next) => {
           </tr></thead>
           <tbody>${rows || `<tr><td colspan="7" style="text-align:center;color:#94a3b8;">No trips this period</td></tr>`}</tbody>
         </table>
+        ${emptyRows ? `
+        <table class="trips" style="margin-top:10px;">
+          <colgroup>
+            <col class="c-ord" /><col class="c-type" /><col class="c-route" /><col class="c-route" />
+            <col class="c-dist" /><col class="c-rate" /><col class="c-pay" />
+          </colgroup>
+          <thead><tr>
+            <th>Empty move</th><th>Truck</th><th>From</th><th>To</th>
+            <th style="text-align:right;">Distance</th><th style="text-align:right;">Rate</th><th style="text-align:right;">Pay</th>
+          </tr></thead>
+          <tbody>${emptyRows}</tbody>
+        </table>` : ''}
 
         <table class="totals">
           <tr><td>Trip Pay</td><td style="text-align:right;">${fmt(salary.tripPay)}</td></tr>
+          ${Number(salary.emptyPay || 0) ? `<tr><td>Empty Miles Pay (${Number(salary.emptyMiles || 0).toFixed(2)} mi @ ${fmtRate(salary.emptyRate)}/mi)</td><td style="text-align:right;">${fmt(salary.emptyPay)}</td></tr>` : ''}
           <tr><td>City Hours Pay (${Number(salary.cityHours || 0)} hr)</td><td style="text-align:right;">${fmt(salary.cityPay)}</td></tr>
           <tr><td>Deductions</td><td style="text-align:right;color:#dc2626;">- ${fmt(salary.deductionTotal)}</td></tr>
           ${Number(salary.previousDueAdded) ? `<tr><td>Previous Due</td><td style="text-align:right;">${fmt(salary.previousDueAdded)}</td></tr>` : ''}

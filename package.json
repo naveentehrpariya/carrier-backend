@@ -7,9 +7,11 @@
   "scripts": {
     "test:cheques": "node scripts/test-cheques.js",
     "test:payroll": "node scripts/test-payroll-matrix.js",
-    "test:orders": "node scripts/test-carrier-settlement.js && node scripts/test-order-shape-projection.js && node scripts/test-mixed-order.js && node scripts/test-payroll-matrix.js && node scripts/test-order-carrier-edit.js",
+    "test:orders": "node scripts/test-carrier-settlement.js && node scripts/test-order-shape-projection.js && node scripts/test-mixed-order.js && node scripts/test-payroll-matrix.js && node scripts/test-order-carrier-edit.js && node scripts/test-order-privacy.js",
     "test:carrier-edit": "node scripts/test-order-carrier-edit.js",
+    "test:privacy": "node scripts/test-order-privacy.js",
     "test:documents": "node scripts/test-documents.js",
+    "test:onboarding": "node scripts/test-carrier-onboarding.js",
     "start": "node index.js",
     "dev": "nodemon index.js",
     "live": "nodemon live.js",
@@ -31,6 +33,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1146.0",
     "@paypal/checkout-server-sdk": "^1.0.3",
     "ajv": "^8.12.0",
     "axios": "^1.2.2",

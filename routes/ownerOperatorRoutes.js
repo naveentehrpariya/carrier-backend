@@ -31,6 +31,12 @@ router
   .get(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.removeOwnerOperator);
 
 router
+  .route('/owner-operators/salary/review')
+  .get(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.salaryAutoChargeReview);
+router
+  .route('/owner-operators/salary/fixed-expense/exclude')
+  .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.setFixedExpenseExcluded);
+router
   .route('/owner-operators/salary/generate')
   .post(validateToken, resolveTenant, requireModuleAccess('regular'), ownerOperatorController.generateMonthlySalary);
 router

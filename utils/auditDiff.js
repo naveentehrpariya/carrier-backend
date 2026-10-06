@@ -33,7 +33,7 @@ const MAX_VALUE_CHARS = 2000;
 const AUDIT_FIELDS = {
   Order: [
     'order_type', 'status', 'is_locked',
-    'serial_no', 'customer_order_no',
+    'serial_no', 'customer_order_no', 'instructions',
     // money as typed + money as stored
     'input_currency', 'input_total_amount', 'input_carrier_amount',
     'total_amount', 'carrier_amount', 'settle_amount',
@@ -59,7 +59,7 @@ const AUDIT_FIELDS = {
     'deletedAt',
   ],
   DriverProfile: [
-    'ratePerMile', 'ratePerMileSolo', 'ratePerMileTeam',
+    'ratePerMile', 'ratePerMileSolo', 'ratePerMileTeam', 'ratePerEmptyMile',
     'cityHoursRate', 'rateCurrency',
     'taxEnabled', 'taxNumber', 'taxCompanyName', 'taxRate',
   ],
@@ -68,6 +68,7 @@ const AUDIT_FIELDS = {
     'manualDeduction', 'manualAddition',
     'finalPayable', 'paidAmount', 'dueAmount', 'owedAmount', 'overpaidAmount', 'paymentStatus',
     'soloRate', 'teamRate', 'cityRate', 'rateCurrency', 'currency',
+    'emptyMiles', 'emptyRate', 'emptyPay', 'emptyMovesReviewedAt',
     'totalMiles', 'totalTripPay', 'deductionTotal', 'additionTotal',
     'taxEnabled', 'taxRate', 'taxableBase', 'taxAmount', 'payableBeforeTax',
   ],
@@ -138,7 +139,7 @@ const AUDIT_FIELDS = {
   ChequeApplication: ['cheque', 'chequeNo', 'targetType', 'targetId', 'targetLabel', 'amount', 'currency', 'deletedAt'],
   // A cheque is money leaving the building — every field on it is evidence.
   PaymentCheque: [
-    'payeeType', 'payeeId', 'payeeName', 'chequeNo', 'referenceNo', 'bankAccount',
+    'payeeType', 'payeeId', 'payeeName', 'payeeAddress', 'chequeNo', 'referenceNo', 'bankAccount',
     'amount', 'currency', 'paymentDate', 'status', 'voidReason', 'bounceReason', 'note', 'deletedAt',
   ],
 };
